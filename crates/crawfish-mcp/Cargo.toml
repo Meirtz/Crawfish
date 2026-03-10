@@ -1,0 +1,17 @@
+[package]
+name = "crawfish-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+crawfish-core = { path = "../crawfish-core" }
+crawfish-types = { path = "../crawfish-types" }
+rmcp.workspace = true
+serde_json.workspace = true

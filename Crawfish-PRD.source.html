@@ -1,0 +1,964 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Crawfish PRD</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      color: #1f2933;
+      line-height: 1.55;
+      margin: 48px;
+      max-width: 920px;
+    }
+    h1, h2, h3, h4 {
+      color: #123b5d;
+      margin-top: 1.4em;
+      margin-bottom: 0.45em;
+    }
+    h1 {
+      font-size: 32px;
+      border-bottom: 3px solid #2d6a9f;
+      padding-bottom: 8px;
+    }
+    h2 {
+      font-size: 22px;
+      border-bottom: 1px solid #d6e4ef;
+      padding-bottom: 4px;
+    }
+    h3 {
+      font-size: 17px;
+    }
+    p {
+      margin: 0.5em 0;
+    }
+    .cover-subtitle {
+      font-size: 18px;
+      color: #2d6a9f;
+      margin-top: -8px;
+    }
+    .cover-tagline {
+      color: #52606d;
+      font-style: italic;
+      margin-bottom: 24px;
+    }
+    .meta {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 18px 0 28px 0;
+    }
+    .meta td {
+      border: 1px solid #d6e4ef;
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    .meta td:first-child {
+      width: 180px;
+      color: #52606d;
+      font-weight: 600;
+      background: #f7fbfe;
+    }
+    table.data {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 14px 0 22px 0;
+      font-size: 13px;
+    }
+    table.data th,
+    table.data td {
+      border: 1px solid #d6e4ef;
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    table.data th {
+      background: #f2f7fb;
+      color: #123b5d;
+      text-align: left;
+    }
+    ul, ol {
+      margin-top: 0.4em;
+      margin-bottom: 0.8em;
+      padding-left: 24px;
+    }
+    li {
+      margin: 0.25em 0;
+    }
+    blockquote {
+      border-left: 4px solid #7aa6c8;
+      padding: 8px 14px;
+      margin: 14px 0;
+      color: #334e68;
+      background: #f7fbfe;
+    }
+    pre {
+      white-space: pre-wrap;
+      font-family: Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: #0f1720;
+      color: #e5edf5;
+      padding: 14px;
+      border-radius: 6px;
+      margin: 12px 0 20px 0;
+    }
+    .note {
+      background: #fff8e8;
+      border: 1px solid #efd8a5;
+      padding: 12px 14px;
+      margin: 12px 0 18px 0;
+    }
+  </style>
+</head>
+<body>
+  <p>PRODUCT REQUIREMENTS DOCUMENT</p>
+  <h1>Crawfish</h1>
+  <p class="cover-subtitle">Lifecycle-Managed Agent Runtime for Always-On Production Systems</p>
+  <p class="cover-tagline">ROS2-inspired runtime semantics, protocol-native interoperability, and production-grade operational control</p>
+
+  <table class="meta">
+    <tr><td>Version</td><td>0.2.0-draft</td></tr>
+    <tr><td>Date</td><td>2026-03-10</td></tr>
+    <tr><td>Status</td><td>Revised Draft</td></tr>
+    <tr><td>License</td><td>Apache 2.0</td></tr>
+    <tr><td>Document Goal</td><td>Define the product, positioning, technical architecture, MVP scope, and launch path for Crawfish.</td></tr>
+  </table>
+
+  <h2>Executive Summary</h2>
+  <p>Crawfish is a production agent runtime, not another prompt wrapper or graph editor. It is designed for teams that need always-on agents to run with declared operational constraints: deadlines, budgets, tool permissions, approval gates, health checks, and orderly lifecycle transitions.</p>
+  <p>The current agent ecosystem is strong at three layers and weak at one critical layer. It is strong at model and tool APIs, strong at workflow durability, and increasingly strong at protocol interoperability. It is weak at runtime operations: how fleets of agents start, degrade, recover, pause, drain, and resume under real production conditions. That missing layer is where Crawfish lives.</p>
+  <p>Crawfish combines four ideas into one coherent runtime:</p>
+  <ul>
+    <li><strong>Managed lifecycle:</strong> agents are supervised resources with desired state, observed state, health, dependency ordering, and degraded modes.</li>
+    <li><strong>Action-oriented execution:</strong> long-running work is modeled as a durable task object with feedback, cancellation, checkpointing, and resumability.</li>
+    <li><strong>Execution contracts:</strong> each task carries explicit delivery, budget, safety, and routing constraints that are enforced by the runtime rather than left to prompt text.</li>
+    <li><strong>Protocol-native integration:</strong> MCP is the default tool plane, A2A is the inter-agent plane, and local subprocess adapters support coding and automation workloads.</li>
+  </ul>
+  <blockquote>Crawfish is to agent operations what ROS2 is to robot operations: a reliability-first runtime that turns orchestration from ad hoc control flow into a managed system.</blockquote>
+  <p>The beachhead is internal agent fleets for engineering, operations, and enterprise automation: systems that must stay up, stay within budget, and fail safely. The product is open-source core, local-first in developer experience, and production-oriented in its architecture.</p>
+
+  <h2>1. Product Category And Positioning</h2>
+  <h3>1.1 Category Definition</h3>
+  <p>Crawfish defines a category between agent SDKs and durable workflow engines: <strong>lifecycle-managed agent runtime</strong>.</p>
+  <p>This category exists because production agents are neither simple request handlers nor generic workflows. They are stateful, tool-using, failure-prone, budget-sensitive software actors that need an operational control plane.</p>
+
+  <h3>1.2 Positioning Statement</h3>
+  <p>For platform engineers and AI product teams running always-on or high-value agent systems, Crawfish is the runtime that adds lifecycle control, contract enforcement, and operational resilience. Unlike lightweight agent SDKs, Crawfish does not stop at tool calls and handoffs. Unlike workflow engines, Crawfish is model-native, protocol-native, and agent-native.</p>
+
+  <h3>1.3 What Crawfish Is And Is Not</h3>
+  <table class="data">
+    <tr>
+      <th>Question</th>
+      <th>Crawfish</th>
+      <th>Not Crawfish</th>
+    </tr>
+    <tr>
+      <td>Primary category</td>
+      <td>Agent runtime and orchestration kernel</td>
+      <td>No-code flow builder or generic DAG engine</td>
+    </tr>
+    <tr>
+      <td>Core value</td>
+      <td>Operational reliability, policy control, resumable execution</td>
+      <td>Prompt experimentation surface</td>
+    </tr>
+    <tr>
+      <td>Primary workload</td>
+      <td>Always-on and long-running agent tasks with tools and approvals</td>
+      <td>Short-lived chat demos or benchmark-only flows</td>
+    </tr>
+    <tr>
+      <td>Interoperability stance</td>
+      <td>MCP-first, A2A-ready, pluggable transports and adapters</td>
+      <td>Single-vendor closed orchestration stack</td>
+    </tr>
+    <tr>
+      <td>Operational model</td>
+      <td>Desired-state supervision with health, drain, degrade, and recover loops</td>
+      <td>Fire-and-forget imperative calls with no control plane</td>
+    </tr>
+  </table>
+
+  <h3>1.4 Messaging Hierarchy</h3>
+  <ul>
+    <li><strong>Category line:</strong> Lifecycle-managed agent runtime.</li>
+    <li><strong>Technical line:</strong> ROS2-inspired orchestration semantics for AI agents.</li>
+    <li><strong>User value line:</strong> Keep agents running, within budget, and under control.</li>
+    <li><strong>Competitive line:</strong> More operational than an SDK, more agent-native than a workflow engine.</li>
+  </ul>
+
+  <h2>2. Market White Space And Competitive Gap</h2>
+  <p>The market is crowded with frameworks, but most products cluster around only part of the real problem. The white space is not "more orchestration." The white space is <strong>operational control for agent fleets</strong>.</p>
+
+  <table class="data">
+    <tr>
+      <th>Existing category</th>
+      <th>What it does well</th>
+      <th>Where it stops short</th>
+      <th>Why Crawfish matters</th>
+    </tr>
+    <tr>
+      <td>Agent SDKs</td>
+      <td>Tool calling, handoffs, tracing, fast developer onboarding</td>
+      <td>Most are request-scoped and thin on lifecycle, budgets, health, and fleet operations</td>
+      <td>Crawfish adds a control plane and operational semantics around those SDK-level primitives</td>
+    </tr>
+    <tr>
+      <td>Graph and workflow frameworks</td>
+      <td>State persistence, human-in-the-loop, branching, workflow composition</td>
+      <td>They center the workflow graph rather than the ongoing life of supervised agents</td>
+      <td>Crawfish centers long-lived agents, dependency graphs, degraded operation, and runtime policy enforcement</td>
+    </tr>
+    <tr>
+      <td>Multi-agent chat frameworks</td>
+      <td>Delegation patterns, event-driven communication, rapid prototyping</td>
+      <td>Operational guarantees, admission control, safety policy, and budget enforcement are often left to user code</td>
+      <td>Crawfish turns multi-agent coordination into an operational system rather than a conversational pattern library</td>
+    </tr>
+    <tr>
+      <td>Durable workflow engines</td>
+      <td>Retries, timers, idempotency, long-running coordination</td>
+      <td>They are not model-native and know nothing about prompts, model fallback, tool scopes, token budgets, or approval semantics</td>
+      <td>Crawfish borrows durability ideas but applies them at the agent runtime layer</td>
+    </tr>
+  </table>
+
+  <h3>2.1 The Product Gap</h3>
+  <p>Today, a team that wants a production agent system typically stitches together an agent SDK, an orchestration library, an event bus, tracing, a scheduler, secret handling, and a custom supervisor. That architecture works for prototypes but breaks down operationally. There is no consistent object for an agent's desired state, no standard degraded mode, no unified contract for budget and safety policy, and no clean bridge between tool protocols and agent protocols.</p>
+  <p>Crawfish occupies that gap. It is the runtime layer that sits between application logic and infrastructure plumbing.</p>
+
+  <h3>2.2 Why This Gap Is Defensible</h3>
+  <ul>
+    <li>Lifecycle and control-plane concepts are cross-cutting. They are difficult to retrofit into request-scoped SDKs without breaking their simplicity model.</li>
+    <li>Execution contracts touch scheduling, routing, observability, security, and developer experience at once. This is architecture, not a helper library.</li>
+    <li>Protocol interoperability alone is not enough. The real challenge is policy-preserving interoperability: tool scope, deadlines, approvals, and failure semantics must survive cross-protocol boundaries.</li>
+    <li>Always-on systems need a reconciliation loop, not just a while-loop.</li>
+  </ul>
+
+  <h2>3. Target Users, Buyers, And Jobs To Be Done</h2>
+  <table class="data">
+    <tr>
+      <th>Role</th>
+      <th>Primary pain</th>
+      <th>Job to be done</th>
+      <th>Why Crawfish fits</th>
+    </tr>
+    <tr>
+      <td>Platform engineer / infra lead</td>
+      <td>Agent systems are hard to supervise and harder to operate safely</td>
+      <td>Deploy agent services with clear health, rollback, policy, and observability semantics</td>
+      <td>Crawfish provides lifecycle management, admission control, auditability, and operational metrics</td>
+    </tr>
+    <tr>
+      <td>AI product engineer</td>
+      <td>Successful demos become unreliable when long-running tools, retries, and cost controls enter the picture</td>
+      <td>Ship agent features that survive failures and stay within latency and budget limits</td>
+      <td>Crawfish turns model and tool calls into durable task execution with contracts and fallback</td>
+    </tr>
+    <tr>
+      <td>Developer tools team</td>
+      <td>Coding agents require file safety, task isolation, and resumable workflows</td>
+      <td>Coordinate local or remote coding agents without uncontrolled edits or runaway loops</td>
+      <td>Crawfish adds locks, scoped tool policies, approvals, and action semantics suited to coding workloads</td>
+    </tr>
+  </table>
+
+  <h3>3.1 Beachhead Use Cases</h3>
+  <ol>
+    <li><strong>Engineering and repo automation:</strong> code review, dependency updates, CI triage, flaky test isolation, release prep.</li>
+    <li><strong>Ops and incident automation:</strong> alert enrichment, runbook execution, remediation proposals, ticket generation.</li>
+    <li><strong>Back-office workflows:</strong> document intake, approval routing, SLA-governed email and queue processing.</li>
+  </ol>
+
+  <div class="note">
+    <strong>Positioning choice:</strong> the initial story should center on "agent fleets for engineering and operations" rather than broad consumer assistants or general workflow automation. Those buyer groups care most about reliability, policy, and control, which are Crawfish's sharpest differentiators.
+  </div>
+
+  <h2>4. Product Principles</h2>
+  <ul>
+    <li><strong>Keep the agent loop simple:</strong> model thinking stays close to the agent; operational complexity lives in the runtime.</li>
+    <li><strong>Policies over prompt text:</strong> budgets, tool scopes, deadlines, and approvals are machine-enforced contracts.</li>
+    <li><strong>Graceful degradation beats binary failure:</strong> cheaper model, narrower tool scope, lower background priority, and delayed retries should come before hard stop whenever safe.</li>
+    <li><strong>Desired state over imperative orchestration:</strong> the system should reconcile toward a declared target state.</li>
+    <li><strong>Protocol-native, vendor-neutral:</strong> tools, remote agents, and transports should be replaceable without rewriting agent logic.</li>
+    <li><strong>Developer-local first, production-ready second:</strong> single-host mode must be easy; cluster mode must not require a rewrite.</li>
+    <li><strong>Observability is part of the product surface:</strong> cost, latency, failure reasons, and transitions are first-class outputs.</li>
+  </ul>
+
+  <h2>5. Product Definition</h2>
+  <h3>5.1 Core Objects</h3>
+  <table class="data">
+    <tr>
+      <th>Object</th>
+      <th>Description</th>
+      <th>Why it matters</th>
+    </tr>
+    <tr>
+      <td>Agent Manifest</td>
+      <td>Declarative definition of identity, dependencies, model class, tools, policies, and lifecycle behavior</td>
+      <td>Moves runtime configuration out of implicit code paths</td>
+    </tr>
+    <tr>
+      <td>Task Action</td>
+      <td>Long-running durable task with goal, feedback, cancellation, checkpoints, and result artifacts</td>
+      <td>Replaces opaque background jobs with inspectable execution</td>
+    </tr>
+    <tr>
+      <td>Execution Contract</td>
+      <td>Runtime-enforced constraints for latency, budget, safety, routing, and recovery</td>
+      <td>Makes production limits explicit and composable</td>
+    </tr>
+    <tr>
+      <td>Capability Descriptor</td>
+      <td>Normalized description of what an agent or tool can do, at what risk, and with what cost profile</td>
+      <td>Lets the runtime bridge MCP tools, internal actions, and remote agents under one planning surface</td>
+    </tr>
+    <tr>
+      <td>Lifecycle Record</td>
+      <td>Observed state timeline, health status, transitions, and failure reasons for each agent instance</td>
+      <td>Creates a control-plane view instead of hidden runtime behavior</td>
+    </tr>
+  </table>
+
+  <h3>5.2 What Makes Crawfish Technically Different</h3>
+  <ul>
+    <li><strong>It separates the control plane from the inference plane.</strong> Models decide task content; the runtime decides whether the task may run, on which agent, with which contract, and in which degradation profile.</li>
+    <li><strong>It treats "QoS" as part of a broader execution contract.</strong> Transport semantics, budget policy, safety policy, and fallback rules live in one compiled plan.</li>
+    <li><strong>It unifies tool and agent interoperability.</strong> MCP, A2A, and local subprocess adapters all feed a normalized capability model.</li>
+    <li><strong>It is local-first without being local-only.</strong> The same programming model supports single-host mode and clustered mode.</li>
+  </ul>
+
+  <h2>6. Technical Architecture</h2>
+  <h3>6.1 Runtime Topology</h3>
+  <table class="data">
+    <tr>
+      <th>Component</th>
+      <th>Role</th>
+      <th>P0 expectation</th>
+    </tr>
+    <tr>
+      <td>Supervisor daemon</td>
+      <td>Reconciliation loop, lifecycle transitions, health monitoring, scheduling, policy compilation</td>
+      <td>Required</td>
+    </tr>
+    <tr>
+      <td>Agent worker runtime</td>
+      <td>Runs agent loops, tool sessions, checkpoints, and task execution callbacks</td>
+      <td>Required</td>
+    </tr>
+    <tr>
+      <td>Action store</td>
+      <td>Persists task definitions, feedback events, checkpoints, and final artifacts</td>
+      <td>Required</td>
+    </tr>
+    <tr>
+      <td>Event bus</td>
+      <td>Agent state events, feedback streams, and notifications</td>
+      <td>Embedded in single-node mode, pluggable in cluster mode</td>
+    </tr>
+    <tr>
+      <td>Protocol adapter mesh</td>
+      <td>MCP client sessions, A2A connectors, subprocess adapters, future plugins</td>
+      <td>MCP required, others phased</td>
+    </tr>
+    <tr>
+      <td>Policy engine</td>
+      <td>Compiles org rules, agent defaults, and task contracts into an execution plan</td>
+      <td>Required</td>
+    </tr>
+    <tr>
+      <td>Observability pipeline</td>
+      <td>Traces, metrics, structured logs, cost events, audit trail</td>
+      <td>Required</td>
+    </tr>
+  </table>
+
+  <h3>6.2 Control Plane vs Execution Plane</h3>
+  <table class="data">
+    <tr>
+      <th>Plane</th>
+      <th>Responsibilities</th>
+      <th>Non-responsibilities</th>
+    </tr>
+    <tr>
+      <td>Control plane</td>
+      <td>Desired state, agent placement, policy compilation, drain and recover, dependency graph, admission control, lease management</td>
+      <td>It does not generate task content or reason over user prompts</td>
+    </tr>
+    <tr>
+      <td>Execution plane</td>
+      <td>Model calls, tool calls, local state mutation, checkpointing, feedback streaming, result artifacts</td>
+      <td>It does not decide org-wide policy or fleet-level topology</td>
+    </tr>
+  </table>
+  <p>This split is important. Many current frameworks mix scheduling logic, business logic, and model logic inside one loop. Crawfish keeps the loop simple by moving operational responsibility to the runtime.</p>
+
+  <h3>6.3 Managed Lifecycle And Reconciliation</h3>
+  <p>Every agent instance is managed by a reconciliation loop. The runtime continuously compares desired state to observed state and takes corrective action. This draws from ROS2 managed nodes and from modern control-plane design, but adapts both to model- and tool-driven workloads.</p>
+
+  <table class="data">
+    <tr>
+      <th>State</th>
+      <th>Meaning</th>
+      <th>Typical entry trigger</th>
+      <th>Typical exit trigger</th>
+    </tr>
+    <tr>
+      <td>Unconfigured</td>
+      <td>Manifest loaded, runtime not yet initialized</td>
+      <td>Definition created or process discovered</td>
+      <td>Configuration begins</td>
+    </tr>
+    <tr>
+      <td>Configuring</td>
+      <td>Model adapters, tool sessions, secrets, and dependencies are being prepared</td>
+      <td>Supervisor begins configure transition</td>
+      <td>Configuration succeeds or fails</td>
+    </tr>
+    <tr>
+      <td>Inactive</td>
+      <td>Ready but not accepting new work</td>
+      <td>Configuration succeeds</td>
+      <td>Activation or finalization</td>
+    </tr>
+    <tr>
+      <td>Activating</td>
+      <td>Warm-up, health probe, cache restore, session restore</td>
+      <td>Supervisor issues activate</td>
+      <td>Active or Degraded</td>
+    </tr>
+    <tr>
+      <td>Active</td>
+      <td>Accepting tasks under normal policy profile</td>
+      <td>Health checks and dependencies are green</td>
+      <td>Degraded, Draining, Failed</td>
+    </tr>
+    <tr>
+      <td>Degraded</td>
+      <td>Agent stays online with reduced capability or higher restrictions</td>
+      <td>Budget pressure, provider instability, repeated soft failures, dependency impairment</td>
+      <td>Recovery, Draining, Failed</td>
+    </tr>
+    <tr>
+      <td>Draining</td>
+      <td>No new tasks accepted; existing work completes or checkpoints</td>
+      <td>Deploy, shutdown, dependency maintenance, rolling restart</td>
+      <td>Inactive or Finalized</td>
+    </tr>
+    <tr>
+      <td>Failed</td>
+      <td>Runtime cannot safely continue under current policy</td>
+      <td>Hard policy violation, repeated crash loop, unrecoverable dependency loss</td>
+      <td>Reconfigure, manual intervention, Finalized</td>
+    </tr>
+    <tr>
+      <td>Finalized</td>
+      <td>Process decommissioned and resources released</td>
+      <td>Delete or permanent shutdown</td>
+      <td>None</td>
+    </tr>
+  </table>
+
+  <p>The <strong>Degraded</strong> state is a key product differentiator. Instead of binary "healthy / unhealthy" logic, Crawfish lets a fleet preserve partial service safely. Example degradation profiles:</p>
+  <ul>
+    <li><strong>cost_saver:</strong> switch to cheaper model class, reduce background polling, lower context retention.</li>
+    <li><strong>read_only:</strong> disable mutating tools and force proposal-only outputs.</li>
+    <li><strong>latency_guard:</strong> shorten tool chains, cap retries, prefer cached context.</li>
+    <li><strong>dependency_isolation:</strong> reject tasks that require impaired upstream agents while continuing independent work.</li>
+  </ul>
+
+  <h3>6.4 Task Model: Actions, Not Fire-And-Forget Calls</h3>
+  <p>Long-running work is represented as a durable task action. This is the primary execution object in Crawfish. A task is accepted, scheduled, checkpointed, observed, and eventually resolved as a result artifact.</p>
+
+  <table class="data">
+    <tr>
+      <th>Field group</th>
+      <th>Examples</th>
+      <th>Why it exists</th>
+    </tr>
+    <tr>
+      <td>Identity</td>
+      <td>task_id, tenant_id, requester, correlation_id, idempotency_key</td>
+      <td>Supports traceability, deduplication, and audit</td>
+    </tr>
+    <tr>
+      <td>Goal</td>
+      <td>intent, capability, input payload, context references, expected artifact types</td>
+      <td>Makes work routable and inspectable</td>
+    </tr>
+    <tr>
+      <td>Contract</td>
+      <td>deadline_ms, max_cost_usd, approval_policy, tool_scope, quality_class, retry_budget</td>
+      <td>Moves runtime constraints out of prompt text</td>
+    </tr>
+    <tr>
+      <td>Scheduling</td>
+      <td>priority, earliest_start, affinity, dependency set, preemption class</td>
+      <td>Allows policy-aware scheduling and backpressure</td>
+    </tr>
+    <tr>
+      <td>Runtime state</td>
+      <td>phase, heartbeat_at, checkpoint_ref, assigned_agent, blocked_reason</td>
+      <td>Supports inspection and recovery</td>
+    </tr>
+    <tr>
+      <td>Outputs</td>
+      <td>feedback events, trace refs, artifacts, final status, failure taxonomy</td>
+      <td>Provides durable results and operational analysis</td>
+    </tr>
+  </table>
+
+  <p>Task phases should include <strong>accepted</strong>, <strong>running</strong>, <strong>blocked</strong>, <strong>awaiting_approval</strong>, <strong>cancelling</strong>, <strong>completed</strong>, <strong>failed</strong>, and <strong>expired</strong>.</p>
+  <p>Cancellation is not best-effort theater. The runtime must propagate cancellation through model streams, tool sessions, and child actions, then persist the terminal state.</p>
+
+  <h3>6.5 Communication Patterns</h3>
+  <table class="data">
+    <tr>
+      <th>Pattern</th>
+      <th>Purpose</th>
+      <th>Semantics</th>
+      <th>Example</th>
+    </tr>
+    <tr>
+      <td>Topics</td>
+      <td>Fleet events and notifications</td>
+      <td>Many-to-many, asynchronous, optionally durable</td>
+      <td>Agent state changed, artifact created, budget threshold crossed</td>
+    </tr>
+    <tr>
+      <td>Services</td>
+      <td>Synchronous control and data queries</td>
+      <td>Request-response, short-lived, typed</td>
+      <td>Inspect agent, fetch checkpoint, validate policy</td>
+    </tr>
+    <tr>
+      <td>Actions</td>
+      <td>Long-running execution</td>
+      <td>Goal, feedback, result, cancellation, checkpointing</td>
+      <td>Review PR, enrich alert, research vendor, update dependency tree</td>
+    </tr>
+  </table>
+  <p>The Action pattern is where Crawfish gains most of its product leverage. It gives the runtime a durable unit of work that can be scheduled, observed, paused, retried, or escalated without inventing custom control flow for every use case.</p>
+
+  <h3>6.6 Execution Contracts</h3>
+  <p>"QoS" is useful inspiration, but the user-facing abstraction should be broader and more intuitive: <strong>Execution Contract</strong>. A contract is compiled from organization defaults, agent manifest defaults, and per-task overrides.</p>
+
+  <table class="data">
+    <tr>
+      <th>Contract layer</th>
+      <th>Fields</th>
+      <th>Behavior</th>
+    </tr>
+    <tr>
+      <td>Delivery contract</td>
+      <td>deadline_ms, freshness_ttl_ms, required_ack, liveliness_window_ms</td>
+      <td>Defines time and delivery expectations</td>
+    </tr>
+    <tr>
+      <td>Execution contract</td>
+      <td>max_cost_usd, max_tokens, model_class, fallback_chain, retry_budget</td>
+      <td>Constrains model and compute behavior</td>
+    </tr>
+    <tr>
+      <td>Safety contract</td>
+      <td>tool_scope, approval_policy, mutation_mode, data_zone, secret_policy</td>
+      <td>Constrains what the task may touch</td>
+    </tr>
+    <tr>
+      <td>Quality contract</td>
+      <td>quality_class, evaluation_hook, minimum_confidence, human_review_rule</td>
+      <td>Controls escalation and review</td>
+    </tr>
+    <tr>
+      <td>Recovery contract</td>
+      <td>checkpoint_interval, resumability, fallback_behavior, dead_letter_policy</td>
+      <td>Controls restart and failure semantics</td>
+    </tr>
+  </table>
+
+  <p>Two policy types are especially important:</p>
+  <ul>
+    <li><strong>Hard policies:</strong> must never be violated. Example: no write tools without approval, no crossing tenant boundary, no budget overspend.</li>
+    <li><strong>Soft policies:</strong> the runtime may degrade or reroute before declaring failure. Example: target latency, preferred provider, preferred model class.</li>
+  </ul>
+
+  <p>This distinction is a major product advantage. It lets the runtime stay operational under pressure without hiding real violations.</p>
+
+  <h3>6.7 Policy Compiler And Execution Plan</h3>
+  <p>The runtime should not consult an LLM to decide scheduling or policy enforcement. Instead, a deterministic policy compiler produces an <strong>Execution Plan</strong> from three inputs:</p>
+  <ol>
+    <li>Organization rules</li>
+    <li>Agent manifest defaults</li>
+    <li>Task-level overrides</li>
+  </ol>
+  <p>The compiled plan determines model routing, allowed tools, approval requirements, retry and fallback behavior, checkpoint cadence, and observability tags. This gives users predictability and auditability.</p>
+
+  <h3>6.8 Scheduler, Concurrency, And Backpressure</h3>
+  <p>Crawfish should use a scheduler that is explicit about priority, deadline, and resource limits. The runtime must assume that agents are expensive and that tool calls can block unpredictably.</p>
+  <ul>
+    <li><strong>Priority bands:</strong> control traffic, user-facing tasks, background maintenance, best-effort cron work.</li>
+    <li><strong>Deadline-aware ordering:</strong> within a band, earlier deadlines outrank later ones.</li>
+    <li><strong>Mutually exclusive groups:</strong> preserve state safety for tasks sharing a mutable workspace or memory scope.</li>
+    <li><strong>Reentrant groups:</strong> allow parallel execution for stateless or read-only work.</li>
+    <li><strong>Admission control:</strong> reject or defer tasks when budget, token rate, or tool session capacity is exhausted.</li>
+    <li><strong>Lease-based ownership:</strong> each active task has a lease; loss of lease triggers recovery rather than duplicate execution.</li>
+  </ul>
+
+  <h3>6.9 State, Checkpointing, And Recovery</h3>
+  <p>Crawfish needs durable execution, but it should not force users to learn a heavyweight workflow DSL. The right model is <strong>checkpointed agent turns</strong>.</p>
+  <ul>
+    <li>Checkpoint after each model turn, after each mutating tool call, and at explicit yield points for long tool operations.</li>
+    <li>Persist enough state to resume safely: task phase, agent memory refs, tool outputs, pending approvals, artifact refs, and trace linkage.</li>
+    <li>Store artifacts separately from state snapshots so large outputs do not bloat recovery records.</li>
+    <li>On restart, the supervisor reconstructs the action graph, reassigns resumable tasks, and marks non-resumable ones for replay or escalation based on policy.</li>
+  </ul>
+  <p>Developer mode should default to SQLite-backed state. Production mode should support Postgres-backed control state and pluggable durable event infrastructure.</p>
+
+  <h3>6.10 Protocol Adapter Mesh</h3>
+  <table class="data">
+    <tr>
+      <th>Adapter</th>
+      <th>Role</th>
+      <th>Why it belongs</th>
+      <th>Priority</th>
+    </tr>
+    <tr>
+      <td>MCP client</td>
+      <td>Tool discovery, tool invocation, session management</td>
+      <td>MCP is the fastest path to a broad tool ecosystem</td>
+      <td>P0</td>
+    </tr>
+    <tr>
+      <td>A2A connector</td>
+      <td>Remote agent discovery and delegation</td>
+      <td>Extends Crawfish beyond one framework and one trust domain</td>
+      <td>P1</td>
+    </tr>
+    <tr>
+      <td>Local subprocess adapter</td>
+      <td>Isolated coding agents and automation workers over stdin/stdout or RPC</td>
+      <td>Important for coding use cases and tool sandboxing</td>
+      <td>P1</td>
+    </tr>
+    <tr>
+      <td>Custom transport plugins</td>
+      <td>Domain-specific tools and interop backends</td>
+      <td>Preserves extensibility without bloating core</td>
+      <td>P2</td>
+    </tr>
+  </table>
+  <p>The key design choice is normalization. Each adapter should expose a capability descriptor with verbs, risk class, cost class, latency class, mutability, and required approvals. This is how Crawfish keeps policy consistent even when execution crosses MCP, A2A, and local adapters.</p>
+
+  <h3>6.11 Observability And Governance</h3>
+  <p>Tracing alone is not enough. The runtime must emit operational meaning, not just call trees.</p>
+  <ul>
+    <li><strong>Trace model:</strong> spans for task, agent turn, tool call, approval gate, scheduler decision, and lifecycle transition.</li>
+    <li><strong>Metric model:</strong> deadline hit rate, budget overrun rate, recovery success rate, active degraded agents, approval wait time, checkpoint replay count, token and dollar burn per successful task.</li>
+    <li><strong>Audit model:</strong> who requested what, which policy applied, why fallback happened, who approved writes, what artifact was produced.</li>
+    <li><strong>Governance model:</strong> tenant boundaries, secret references, tool allowlists, mutable action logs, and retention controls.</li>
+  </ul>
+
+  <h3>6.12 Security Model</h3>
+  <table class="data">
+    <tr>
+      <th>Area</th>
+      <th>Requirement</th>
+    </tr>
+    <tr>
+      <td>Secrets</td>
+      <td>Secrets must be referenced, not embedded. They should be mounted into tool sessions only when contract and policy allow it.</td>
+    </tr>
+    <tr>
+      <td>Tool permissions</td>
+      <td>Tools are declared with risk class and mutation scope. Runtime policy decides whether proposal-only, approval-gated, or autonomous execution is permitted.</td>
+    </tr>
+    <tr>
+      <td>Workspace isolation</td>
+      <td>Coding workloads require per-task or per-agent workspace isolation plus file locking or branch isolation for mutable operations.</td>
+    </tr>
+    <tr>
+      <td>Approval gates</td>
+      <td>Human approval must be a first-class runtime state, not an application afterthought.</td>
+    </tr>
+    <tr>
+      <td>Tenancy</td>
+      <td>Tenant IDs and data-zone constraints must propagate through tasks, checkpoints, and remote delegation.</td>
+    </tr>
+  </table>
+
+  <h3>6.13 Reference Deployment Modes</h3>
+  <table class="data">
+    <tr>
+      <th>Mode</th>
+      <th>Target user</th>
+      <th>Runtime shape</th>
+      <th>Why it matters</th>
+    </tr>
+    <tr>
+      <td>Single-host developer mode</td>
+      <td>Individual engineer</td>
+      <td>One supervisor daemon, local workers, SQLite state, embedded event bus, local MCP sessions</td>
+      <td>Fast setup and strong local UX</td>
+    </tr>
+    <tr>
+      <td>Team staging mode</td>
+      <td>Small internal team</td>
+      <td>Supervisor plus shared Postgres, external observability sink, optional NATS-backed bus</td>
+      <td>Shared testing without full platform overhead</td>
+    </tr>
+    <tr>
+      <td>Production cluster mode</td>
+      <td>Platform and operations teams</td>
+      <td>Redundant supervisors, leased workers, durable event infrastructure, centralized policy and audit</td>
+      <td>True always-on fleet operations</td>
+    </tr>
+  </table>
+
+  <h2>7. Developer Experience</h2>
+  <h3>7.1 Product Surface</h3>
+  <ul>
+    <li><code>crawfishd</code> supervisor daemon</li>
+    <li><code>crawfish</code> CLI for init, run, status, inspect, drain, resume, and policy validation</li>
+    <li>TypeScript-first SDK for manifests, callbacks, and adapters</li>
+    <li>Python control-plane SDK after core runtime is stable</li>
+  </ul>
+
+  <h3>7.2 Configuration Shape</h3>
+  <pre>[agent.repo_reviewer]
+role = "Review pull requests and produce structured findings"
+capabilities = ["code.review", "repo.read", "ci.inspect"]
+dependencies = ["repo_indexer"]
+model_class = "standard"
+
+[agent.repo_reviewer.lifecycle]
+heartbeat_seconds = 10
+degrade_after_failures = 3
+drain_timeout_seconds = 60
+
+[agent.repo_reviewer.contract]
+deadline_ms = 30000
+max_cost_usd = 1.50
+tool_scope = ["git.read", "fs.read", "ci.read"]
+approval_policy = "human_for_write"
+fallback_chain = ["standard", "economy"]
+
+[agent.repo_reviewer.checkpoint]
+mode = "turn"
+artifact_retention = "7d"</pre>
+
+  <h3>7.3 UX Requirements</h3>
+  <ul>
+    <li>Hello-world local setup in under 10 minutes.</li>
+    <li>Meaningful starter template in under 30 lines of manifest configuration.</li>
+    <li>One command to inspect why an agent is degraded, blocked, or denied by policy.</li>
+    <li>One command to inspect which policy compiled into the current execution plan.</li>
+  </ul>
+
+  <h2>8. MVP Scope</h2>
+  <h3>8.1 P0: Must Have For Alpha</h3>
+  <table class="data">
+    <tr>
+      <th>Capability</th>
+      <th>Description</th>
+      <th>Acceptance criteria</th>
+    </tr>
+    <tr>
+      <td>Supervisor daemon</td>
+      <td>Single-host control plane with desired-state reconciliation</td>
+      <td>Can start, stop, drain, and inspect a multi-agent fleet from one process</td>
+    </tr>
+    <tr>
+      <td>Lifecycle state machine</td>
+      <td>Managed transitions with health and dependency checks</td>
+      <td>Agents move through configured states; dependency failures can trigger Degraded or Draining transitions automatically</td>
+    </tr>
+    <tr>
+      <td>Action task model</td>
+      <td>Durable long-running task object with progress and cancellation</td>
+      <td>Every task has a stable ID, feedback stream, terminal status, and persisted result or failure reason</td>
+    </tr>
+    <tr>
+      <td>Execution contract v1</td>
+      <td>Deadline, max cost, tool scope, approval policy, retry budget, fallback chain</td>
+      <td>Runtime enforces hard policies and records soft-policy degradations</td>
+    </tr>
+    <tr>
+      <td>MCP integration</td>
+      <td>Tool session management and invocation</td>
+      <td>Agents can discover and invoke MCP tools under scoped policy</td>
+    </tr>
+    <tr>
+      <td>Checkpoint and resume</td>
+      <td>Turn-based checkpoints with restart recovery</td>
+      <td>Supervisor restart can resume resumable tasks from the last durable checkpoint</td>
+    </tr>
+    <tr>
+      <td>Observability baseline</td>
+      <td>Trace IDs, lifecycle events, cost and latency metrics</td>
+      <td>Every task and lifecycle transition is inspectable via CLI and exported telemetry</td>
+    </tr>
+    <tr>
+      <td>Security baseline</td>
+      <td>Secret refs, tool scopes, approval gates</td>
+      <td>Mutating tools cannot run without declared policy and, when required, explicit approval</td>
+    </tr>
+  </table>
+
+  <h3>8.2 P1: Should Have For Beta</h3>
+  <ul>
+    <li>A2A connector with policy-preserving remote delegation</li>
+    <li>Local subprocess adapter for coding agents and sandboxed workers</li>
+    <li>Visual fleet dashboard for lifecycle and task inspection</li>
+    <li>Multi-host supervisor and leased worker model</li>
+    <li>Context compression and memory compaction hooks</li>
+    <li>Evaluation and review hooks tied to quality contract</li>
+  </ul>
+
+  <h3>8.3 P2: Later Expansion</h3>
+  <ul>
+    <li>Marketplace and reusable capability packs</li>
+    <li>Policy DSL with simulation mode</li>
+    <li>Advanced multi-tenant control plane</li>
+    <li>Additional transport and protocol plugins</li>
+    <li>Adaptive scheduling based on historical success and cost curves</li>
+  </ul>
+
+  <h2>9. Non-Goals For Initial Versions</h2>
+  <ul>
+    <li>Not a general ETL or batch data pipeline engine</li>
+    <li>Not a consumer personal assistant shell</li>
+    <li>Not a benchmark-maximization framework</li>
+    <li>Not a replacement for Kubernetes, Temporal, or an enterprise secrets platform</li>
+    <li>Not a visual-first product in v0.1; the runtime comes first, the dashboard comes after</li>
+  </ul>
+
+  <h2>10. Success Metrics</h2>
+  <table class="data">
+    <tr>
+      <th>Metric</th>
+      <th>Why it matters</th>
+      <th>Alpha target</th>
+    </tr>
+    <tr>
+      <td>Task deadline hit rate</td>
+      <td>Measures operational predictability</td>
+      <td>Greater than 90 percent for tasks within supported contract envelope</td>
+    </tr>
+    <tr>
+      <td>Budget overrun rate</td>
+      <td>Shows whether contracts actually control spend</td>
+      <td>Less than 3 percent of tasks breach hard budget limits</td>
+    </tr>
+    <tr>
+      <td>Recovery success rate</td>
+      <td>Measures restart resilience</td>
+      <td>Greater than 80 percent of resumable tasks recover without manual intervention</td>
+    </tr>
+    <tr>
+      <td>Degraded survival rate</td>
+      <td>Shows value of graceful degradation</td>
+      <td>At least half of soft-failure incidents end in Degraded rather than Failed state</td>
+    </tr>
+    <tr>
+      <td>Time to inspect failure cause</td>
+      <td>Measures operator ergonomics</td>
+      <td>Under 2 minutes using CLI and telemetry</td>
+    </tr>
+    <tr>
+      <td>Hello-world setup time</td>
+      <td>Measures onboarding friction</td>
+      <td>Under 10 minutes for local mode</td>
+    </tr>
+  </table>
+
+  <h2>11. Go-To-Market Narrative</h2>
+  <h3>11.1 Launch Story</h3>
+  <p>The launch narrative should not claim "we orchestrate agents better" in the abstract. It should claim something more concrete and more defensible: <strong>most frameworks help you build agent logic; Crawfish helps you operate agent systems</strong>.</p>
+
+  <h3>11.2 Hero Demo</h3>
+  <p>The hero demo should be a small engineering or operations fleet, not a generic chatbot. Example: repo indexer, repo reviewer, CI triage agent, and release prep agent running under one supervisor, with visible degradation, approvals, and recovery.</p>
+
+  <h3>11.3 Open Source Strategy</h3>
+  <ul>
+    <li>Open-source the core runtime, manifest model, MCP integration, CLI, and telemetry schema.</li>
+    <li>Make the operational story obvious from day one: inspectable state, visible contracts, clear logs, and restart recovery.</li>
+    <li>Document one local mode and one production reference deployment so users see a path from laptop to team use.</li>
+  </ul>
+
+  <h2>12. Risks And Mitigations</h2>
+  <table class="data">
+    <tr>
+      <th>Risk</th>
+      <th>Impact</th>
+      <th>Mitigation</th>
+    </tr>
+    <tr>
+      <td>Over-engineering</td>
+      <td>High</td>
+      <td>Protect the agent authoring surface. Keep manifests small. Move complexity behind the runtime and policy compiler.</td>
+    </tr>
+    <tr>
+      <td>Protocol churn</td>
+      <td>Medium</td>
+      <td>Keep adapters thin and normalize capabilities and contracts above them.</td>
+    </tr>
+    <tr>
+      <td>Weak differentiation against workflow engines</td>
+      <td>Medium</td>
+      <td>Focus the narrative on lifecycle, degraded operation, tool safety, and policy-preserving interop.</td>
+    </tr>
+    <tr>
+      <td>Security incidents in always-on mode</td>
+      <td>High</td>
+      <td>Ship approval gates, scoped tools, secret refs, audit logs, and read-only degraded mode early.</td>
+    </tr>
+    <tr>
+      <td>Complex mental model for users</td>
+      <td>High</td>
+      <td>Provide strong templates, clear defaults, and a progressive path from single agent to fleet.</td>
+    </tr>
+  </table>
+
+  <h2>13. Recommended Roadmap</h2>
+  <table class="data">
+    <tr>
+      <th>Phase</th>
+      <th>Timeline</th>
+      <th>Focus</th>
+      <th>Key outputs</th>
+    </tr>
+    <tr>
+      <td>Phase 0</td>
+      <td>Weeks 1-2</td>
+      <td>Architecture and developer experience</td>
+      <td>Manifest schema, supervisor skeleton, local mode, core demo, docs</td>
+    </tr>
+    <tr>
+      <td>Phase 1</td>
+      <td>Weeks 3-8</td>
+      <td>Alpha runtime</td>
+      <td>Lifecycle manager, action model, contract v1, MCP integration, checkpointing, CLI</td>
+    </tr>
+    <tr>
+      <td>Phase 2</td>
+      <td>Months 3-4</td>
+      <td>Team-grade operations</td>
+      <td>Dashboard, policy inspector, richer observability, leased workers, better degradation profiles</td>
+    </tr>
+    <tr>
+      <td>Phase 3</td>
+      <td>Months 5-6</td>
+      <td>Interoperability expansion</td>
+      <td>A2A connector, subprocess adapters, remote execution, evaluation hooks</td>
+    </tr>
+    <tr>
+      <td>Phase 4</td>
+      <td>Months 7-12</td>
+      <td>Production hardening</td>
+      <td>Policy simulation, enterprise controls, scale testing, plugin ecosystem</td>
+    </tr>
+  </table>
+
+  <h2>14. Final Recommendation</h2>
+  <p>Crawfish should position itself as the runtime layer the current agent ecosystem is missing. The key is not to promise "smarter agents." The key is to promise <strong>operable agents</strong>.</p>
+  <p>The strongest version of this product is one that keeps the authoring model simple while making the runtime operationally rich: managed lifecycle, action-based durability, execution contracts, protocol-native adapters, and built-in governance. If those pieces come together cleanly, Crawfish will not look like another orchestration framework. It will look like the control plane agent systems have been missing.</p>
+</body>
+</html>

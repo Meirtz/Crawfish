@@ -1,0 +1,49 @@
+[storage]
+sqlite_path = ".crawfish/state/control.db"
+state_dir = ".crawfish/state"
+
+[fleet]
+manifests_dir = "agents"
+
+[runtime]
+reconcile_interval_ms = 5000
+
+[governance.system_defaults]
+default_disposition = "deny"
+capability_visibility = "owner_only"
+data_boundary = "owner_only"
+tool_boundary = "no_cross_owner_mutation"
+workspace_boundary = "isolated"
+network_boundary = "local_only"
+
+[contracts.org_defaults.delivery]
+deadline_ms = 300000
+freshness_ttl_ms = 60000
+required_ack = true
+liveliness_window_ms = 30000
+
+[contracts.org_defaults.execution]
+max_cost_usd = 5.0
+max_tokens = 64000
+model_class = "standard"
+preferred_harnesses = ["mcp"]
+fallback_chain = ["deterministic"]
+retry_budget = 1
+
+[contracts.org_defaults.safety]
+tool_scope = ["repo:read", "ci:read", "logs:read"]
+approval_policy = "on_mutation"
+mutation_mode = "proposal_only"
+data_zone = "owner_local"
+secret_policy = "adapter_scoped"
+
+[contracts.org_defaults.quality]
+quality_class = "standard"
+minimum_confidence = 0.6
+
+[contracts.org_defaults.recovery]
+resumability = "checkpoint_resume"
+fallback_behavior = "degrade"
+continuity_preference = ["deterministic_only", "store_and_forward", "human_handoff"]
+deterministic_fallbacks = ["local.rule_engine"]
+

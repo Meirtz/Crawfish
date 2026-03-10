@@ -1,0 +1,36 @@
+[package]
+name = "crawfish-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+crawfish-core = { path = "../crawfish-core" }
+crawfish-runtime = { path = "../crawfish-runtime" }
+crawfish-types = { path = "../crawfish-types" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
+
+[[bin]]
+name = "crawfish"
+path = "src/bin/crawfish.rs"
+
+[[bin]]
+name = "crawfishd"
+path = "src/bin/crawfishd.rs"
+

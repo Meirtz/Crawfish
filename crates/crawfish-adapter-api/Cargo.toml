@@ -1,0 +1,15 @@
+[package]
+name = "crawfish-adapter-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crawfish-types = { path = "../crawfish-types" }
+serde.workspace = true
+serde_json.workspace = true
+

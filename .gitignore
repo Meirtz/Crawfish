@@ -1,0 +1,13 @@
+target/
+.DS_Store
+.idea/
+.vscode/
+.build/
+.docx-work-*/
+.crawfish/
+Cargo.lock
+__pycache__/
+*.pyc
+*.db
+*.db-shm
+*.db-wal

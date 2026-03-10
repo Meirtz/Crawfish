@@ -1,0 +1,553 @@
+use async_trait::async_trait;
+use crawfish_core::{ActionStore, CheckpointStore};
+use crawfish_types::{Action, AgentManifest, AuditReceipt, EncounterRecord, LifecycleRecord};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::{ConnectOptions, Pool, Row, Sqlite, SqlitePool};
+use std::path::{Path, PathBuf};
+use tokio::fs;
+
+pub struct SqliteStore {
+    pool: SqlitePool,
+    checkpoint_dir: PathBuf,
+}
+
+impl SqliteStore {
+    pub async fn connect(database_path: &Path, state_dir: &Path) -> anyhow::Result<Self> {
+        if let Some(parent) = database_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::create_dir_all(state_dir.join("checkpoints")).await?;
+
+        let options = SqliteConnectOptions::new()
+            .filename(database_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .disable_statement_logging();
+        let pool = Pool::<Sqlite>::connect_with(options).await?;
+        let store = Self {
+            pool,
+            checkpoint_dir: state_dir.join("checkpoints"),
+        };
+        store.migrate().await?;
+        Ok(store)
+    }
+
+    pub async fn migrate(&self) -> anyhow::Result<()> {
+        sqlx::migrate!("./migrations").run(&self.pool).await?;
+        Ok(())
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    pub async fn upsert_agent_manifest(&self, manifest: &AgentManifest) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(manifest)?;
+        sqlx::query(
+            r#"
+            INSERT INTO agents (id, owner_id, owner_kind, trust_domain, role, manifest_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+              owner_id = excluded.owner_id,
+              owner_kind = excluded.owner_kind,
+              trust_domain = excluded.trust_domain,
+              role = excluded.role,
+              manifest_json = excluded.manifest_json
+            "#,
+        )
+        .bind(&manifest.id)
+        .bind(&manifest.owner.id)
+        .bind(format!("{:?}", manifest.owner.kind).to_lowercase())
+        .bind(format!("{:?}", manifest.trust_domain).to_lowercase())
+        .bind(&manifest.role)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_agent_manifests(&self) -> anyhow::Result<Vec<AgentManifest>> {
+        let rows = sqlx::query("SELECT manifest_json FROM agents ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("manifest_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
+    pub async fn get_agent_manifest(
+        &self,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<AgentManifest>> {
+        let row = sqlx::query("SELECT manifest_json FROM agents WHERE id = ?1")
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("manifest_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn upsert_lifecycle_record(&self, record: &LifecycleRecord) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(record)?;
+        sqlx::query(
+            r#"
+            INSERT INTO lifecycle_records (
+              agent_id,
+              desired_state,
+              observed_state,
+              health,
+              transition_reason,
+              last_transition_at,
+              degradation_profile,
+              continuity_mode,
+              failure_count,
+              record_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(agent_id) DO UPDATE SET
+              desired_state = excluded.desired_state,
+              observed_state = excluded.observed_state,
+              health = excluded.health,
+              transition_reason = excluded.transition_reason,
+              last_transition_at = excluded.last_transition_at,
+              degradation_profile = excluded.degradation_profile,
+              continuity_mode = excluded.continuity_mode,
+              failure_count = excluded.failure_count,
+              record_json = excluded.record_json
+            "#,
+        )
+        .bind(&record.agent_id)
+        .bind(format!("{:?}", record.desired_state).to_lowercase())
+        .bind(format!("{:?}", record.observed_state).to_lowercase())
+        .bind(format!("{:?}", record.health).to_lowercase())
+        .bind(&record.transition_reason)
+        .bind(&record.last_transition_at)
+        .bind(record.degradation_profile.as_ref().map(enum_to_snake))
+        .bind(record.continuity_mode.as_ref().map(enum_to_snake))
+        .bind(i64::from(record.failure_count))
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_lifecycle_records(&self) -> anyhow::Result<Vec<LifecycleRecord>> {
+        let rows = sqlx::query("SELECT record_json FROM lifecycle_records ORDER BY agent_id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("record_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
+    pub async fn get_lifecycle_record(
+        &self,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<LifecycleRecord>> {
+        let row = sqlx::query("SELECT record_json FROM lifecycle_records WHERE agent_id = ?1")
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("record_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn insert_encounter(&self, encounter: &EncounterRecord) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(encounter)?;
+        sqlx::query(
+            r#"
+            INSERT INTO encounters (id, target_agent_id, trust_domain, state, encounter_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              target_agent_id = excluded.target_agent_id,
+              trust_domain = excluded.trust_domain,
+              state = excluded.state,
+              encounter_json = excluded.encounter_json
+            "#,
+        )
+        .bind(&encounter.id)
+        .bind(&encounter.target_agent_id)
+        .bind(format!("{:?}", encounter.trust_domain).to_lowercase())
+        .bind(format!("{:?}", encounter.state).to_lowercase())
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_latest_encounter_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<EncounterRecord>> {
+        let row = sqlx::query(
+            "SELECT encounter_json FROM encounters WHERE target_agent_id = ?1 ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("encounter_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn insert_audit_receipt(&self, receipt: &AuditReceipt) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(receipt)?;
+        sqlx::query(
+            r#"
+            INSERT INTO audit_receipts (id, encounter_ref, outcome, audit_json)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+              encounter_ref = excluded.encounter_ref,
+              outcome = excluded.outcome,
+              audit_json = excluded.audit_json
+            "#,
+        )
+        .bind(&receipt.id)
+        .bind(&receipt.encounter_ref)
+        .bind(format!("{:?}", receipt.outcome).to_lowercase())
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_audit_receipt_by_encounter(
+        &self,
+        encounter_ref: &str,
+    ) -> anyhow::Result<Option<AuditReceipt>> {
+        let row = sqlx::query("SELECT audit_json FROM audit_receipts WHERE encounter_ref = ?1")
+            .bind(encounter_ref)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("audit_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+}
+
+#[async_trait]
+impl ActionStore for SqliteStore {
+    async fn upsert_action(&self, action: &Action) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(action)?;
+        sqlx::query(
+            r#"
+            INSERT INTO actions (id, capability, phase, checkpoint_ref, action_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              capability = excluded.capability,
+              phase = excluded.phase,
+              checkpoint_ref = excluded.checkpoint_ref,
+              action_json = excluded.action_json
+            "#,
+        )
+        .bind(&action.id)
+        .bind(&action.capability)
+        .bind(format!("{:?}", action.phase).to_lowercase())
+        .bind(&action.checkpoint_ref)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn append_action_event(
+        &self,
+        action_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO action_events (action_id, event_type, payload_json, created_at) VALUES (?1, ?2, ?3, strftime('%s','now'))",
+        )
+        .bind(action_id)
+        .bind(event_type)
+        .bind(payload.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_action(&self, action_id: &str) -> anyhow::Result<Option<Action>> {
+        let row = sqlx::query("SELECT action_json FROM actions WHERE id = ?1")
+            .bind(action_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("action_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for SqliteStore {
+    async fn put_checkpoint(
+        &self,
+        action_id: &str,
+        checkpoint_ref: &str,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        let action_dir = self.checkpoint_dir.join(action_id);
+        fs::create_dir_all(&action_dir).await?;
+        let blob_path = action_dir.join(format!("{checkpoint_ref}.bin"));
+        fs::write(&blob_path, payload).await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO checkpoints (action_id, checkpoint_ref, blob_path, created_at)
+            VALUES (?1, ?2, ?3, strftime('%s','now'))
+            ON CONFLICT(action_id) DO UPDATE SET
+              checkpoint_ref = excluded.checkpoint_ref,
+              blob_path = excluded.blob_path,
+              created_at = excluded.created_at
+            "#,
+        )
+        .bind(action_id)
+        .bind(checkpoint_ref)
+        .bind(blob_path.display().to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_checkpoint(&self, action_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let row = sqlx::query("SELECT blob_path FROM checkpoints WHERE action_id = ?1")
+            .bind(action_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(row) => {
+                let path: String = row.try_get("blob_path")?;
+                Ok(Some(fs::read(path).await?))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+fn enum_to_snake<T: std::fmt::Debug>(value: &T) -> String {
+    format!("{value:?}")
+        .chars()
+        .flat_map(|c| match c {
+            'A'..='Z' => vec!['_', c.to_ascii_lowercase()],
+            _ => vec![c],
+        })
+        .collect::<String>()
+        .trim_start_matches('_')
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crawfish_core::now_timestamp;
+    use crawfish_types::{
+        ActionOutputs, ActionPhase, AgentManifest, AgentState, AuditOutcome, CounterpartyRef,
+        EncounterState, ExecutionContract, GoalSpec, HealthStatus, LifecycleRecord, OwnerKind,
+        OwnerRef, RequesterKind, RequesterRef, RuntimeProfile, TrustDomain,
+    };
+    use tempfile::tempdir;
+
+    fn owner(id: &str) -> OwnerRef {
+        OwnerRef {
+            kind: OwnerKind::Human,
+            id: id.to_string(),
+            display_name: None,
+        }
+    }
+
+    fn manifest(id: &str) -> AgentManifest {
+        AgentManifest {
+            id: id.to_string(),
+            owner: owner("alice"),
+            trust_domain: TrustDomain::SameOwnerLocal,
+            role: "reviewer".to_string(),
+            capabilities: vec!["repo.review".to_string()],
+            exposed_capabilities: vec!["repo.review".to_string()],
+            dependencies: Vec::new(),
+            runtime: RuntimeProfile::default(),
+            lifecycle: Default::default(),
+            encounter_policy: Default::default(),
+            contract_defaults: ExecutionContract::default(),
+            adapters: Vec::new(),
+            workspace_policy: Default::default(),
+            default_data_boundaries: vec!["owner_local".to_string()],
+            strategy_defaults: Default::default(),
+        }
+    }
+
+    fn action(id: &str) -> Action {
+        Action {
+            id: id.to_string(),
+            requester: RequesterRef {
+                kind: RequesterKind::User,
+                id: "user-1".to_string(),
+            },
+            initiator_owner: owner("alice"),
+            counterparty_refs: Vec::new(),
+            goal: GoalSpec {
+                summary: "review pull request".to_string(),
+                details: None,
+            },
+            capability: "repo.review".to_string(),
+            inputs: Default::default(),
+            contract: ExecutionContract::default(),
+            execution_strategy: None,
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            data_boundary: "owner_local".to_string(),
+            schedule: Default::default(),
+            phase: ActionPhase::Accepted,
+            checkpoint_ref: None,
+            outputs: ActionOutputs::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_and_lifecycle_persistence_work() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("control.db");
+        let state_dir = dir.path().join("state");
+        let store = SqliteStore::connect(&db, &state_dir).await.unwrap();
+
+        store
+            .upsert_agent_manifest(&manifest("repo_reviewer"))
+            .await
+            .unwrap();
+        store
+            .upsert_lifecycle_record(&LifecycleRecord {
+                agent_id: "repo_reviewer".to_string(),
+                desired_state: AgentState::Active,
+                observed_state: AgentState::Active,
+                health: HealthStatus::Healthy,
+                transition_reason: None,
+                last_transition_at: now_timestamp(),
+                degradation_profile: None,
+                continuity_mode: None,
+                failure_count: 0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(store.list_agent_manifests().await.unwrap().len(), 1);
+        assert_eq!(store.list_lifecycle_records().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn action_and_checkpoint_round_trip() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("control.db");
+        let state_dir = dir.path().join("state");
+        let store = SqliteStore::connect(&db, &state_dir).await.unwrap();
+
+        store.upsert_action(&action("action-1")).await.unwrap();
+        store
+            .append_action_event(
+                "action-1",
+                "accepted",
+                serde_json::json!({"phase": "accepted"}),
+            )
+            .await
+            .unwrap();
+        store
+            .put_checkpoint("action-1", "ckpt-1", b"checkpoint")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_action("action-1")
+                .await
+                .unwrap()
+                .expect("action")
+                .id,
+            "action-1"
+        );
+        assert_eq!(
+            store
+                .get_checkpoint("action-1")
+                .await
+                .unwrap()
+                .expect("checkpoint"),
+            b"checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn encounter_and_audit_round_trip() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("control.db");
+        let state_dir = dir.path().join("state");
+        let store = SqliteStore::connect(&db, &state_dir).await.unwrap();
+
+        let encounter = EncounterRecord {
+            id: "enc-1".to_string(),
+            initiator_ref: CounterpartyRef {
+                agent_id: None,
+                session_id: Some("sess-1".to_string()),
+                owner: owner("foreign"),
+                trust_domain: TrustDomain::SameDeviceForeignOwner,
+            },
+            target_agent_id: "repo_reviewer".to_string(),
+            target_owner: owner("alice"),
+            trust_domain: TrustDomain::SameDeviceForeignOwner,
+            requested_capabilities: vec!["repo.review".to_string()],
+            applied_policy_source: "system_defaults".to_string(),
+            state: EncounterState::Denied,
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            created_at: now_timestamp(),
+        };
+
+        let receipt = AuditReceipt {
+            id: "audit-1".to_string(),
+            encounter_ref: "enc-1".to_string(),
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            outcome: AuditOutcome::Denied,
+            reason: "policy denied".to_string(),
+            approver_ref: None,
+            emitted_at: now_timestamp(),
+        };
+
+        store.insert_encounter(&encounter).await.unwrap();
+        store.insert_audit_receipt(&receipt).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_latest_encounter_for_agent("repo_reviewer")
+                .await
+                .unwrap()
+                .expect("encounter")
+                .id,
+            "enc-1"
+        );
+        assert_eq!(
+            store
+                .get_audit_receipt_by_encounter("enc-1")
+                .await
+                .unwrap()
+                .expect("receipt")
+                .id,
+            "audit-1"
+        );
+    }
+}
