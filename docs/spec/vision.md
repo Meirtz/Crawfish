@@ -61,7 +61,7 @@ For platform engineers and AI product teams running high-value agent systems, Cr
 Crawfish should talk about interoperability in three planes:
 
 - **Tool plane:** MCP for tools and services.
-- **Harness plane:** OpenClaw Gateway and ACP-compatible harnesses for specialized execution surfaces, especially coding agents.
+- **Harness plane:** OpenClaw Gateway and ACP-compatible harnesses for specialized execution surfaces, including planning, research, operations, investigation, and coding agents.
 - **Agent plane:** A2A for remote agent delegation across system boundaries.
 
 This framing is more accurate than treating all integrations as generic subprocesses. It also matches the actual product problem: tools, harnesses, and remote agents have different semantics, risk envelopes, and scheduling implications.
@@ -117,7 +117,7 @@ That does not reduce the need for Crawfish. It increases it.
 When harnesses proliferate, the system problem shifts upward:
 
 - which execution surface should run a task under which contract
-- how should a harness failure affect other agents in the fleet
+- how should a harness failure affect other agents in the swarm
 - what work can continue without any model or remote harness at all
 - when should the runtime repair, queue, escalate, or hand off instead of pretending the outage did not happen
 
@@ -142,12 +142,12 @@ Crawfish should be strong where a continuity control plane should be strong:
 - execution contract compilation and enforcement
 - continuity modes under route or network loss
 - deterministic fallback, repair loops, and operator inspection
-- fleet-wide policy and dependency semantics across many execution surfaces
+- swarm-wide policy and dependency semantics across many execution surfaces
 
 The right relationship is bidirectional interoperability, not category confusion:
 
-- OpenClaw can call Crawfish when a session needs durable, policy-bound fleet work.
-- Crawfish can call OpenClaw when an action needs an interactive coding loop or gateway-native agent surface.
+- OpenClaw can call Crawfish when a session needs durable, policy-bound swarm work.
+- Crawfish can call OpenClaw when an action needs a specialized interactive or gateway-native agent surface.
 
 ## Why OpenClaw Looks Like The Wild West, And Why Crawfish Should Be The Law Layer
 
@@ -284,11 +284,11 @@ The crowded part of the market is agent authoring. The underbuilt part is **agen
 
 | Existing category | What it does well | Where it stops short | Why Crawfish exists |
 | --- | --- | --- | --- |
-| Agent SDKs | tool calling, handoffs, tracing, fast onboarding | usually request-scoped, thin on lifecycle, budgets, health, and fleet operations | Crawfish adds a control plane around agent execution |
+| Agent SDKs | tool calling, handoffs, tracing, fast onboarding | usually request-scoped, thin on lifecycle, budgets, health, and swarm operations | Crawfish adds a control plane around agent execution |
 | Graph and workflow frameworks | persistence, branching, human-in-the-loop, orchestration composition | center the workflow graph rather than the ongoing life of supervised agents | Crawfish centers long-lived agents, dependency graphs, degraded mode, and runtime policy |
 | Multi-agent chat frameworks | delegation patterns and event-driven prototyping | operational guarantees and approval semantics are often left to user code | Crawfish turns coordination into an operable system |
 | Durable workflow engines | retries, timers, long-running state machines | not model-native and unaware of tool scopes, prompt context, or approval gates | Crawfish borrows durability ideas at the agent runtime layer |
-| Agent gateways such as OpenClaw | channels, interactive sessions, plugins, RPC integration, agent loops | do not by themselves define lifecycle-managed fleet semantics, contract compilation, deterministic continuity, or repair policy | Crawfish complements the gateway with a runtime and control plane |
+| Agent gateways such as OpenClaw | channels, interactive sessions, plugins, RPC integration, agent loops | do not by themselves define lifecycle-managed swarm semantics, contract compilation, deterministic continuity, or repair policy | Crawfish complements the gateway with a runtime and control plane |
 | Identity or access systems | principals, authn, authz, directory semantics | usually do not understand lifecycle-managed agents, capability leases, or encounter governance | Crawfish brings agent-native governance into runtime behavior |
 
 ## Why Not LangGraph + MCP + Temporal + Custom Supervisor?
@@ -297,17 +297,17 @@ Because that stack solves adjacent problems, not the full product problem.
 
 | Piece | Official scope | What it still leaves you building |
 | --- | --- | --- |
-| [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) | durable agent workflows, persistence, human-in-the-loop, graph-based coordination | desired-state supervision, degradation profiles, policy compiler, fleet inspection, admission control |
+| [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) | durable agent workflows, persistence, human-in-the-loop, graph-based coordination | desired-state supervision, degradation profiles, policy compiler, swarm inspection, admission control |
 | [MCP](https://modelcontextprotocol.io/docs/learn/architecture) | protocol for host-client-server tool integration | lifecycle, scheduling, checkpointing, approvals, budget enforcement, tool risk normalization |
 | [Temporal](https://docs.temporal.io/workflows) | durable workflows with replay, timers, and recovery | model-native contracts, agent lifecycle, capability normalization, tool safety, policy-aware routing |
-| [OpenClaw](https://docs.openclaw.ai/concepts/agent-loop) | interactive agent loop, Gateway, plugins, RPC adapters, multi-channel agent surface | fleet lifecycle, continuity semantics, deterministic fallback, repair loops, and cross-surface contract enforcement |
+| [OpenClaw](https://docs.openclaw.ai/concepts/agent-loop) | interactive agent loop, Gateway, plugins, RPC adapters, multi-channel agent surface | swarm lifecycle, continuity semantics, deterministic fallback, repair loops, and cross-surface contract enforcement |
 | custom supervisor | can patch missing operational pieces | every team rebuilds leases, failure taxonomies, inspection UX, policy precedence, and degraded behavior differently |
 
 The wedge is not that Crawfish replaces these systems. The wedge is that Crawfish provides the missing runtime layer that lets them be combined coherently.
 
-The same logic also explains where Crawfish sits relative to [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) and [AutoGen](https://microsoft.github.io/autogen/dev/): both are valuable agent-building frameworks, but neither is primarily a lifecycle-managed control plane for multi-agent fleet operations.
+The same logic also explains where Crawfish sits relative to [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) and [AutoGen](https://microsoft.github.io/autogen/dev/): both are valuable agent-building frameworks, but neither is primarily a lifecycle-managed control plane for multi-agent swarm operations.
 
-The same gap appears for specialized harnesses and gateways. [ACP](https://zed.dev/acp) and the [Agent Client Protocol specification](https://github.com/agentclientprotocol/agent-client-protocol) create a standard way for clients to talk to coding agents and other harnesses. [OpenClaw's Gateway protocol and plugins](https://docs.openclaw.ai/gateway/protocol) create another practical integration surface for interactive agent loops. Those are valuable, but they still do not answer which harness should run, under which policy, with which fallback, or how its failure should affect the rest of a fleet. Crawfish exists above that layer.
+The same gap appears for specialized harnesses and gateways. [ACP](https://zed.dev/acp) and the [Agent Client Protocol specification](https://github.com/agentclientprotocol/agent-client-protocol) create a standard way for clients to talk to specialized agents and other harnesses. [OpenClaw's Gateway protocol and plugins](https://docs.openclaw.ai/gateway/protocol) create another practical integration surface for interactive agent loops. Those are valuable, but they still do not answer which harness should run, under which policy, with which fallback, or how its failure should affect the rest of a swarm. Crawfish exists above that layer.
 
 ## Target Users
 
@@ -320,7 +320,7 @@ The same gap appears for specialized harnesses and gateways. [ACP](https://zed.d
 
 ## Beachhead And Hero Demo
 
-The first public story should be a small engineering and operations fleet:
+The first public story should be a small engineering and operations swarm:
 
 - `repo_indexer`
 - `repo_reviewer`
@@ -337,7 +337,7 @@ This hero demo is better than a generic chatbot because it makes the product's d
 P1 extends the story in two concrete ways:
 
 - an OpenClaw session or plugin can submit work into Crawfish for durable execution
-- coding-heavy actions such as `coding.patch.plan` can route out to OpenClaw or another harness and run under a Ralph-style verify loop
+- proposal-only actions such as `task.plan` can route out to OpenClaw or another harness and later run under a Ralph-style verify loop when verification is required
 - a same-device foreign-owner agent encounter must pass encounter policy, explicit consent, and revocable leasing before it can cross local boundaries
 
 ## Product Principles
@@ -346,7 +346,7 @@ P1 extends the story in two concrete ways:
 - Prefer policies over prompt text. Budgets, approvals, and tool scopes must be machine-enforced.
 - Prefer sovereign boundaries over ambient trust.
 - Prefer graceful degradation over binary failure where safety allows it.
-- Prefer verified loops over unverifiable success claims for coding-heavy work.
+- Prefer verified loops over unverifiable success claims for verification-sensitive work.
 - Prefer desired state over imperative orchestration.
 - Stay protocol-native and vendor-neutral.
 - Be developer-local first and production-ready second.
@@ -408,8 +408,8 @@ Crawfish should absorb that insight, but not collapse into it.
 
 The right abstraction is:
 
-- Ralph-style looping is an **execution strategy** for coding-heavy actions
-- lifecycle, contract, repair, continuity, and fleet supervision remain runtime concerns
+- Ralph-style looping is an **execution strategy** for verification-sensitive actions
+- lifecycle, contract, repair, continuity, and swarm supervision remain runtime concerns
 - not every agent or action should use a verify loop
 
 This boundary keeps Crawfish useful beyond autonomous coding while still letting it adopt one of the most effective patterns for high-risk code generation work.
@@ -434,7 +434,7 @@ This boundary keeps Crawfish useful beyond autonomous coding while still letting
 | repair loop success rate | measures whether automatic repair meaningfully restores service | tracked after self-repair baseline ships |
 | encounter audit coverage | measures whether cross-owner interactions leave formal governance evidence | required for every same-device foreign-owner path before beta |
 | lease revocation effectiveness | measures whether withdrawn capability actually stops future work | tracked once encounter enforcement ships |
-| verified coding completion rate | measures whether verify-loop actions can finish under deterministic checks rather than self-reported success | tracked once OpenClaw and Ralph-style strategies ship |
-| harness routing recovery rate | measures whether specialized harnesses can fail without collapsing the fleet | tracked after ACP-compatible adapters are introduced |
+| verified execution completion rate | measures whether verify-loop actions can finish under deterministic checks rather than self-reported success | tracked once OpenClaw and Ralph-style strategies ship |
+| harness routing recovery rate | measures whether specialized harnesses can fail without collapsing the swarm | tracked after ACP-compatible adapters are introduced |
 | time to inspect failure cause | measures operator ergonomics | under 2 minutes through CLI and telemetry |
 | local hello-world time | measures onboarding friction | under 10 minutes |

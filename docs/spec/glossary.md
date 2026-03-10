@@ -9,10 +9,11 @@ This glossary is shared across the repository. Other documents should reuse thes
 | **runtime** | The full Crawfish system that accepts manifests and actions, supervises workers, enforces contracts, and manages lifecycle and recovery. |
 | **control plane** | The part of the runtime responsible for desired state, scheduling, lifecycle transitions, policy compilation, admission control, inspection, and recovery decisions. |
 | **execution plane** | The part of the runtime that performs agent turns, tool calls, checkpoints, and result generation. |
+| **swarm** | A governed set of agents and harness-backed workers operating under one Crawfish control plane. A swarm does not imply shared trust, shared memory, or automatic context sharing. |
 | **agent** | A bounded software actor defined by an `AgentManifest`. An agent has identity, capabilities, policy defaults, dependencies, and lifecycle behavior. In Crawfish, an agent is neither a chatbot persona nor an unconstrained autonomous entity. |
 | **owner** | The controlling principal for an agent or session, such as a human, team, org, or service account. Governance decisions must always be attributable to owners. |
 | **worker** | A concrete execution instance that runs one agent's turns and tool sessions under supervision. One agent may map to one or more workers depending on deployment mode. |
-| **harness** | A specialized agent runtime or execution surface, typically optimized for a class of work such as coding. Examples include ACP-compatible coding agents and harness-specific CLIs. |
+| **harness** | A specialized agent runtime or execution surface optimized for a class of work such as planning, research, investigation, operations, or coding. Examples include OpenClaw, ACP-compatible agents, and harness-specific CLIs. |
 | **action** | The durable unit of work in Crawfish. An action has a goal, compiled contract, schedule, phase, checkpoints, and outputs. |
 | **deterministic executor** | A traditional programmatic executor that does not rely on an LLM or external agent harness. Examples include policy evaluators, static analyzers, rule engines, AST transforms, classifiers, and queueing logic. |
 | **contract** | The runtime-enforced set of delivery, execution, safety, quality, and recovery constraints applied to an action. |
@@ -51,5 +52,5 @@ This glossary is shared across the repository. Other documents should reuse thes
 | **self-repair** | Runtime actions that restore service without changing the product's core goals or policy envelope, such as reconnecting adapters, replaying checkpoints, rebuilding caches, or isolating failed dependencies. |
 | **controlled self-evolution** | Deliberate adaptation of policy, routing, or thresholds based on evidence, performed offline, in shadow mode, or within tightly bounded envelopes. It is not unrestricted runtime self-modification. |
 | **human handoff** | An explicit continuity outcome in which Crawfish packages context, evidence, and next-step guidance for an operator when no safe automated route remains. |
-| **verify loop** | A Ralph-style execution pattern in which a coding-heavy action iterates through work, deterministic verification, feedback injection, and retry until success or stop budget exhaustion. |
-| **hero demo** | The canonical public example for Crawfish: an engineering and operations fleet made up of `repo_indexer`, `repo_reviewer`, `ci_triage`, and `incident_enricher`. |
+| **verify loop** | A Ralph-style execution pattern in which a verification-sensitive action iterates through work, deterministic verification, feedback injection, and retry until success or stop budget exhaustion. |
+| **hero demo** | The canonical public example for Crawfish: an engineering and operations swarm made up of `repo_indexer`, `repo_reviewer`, `ci_triage`, `incident_enricher`, `workspace_editor`, and `task_planner`. |

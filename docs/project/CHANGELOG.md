@@ -16,18 +16,20 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - operator control commands for `action list`, `action approve`, `action reject`, and `lease revoke`
 - runtime persistence and inspection for consent grants, capability leases, and audit receipts
 - `action events` over the local UDS API for operator timeline inspection
-- reference hero demo assets plus `examples/hero-fleet/demo.sh`
+- reference hero demo assets plus `examples/hero-swarm/demo.sh`
 - `P1a` OpenClaw inbound Gateway RPC bridge under `integrations/openclaw-inbound/`
 - OpenClaw inbound caller mapping, scoped action inspection, and scoped agent status over the local UDS API
-- `coding.patch.plan` and the `coding_planner` hero agent as the first OpenClaw outbound capability
+- `task.plan` and the `task_planner` hero agent as the first OpenClaw outbound capability
 - native Rust `crawfish-openclaw` Gateway adapter with streamed lifecycle, assistant, and tool event mapping
-- deterministic fallback planning for `coding.patch.plan` when the preferred OpenClaw route is unavailable
+- deterministic fallback planning for `task.plan` when the preferred OpenClaw route is unavailable
+- deprecated compatibility aliases for `[fleet]`, `coding.patch.plan`, and legacy task-planning input keys during `0.1.x alpha`
 - explicit abandoned-run lineage for restarted OpenClaw-backed actions
 
 ### Changed
 
 - `Cargo.lock` is now tracked because Crawfish publishes binaries
-- the runnable example under `examples/hero-fleet/` is now the reference public example, not a loose demo
+- the runnable example under `examples/hero-swarm/` is now the reference public example, not a loose demo
+- public terminology now uses `agent swarm` as the primary term, with `fleet` retained only as a temporary alpha migration alias
 - `policy validate` is now a strict dry-run with no runtime persistence side effects
 - action phase persistence now uses canonical snake_case values such as `awaiting_approval`
 - workspace mutation now enforces workspace-scoped file locking and stable failure codes for lock, lease, approval, route, executor, and restart states

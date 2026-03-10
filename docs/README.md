@@ -34,13 +34,14 @@ Public maintenance and contribution policy lives in:
 
 ## Runnable Example
 
-The live alpha example fleet is tracked under:
+The live alpha example swarm is tracked under:
 
-- [`../examples/hero-fleet/Crawfish.toml`](../examples/hero-fleet/Crawfish.toml)
-- [`../examples/hero-fleet/agents/repo_indexer.toml`](../examples/hero-fleet/agents/repo_indexer.toml)
-- [`../examples/hero-fleet/agents/repo_reviewer.toml`](../examples/hero-fleet/agents/repo_reviewer.toml)
-- [`../examples/hero-fleet/agents/ci_triage.toml`](../examples/hero-fleet/agents/ci_triage.toml)
-- [`../examples/hero-fleet/agents/workspace_editor.toml`](../examples/hero-fleet/agents/workspace_editor.toml)
+- [`../examples/hero-swarm/Crawfish.toml`](../examples/hero-swarm/Crawfish.toml)
+- [`../examples/hero-swarm/agents/repo_indexer.toml`](../examples/hero-swarm/agents/repo_indexer.toml)
+- [`../examples/hero-swarm/agents/repo_reviewer.toml`](../examples/hero-swarm/agents/repo_reviewer.toml)
+- [`../examples/hero-swarm/agents/ci_triage.toml`](../examples/hero-swarm/agents/ci_triage.toml)
+- [`../examples/hero-swarm/agents/task_planner.toml`](../examples/hero-swarm/agents/task_planner.toml)
+- [`../examples/hero-swarm/agents/workspace_editor.toml`](../examples/hero-swarm/agents/workspace_editor.toml)
 - [`../integrations/openclaw-inbound/`](../integrations/openclaw-inbound/)
 
 That example is the current implementation reference for Hero P0 plus `P1a` inbound interop: deterministic `repo.index`, deterministic-first `repo.review`, `ci_triage` with either direct log input or SSE MCP-backed log fetch, approval-gated local mutation through `workspace_editor`, and OpenClaw Gateway RPC ingress through the isolated bridge package.

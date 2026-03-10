@@ -27,4 +27,4 @@
 ## Example Contract
 
 - [ ] Not applicable
-- [ ] Updated `examples/hero-fleet/` and matching docs in the same PR
+- [ ] Updated `examples/hero-swarm/` and matching docs in the same PR

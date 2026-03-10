@@ -376,7 +376,7 @@ type ContinuityModeName =
 | --- | --- | --- | --- |
 | `read_only` | mutation policy tightened, approval system unavailable, unsafe write conditions | all mutating capabilities become proposal-only or blocked | write approvals and safety checks are available again |
 | `dependency_isolation` | upstream agent or required adapter is impaired | actions depending on that capability are blocked or downgraded; independent actions continue | dependency health and liveliness recover |
-| `budget_guard` | action or fleet approaches spend threshold | expensive model or harness routes are disabled; cheaper routes are preferred; non-critical work may be deferred | budget pressure clears or policy window resets |
+| `budget_guard` | action or swarm approaches spend threshold | expensive model or harness routes are disabled; cheaper routes are preferred; non-critical work may be deferred | budget pressure clears or policy window resets |
 | `provider_failover` | provider, model endpoint, or harness instability | route to fallback model or harness while preserving hard policy | primary execution route becomes healthy again |
 
 ### Degraded Implementation Rules
@@ -520,7 +520,7 @@ Resolution order:
 
 Rules:
 
-- `verify_loop` is mandatory for the documented coding-heavy capability classes unless a higher-level hard policy blocks that action entirely
+- `verify_loop` is mandatory for the documented verification-sensitive capability classes unless a higher-level hard policy blocks that action entirely
 - deterministic checks named in `verification_spec` are part of completion semantics, not optional telemetry
 - a degraded or continuity transition may replace the selected adapter, but it must not silently downgrade `verify_loop` into unverifiable completion
 
@@ -620,10 +620,10 @@ Every execution surface must produce or map to a `CapabilityDescriptor`. Crawfis
 | Plane | Primary protocol | Role |
 | --- | --- | --- |
 | tool plane | MCP | connect tools and services into the runtime |
-| harness plane | OpenClaw Gateway plus ACP-compatible adapters | invoke specialized execution harnesses such as coding agents |
+| harness plane | OpenClaw Gateway plus ACP-compatible adapters | invoke specialized execution harnesses for planning, research, operations, investigation, or coding |
 | agent plane | A2A | delegate work to remote agent systems |
 
-The harness plane matters because a specialized coding harness is neither just a tool nor just a remote agent. It has richer session semantics, permission prompts, workspace expectations, and cancellation behavior. Crawfish should treat that difference explicitly. See [OpenClaw's Agent Loop](https://docs.openclaw.ai/concepts/agent-loop), [OpenClaw Gateway protocol](https://docs.openclaw.ai/gateway/protocol), [ACP at Zed](https://zed.dev/acp), and the [Agent Client Protocol specification](https://github.com/agentclientprotocol/agent-client-protocol) for the protocol layers Crawfish should sit above.
+The harness plane matters because a specialized agent harness is neither just a tool nor just a remote agent. It has richer session semantics, permission prompts, workspace expectations, and cancellation behavior. Crawfish should treat that difference explicitly. See [OpenClaw's Agent Loop](https://docs.openclaw.ai/concepts/agent-loop), [OpenClaw Gateway protocol](https://docs.openclaw.ai/gateway/protocol), [ACP at Zed](https://zed.dev/acp), and the [Agent Client Protocol specification](https://github.com/agentclientprotocol/agent-client-protocol) for the protocol layers Crawfish should sit above.
 
 ACPX-like tools are useful evidence of this layer, but they should be treated as implementations of the harness plane rather than as the protocol definition itself.
 
@@ -665,7 +665,7 @@ Outbound rules:
 - the current `P1b` implementation supports `session_mode = ephemeral` only
 - the current `P1b` implementation supports `workspace_policy = inherit | crawfish_managed`; `openclaw_managed` is parsed but rejected at runtime
 - `auth_ref` currently resolves to an environment variable name containing the Gateway bearer token
-- `coding.patch.plan` is the first outbound capability and remains proposal-only; mutation and verify-loop semantics are deferred
+- `task.plan` is the first outbound capability and remains proposal-only; mutation and verify-loop semantics are deferred
 
 ### Shared Governance Kernel
 
@@ -679,7 +679,7 @@ OpenClaw inbound and outbound paths must reuse the same governance model as futu
 
 ## Execution Strategies
 
-Execution strategy is orthogonal to adapter choice. A coding action might run through OpenClaw, an ACP-compatible harness, or a local executor and still choose either a single pass or a verify loop.
+Execution strategy is orthogonal to adapter choice. A task might run through OpenClaw, an ACP-compatible harness, or a local executor and still choose either a single pass or a verify loop.
 
 | Strategy | Use when | Completion rule |
 | --- | --- | --- |
@@ -692,8 +692,8 @@ Ralph-style loops are modeled as `verify_loop`, not as a separate runtime catego
 
 Only the following capability classes should default to `verify_loop`:
 
-- `coding.patch.plan`
-- `coding.patch.apply`
+- `task.plan`
+- `workspace.patch.apply`
 - `migration.refactor`
 - `spec.implement`
 
@@ -727,7 +727,7 @@ Deterministic continuity is a first-class runtime concern, not a consolation pri
 
 When every model or harness route is down, Crawfish should still preserve the safe subset of useful work through deterministic executors. These executors are traditional software components, not miniature prompt loops.
 
-For the hero fleet, the minimum deterministic continuity set should look like this:
+For the hero swarm, the minimum deterministic continuity set should look like this:
 
 | Agent | Deterministic continuity examples |
 | --- | --- |

@@ -60,7 +60,7 @@ Project maintenance docs live in:
 - **Three-plane interoperability instead of one transport assumption.** Crawfish uses MCP for tools, OpenClaw Gateway and ACP-compatible integrations for specialized harnesses, and A2A for remote agent delegation.
 - **Continuity above the model layer instead of provider lock-in.** When models, harnesses, or networks are impaired, Crawfish contracts safely into deterministic fallbacks, queueing, cached reads, or human handoff.
 
-Compared with [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview), [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/), and [Temporal Workflows](https://docs.temporal.io/workflows), Crawfish is centered on operating agent fleets under policy and failure pressure, not only composing agent logic or durable control flow. Compared with [OpenClaw](https://docs.openclaw.ai/concepts/agent-loop), Crawfish is the continuity control plane, not the interactive agent loop or gateway surface.
+Compared with [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview), [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/), and [Temporal Workflows](https://docs.temporal.io/workflows), Crawfish is centered on operating agent swarms under policy and failure pressure, not only composing agent logic or durable control flow. Compared with [OpenClaw](https://docs.openclaw.ai/concepts/agent-loop), Crawfish is the continuity control plane, not the interactive agent loop or gateway surface.
 
 ## System
 
@@ -169,7 +169,7 @@ flowchart LR
 
 ## Hero Demo
 
-The first public story is a small engineering and operations fleet running under one supervisor:
+The first public story is a small engineering and operations swarm running under one supervisor:
 
 - `repo_indexer` keeps repository structure and ownership context warm.
 - `repo_reviewer` reviews pull requests and produces structured findings.
@@ -185,9 +185,9 @@ The demo shows five things at once:
 4. Restart recovery from the last durable checkpoint.
 5. Continuity behavior when every external model route is unavailable.
 
-The same demo should also prove a harder claim: if every external model route is unavailable, the fleet does not simply disappear. It keeps the control plane alive, continues deterministic work where possible, queues or hands off the rest, and makes the contraction explicit.
+The same demo should also prove a harder claim: if every external model route is unavailable, the swarm does not simply disappear. It keeps the control plane alive, continues deterministic work where possible, queues or hands off the rest, and makes the contraction explicit.
 
-The same demo can now also show bidirectional OpenClaw interop when a local Gateway is available: OpenClaw can submit work into Crawfish as an external control surface, while `coding.patch.plan` routes out through the OpenClaw Gateway agent loop and returns a proposal-only patch plan. Ralph-style verified coding loops remain a later milestone.
+The same demo can now also show bidirectional OpenClaw interop when a local Gateway is available: OpenClaw can submit work into Crawfish as an external control surface, while `task.plan` routes out through the OpenClaw Gateway agent loop and returns a proposal-only task plan. Ralph-style verified execution loops remain a later milestone.
 
 That same future demo should also show a same-device foreign-owner encounter: a roaming external agent can request access to a local capability, but it must pass encounter policy, receive explicit consent, and execute only through a revocable capability lease.
 
@@ -218,9 +218,9 @@ The current Rust alpha now covers one runnable Hero P0 slice plus `P1a` OpenClaw
 - `incident.enrich` turns local logs plus service topology into deterministic blast-radius and next-step artifacts.
 - `workspace.patch.apply` performs deterministic local file edits under explicit approval, grant, and lease control.
 - `P1a` adds a thin OpenClaw inbound Gateway RPC bridge under [`integrations/openclaw-inbound/`](integrations/openclaw-inbound/) with `crawfish.action.submit`, `crawfish.action.inspect`, `crawfish.action.events`, and `crawfish.agent.status`.
-- OpenClaw inbound caller mapping is configured under `[openclaw.inbound]` in [`examples/hero-fleet/Crawfish.toml`](examples/hero-fleet/Crawfish.toml), and governance remains enforced in `crawfishd`, not in the bridge.
-- `coding.patch.plan` now uses the new `coding_planner` agent and can route out through the OpenClaw Gateway with streamed lifecycle, assistant, and tool events.
-- when OpenClaw outbound is unavailable, `coding.patch.plan` falls back to a deterministic planner when the contract fallback chain permits it.
+- OpenClaw inbound caller mapping is configured under `[openclaw.inbound]` in [`examples/hero-swarm/Crawfish.toml`](examples/hero-swarm/Crawfish.toml), and governance remains enforced in `crawfishd`, not in the bridge.
+- `task.plan` now uses the new `task_planner` agent and can route out through the OpenClaw Gateway with streamed lifecycle, assistant, and tool events.
+- when OpenClaw outbound is unavailable, `task.plan` falls back to a deterministic planner when the contract fallback chain permits it.
 - current OpenClaw outbound support is intentionally narrow: `auth_ref` resolves to an environment variable, `session_mode = ephemeral` is supported, and `workspace_policy = inherit | crawfish_managed` is supported.
 - `inspect` surfaces artifact refs, checkpoint refs, recovery stage, continuity mode, encounter metadata, and external refs.
 - `action list`, `action events`, `action approve`, `action reject`, and `lease revoke` expose the operator control path over the local UDS API.
@@ -231,7 +231,7 @@ The current Rust alpha now covers one runnable Hero P0 slice plus `P1a` OpenClaw
 
 The first external tool transport implemented in code is `MCP over SSE`. `repo_reviewer` remains deterministic-first, while `ci_triage` can fetch remote log material through MCP and then complete the actual classification locally.
 
-The next planned milestone after this `P1b` outbound slice is `P1c` runtime verification for coding-heavy actions, starting with Ralph-style verify-loop support on top of the existing OpenClaw route.
+The next planned milestone after this scope-corrected outbound slice is `P1d` verified execution strategies, starting with Ralph-style verify-loop support as one optional strategy on top of the existing OpenClaw route.
 
 ## Quickstart
 
@@ -290,5 +290,5 @@ cargo run -p crawfish-cli --bin crawfish -- action events "$MUTATION_ID" --json
 kill $CRAWFISH_PID
 ```
 
-For a full sample configuration, start from [`examples/hero-fleet/Crawfish.toml`](examples/hero-fleet/Crawfish.toml) and the agent manifests under [`examples/hero-fleet/agents/`](examples/hero-fleet/agents/).
-For a repeatable local demo that exercises review, incident enrichment, approval-gated mutation, and operator event inspection, run [`examples/hero-fleet/demo.sh`](examples/hero-fleet/demo.sh).
+For a full sample configuration, start from [`examples/hero-swarm/Crawfish.toml`](examples/hero-swarm/Crawfish.toml) and the agent manifests under [`examples/hero-swarm/agents/`](examples/hero-swarm/agents/).
+For a repeatable local demo that exercises review, incident enrichment, approval-gated mutation, operator event inspection, and OpenClaw task planning, run [`examples/hero-swarm/demo.sh`](examples/hero-swarm/demo.sh).

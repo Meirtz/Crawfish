@@ -32,7 +32,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - If a change affects behavior in the runnable example, update these in the same PR:
   - [`../README.md`](/Users/meirtz/Documents/Tencent/CrawFish/README.md)
   - [`../docs/spec/v0.1-plan.md`](/Users/meirtz/Documents/Tencent/CrawFish/docs/spec/v0.1-plan.md)
-  - [`../examples/hero-fleet/Crawfish.toml`](/Users/meirtz/Documents/Tencent/CrawFish/examples/hero-fleet/Crawfish.toml)
+  - [`../examples/hero-swarm/Crawfish.toml`](/Users/meirtz/Documents/Tencent/CrawFish/examples/hero-swarm/Crawfish.toml)
 - If a breaking alpha change affects users, include a short migration note in the changelog and docs.
 
 ## Public Surface Expectations
