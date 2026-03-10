@@ -243,6 +243,33 @@ impl SqliteStore {
         .transpose()
     }
 
+    pub async fn latest_completed_action(
+        &self,
+        target_agent_id: &str,
+        capability: &str,
+    ) -> anyhow::Result<Option<Action>> {
+        let row = sqlx::query(
+            r#"
+            SELECT action_json
+            FROM actions
+            WHERE target_agent_id = ?1
+              AND capability = ?2
+              AND phase = 'completed'
+            ORDER BY COALESCE(finished_at, created_at) DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(target_agent_id)
+        .bind(capability)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("action_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
     pub async fn set_admin_mode_draining(&self, draining: bool) -> anyhow::Result<()> {
         let value = if draining {
             ADMIN_MODE_DRAINING

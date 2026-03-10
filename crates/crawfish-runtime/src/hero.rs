@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use crawfish_core::DeterministicExecutor;
-use crawfish_types::{Action, ActionOutputs, ArtifactRef, RepoIndexArtifact};
+use crawfish_types::{
+    Action, ActionOutputs, ArtifactRef, RepoIndexArtifact, ReviewFinding, ReviewFindingsArtifact,
+    ReviewRiskLevel,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -11,9 +14,29 @@ pub struct RepoIndexerDeterministicExecutor {
     state_dir: PathBuf,
 }
 
+pub struct RepoReviewerDeterministicExecutor {
+    state_dir: PathBuf,
+    repo_index: RepoIndexArtifact,
+    repo_index_ref: Option<ArtifactRef>,
+}
+
 impl RepoIndexerDeterministicExecutor {
     pub fn new(state_dir: PathBuf) -> Self {
         Self { state_dir }
+    }
+}
+
+impl RepoReviewerDeterministicExecutor {
+    pub fn new(
+        state_dir: PathBuf,
+        repo_index: RepoIndexArtifact,
+        repo_index_ref: Option<ArtifactRef>,
+    ) -> Self {
+        Self {
+            state_dir,
+            repo_index,
+            repo_index_ref,
+        }
     }
 }
 
@@ -72,6 +95,142 @@ impl DeterministicExecutor for RepoIndexerDeterministicExecutor {
     }
 }
 
+#[async_trait]
+impl DeterministicExecutor for RepoReviewerDeterministicExecutor {
+    async fn execute(&self, action: &Action) -> anyhow::Result<ActionOutputs> {
+        let workspace_root = required_input_string(action, "workspace_root")?;
+        let changed_files = changed_files_from_action(action).await?;
+        if changed_files.is_empty() {
+            return Err(anyhow!(
+                "repo.review requires diff_text, diff_file, or changed_files"
+            ));
+        }
+
+        let diff_text = diff_text_from_action(action).await.unwrap_or_default();
+        let todo_files =
+            scan_changed_files_for_markers(&workspace_root, &changed_files, &["TODO", "FIXME"]);
+        let risky_files = changed_files
+            .iter()
+            .filter(|file| is_risky_path(file))
+            .cloned()
+            .collect::<Vec<_>>();
+        let secret_hits = detect_secret_patterns(&diff_text, &workspace_root, &changed_files);
+        let missing_test_files = changed_files
+            .iter()
+            .filter(|file| !is_test_file(file))
+            .filter(|file| !self.repo_index.test_file_map.contains_key(*file))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut findings = Vec::new();
+        if !missing_test_files.is_empty() {
+            findings.push(ReviewFinding {
+                title: "Missing test coverage".to_string(),
+                detail: format!(
+                    "Changed files do not have mapped tests in the repository index: {}",
+                    missing_test_files.join(", ")
+                ),
+                severity: "medium".to_string(),
+                files: missing_test_files.clone(),
+            });
+        }
+        if !todo_files.is_empty() {
+            findings.push(ReviewFinding {
+                title: "TODO or FIXME in changed files".to_string(),
+                detail: format!(
+                    "Changed files still contain TODO/FIXME markers: {}",
+                    todo_files.join(", ")
+                ),
+                severity: "medium".to_string(),
+                files: todo_files.clone(),
+            });
+        }
+        if !risky_files.is_empty() {
+            findings.push(ReviewFinding {
+                title: "Risky paths changed".to_string(),
+                detail: format!(
+                    "The diff touches high-sensitivity paths: {}",
+                    risky_files.join(", ")
+                ),
+                severity: "high".to_string(),
+                files: risky_files.clone(),
+            });
+        }
+        if !secret_hits.is_empty() {
+            findings.push(ReviewFinding {
+                title: "Potential secret material detected".to_string(),
+                detail: format!(
+                    "The diff or changed files contain credential-like patterns: {}",
+                    secret_hits.join(", ")
+                ),
+                severity: "high".to_string(),
+                files: changed_files.clone(),
+            });
+        }
+        if diff_text.lines().count() > 300 || changed_files.len() > 20 {
+            findings.push(ReviewFinding {
+                title: "Large review surface".to_string(),
+                detail: "The change set is large enough that manual follow-up is recommended."
+                    .to_string(),
+                severity: "medium".to_string(),
+                files: changed_files.clone(),
+            });
+        }
+        if findings.is_empty() {
+            findings.push(ReviewFinding {
+                title: "No deterministic findings".to_string(),
+                detail: "The deterministic review checks did not surface actionable issues."
+                    .to_string(),
+                severity: "low".to_string(),
+                files: changed_files.clone(),
+            });
+        }
+
+        let artifact = ReviewFindingsArtifact {
+            risk_level: calculate_review_risk(&findings),
+            changed_files: changed_files.clone(),
+            findings: findings.clone(),
+        };
+        let json_ref = write_json_artifact(
+            &self.state_dir,
+            &action.id,
+            "review_findings.json",
+            &artifact,
+        )
+        .await?;
+        let markdown = build_review_summary_markdown(&artifact, action);
+        let markdown_ref =
+            write_text_artifact(&self.state_dir, &action.id, "review_summary.md", &markdown)
+                .await?;
+
+        let mut artifacts = Vec::new();
+        if let Some(repo_index_ref) = &self.repo_index_ref {
+            artifacts.push(repo_index_ref.clone());
+        }
+        artifacts.push(json_ref);
+        artifacts.push(markdown_ref);
+
+        Ok(ActionOutputs {
+            summary: Some(format!(
+                "Deterministic review produced {} findings for {} changed files",
+                artifact.findings.len(),
+                artifact.changed_files.len()
+            )),
+            artifacts,
+            metadata: BTreeMap::from([
+                (
+                    "executor_class".to_string(),
+                    serde_json::json!("deterministic"),
+                ),
+                (
+                    "risk_level".to_string(),
+                    serde_json::json!(format!("{:?}", artifact.risk_level).to_lowercase()),
+                ),
+            ]),
+        })
+    }
+}
+
 pub async fn write_json_artifact<T: serde::Serialize>(
     state_dir: &Path,
     action_id: &str,
@@ -83,6 +242,22 @@ pub async fn write_json_artifact<T: serde::Serialize>(
     let path = artifacts_dir.join(file_name);
     let bytes = serde_json::to_vec_pretty(value)?;
     fs::write(&path, bytes).await?;
+    Ok(ArtifactRef {
+        kind: infer_artifact_kind(file_name),
+        path: path.display().to_string(),
+    })
+}
+
+pub async fn write_text_artifact(
+    state_dir: &Path,
+    action_id: &str,
+    file_name: &str,
+    contents: &str,
+) -> anyhow::Result<ArtifactRef> {
+    let artifacts_dir = state_dir.join("artifacts").join(action_id);
+    fs::create_dir_all(&artifacts_dir).await?;
+    let path = artifacts_dir.join(file_name);
+    fs::write(&path, contents).await?;
     Ok(ArtifactRef {
         kind: infer_artifact_kind(file_name),
         path: path.display().to_string(),
@@ -104,6 +279,13 @@ fn infer_artifact_kind(file_name: &str) -> String {
         .or_else(|| file_name.strip_suffix(".md"))
         .unwrap_or(file_name)
         .to_string()
+}
+
+pub async fn load_json_artifact<T: serde::de::DeserializeOwned>(
+    artifact_ref: &ArtifactRef,
+) -> anyhow::Result<T> {
+    let contents = fs::read_to_string(&artifact_ref.path).await?;
+    Ok(serde_json::from_str(&contents)?)
 }
 
 fn collect_repo_files(workspace_root: &Path) -> Vec<String> {
@@ -190,6 +372,168 @@ fn map_files_to_tests(files: &[String], test_files: &[String]) -> BTreeMap<Strin
         }
     }
     mapping
+}
+
+async fn changed_files_from_action(action: &Action) -> anyhow::Result<Vec<String>> {
+    if let Some(files) = action
+        .inputs
+        .get("changed_files")
+        .and_then(|value| value.as_array())
+    {
+        let changed_files = files
+            .iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        return Ok(changed_files);
+    }
+
+    let diff = diff_text_from_action(action).await?;
+    Ok(parse_changed_files_from_diff(&diff))
+}
+
+async fn diff_text_from_action(action: &Action) -> anyhow::Result<String> {
+    if let Some(diff_text) = action
+        .inputs
+        .get("diff_text")
+        .and_then(|value| value.as_str())
+    {
+        return Ok(diff_text.to_string());
+    }
+
+    if let Some(diff_file) = action
+        .inputs
+        .get("diff_file")
+        .and_then(|value| value.as_str())
+    {
+        return Ok(fs::read_to_string(diff_file).await?);
+    }
+
+    Err(anyhow!(
+        "repo.review requires diff_text, diff_file, or changed_files"
+    ))
+}
+
+fn parse_changed_files_from_diff(diff: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            files.push(path.to_string());
+        } else if let Some(path) = line.strip_prefix("diff --git a/") {
+            if let Some((_, rhs)) = path.split_once(" b/") {
+                files.push(rhs.to_string());
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn scan_changed_files_for_markers(
+    workspace_root: &str,
+    changed_files: &[String],
+    markers: &[&str],
+) -> Vec<String> {
+    changed_files
+        .iter()
+        .filter_map(|file| {
+            let path = Path::new(workspace_root).join(file);
+            let contents = std::fs::read_to_string(path).ok()?;
+            if markers.iter().any(|marker| contents.contains(marker)) {
+                Some(file.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_risky_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    [
+        "auth",
+        "secret",
+        "config",
+        "policy",
+        "migration",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn detect_secret_patterns(
+    diff_text: &str,
+    workspace_root: &str,
+    changed_files: &[String],
+) -> Vec<String> {
+    let secret_needles = [
+        "AKIA",
+        "BEGIN PRIVATE KEY",
+        "SECRET_KEY",
+        "TOKEN=",
+        "PASSWORD=",
+    ];
+    let mut hits = Vec::new();
+
+    if secret_needles
+        .iter()
+        .any(|needle| diff_text.to_uppercase().contains(&needle.to_uppercase()))
+    {
+        hits.push("diff_text".to_string());
+    }
+
+    for file in changed_files {
+        let path = Path::new(workspace_root).join(file);
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if secret_needles
+                .iter()
+                .any(|needle| contents.to_uppercase().contains(&needle.to_uppercase()))
+            {
+                hits.push(file.clone());
+            }
+        }
+    }
+
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+fn calculate_review_risk(findings: &[ReviewFinding]) -> ReviewRiskLevel {
+    if findings.iter().any(|finding| finding.severity == "high") {
+        ReviewRiskLevel::High
+    } else if findings.iter().any(|finding| finding.severity == "medium") {
+        ReviewRiskLevel::Medium
+    } else {
+        ReviewRiskLevel::Low
+    }
+}
+
+fn build_review_summary_markdown(artifact: &ReviewFindingsArtifact, action: &Action) -> String {
+    let mut lines = vec![
+        "# Review Summary".to_string(),
+        String::new(),
+        format!("- Capability: `{}`", action.capability),
+        format!(
+            "- Risk level: `{}`",
+            format!("{:?}", artifact.risk_level).to_lowercase()
+        ),
+        format!("- Changed files: {}", artifact.changed_files.len()),
+        String::new(),
+        "## Findings".to_string(),
+        String::new(),
+    ];
+
+    for finding in &artifact.findings {
+        lines.push(format!("- **{}** ({})", finding.title, finding.severity));
+        lines.push(format!("  {}", finding.detail));
+        if !finding.files.is_empty() {
+            lines.push(format!("  Files: {}", finding.files.join(", ")));
+        }
+    }
+
+    lines.join("\n")
 }
 
 async fn resolve_owners(
@@ -304,9 +648,26 @@ mod tests {
     use tempfile::tempdir;
 
     fn action_with_workspace(workspace_root: &Path) -> Action {
+        action_with_capability(
+            "repo.index",
+            BTreeMap::from([(
+                "workspace_root".to_string(),
+                serde_json::json!(workspace_root.display().to_string()),
+            )]),
+        )
+    }
+
+    fn action_with_capability(
+        capability: &str,
+        inputs: BTreeMap<String, serde_json::Value>,
+    ) -> Action {
         Action {
             id: "action-1".to_string(),
-            target_agent_id: "repo_indexer".to_string(),
+            target_agent_id: if capability == "repo.review" {
+                "repo_reviewer".to_string()
+            } else {
+                "repo_indexer".to_string()
+            },
             requester: RequesterRef {
                 kind: RequesterKind::User,
                 id: "cli".to_string(),
@@ -318,14 +679,11 @@ mod tests {
             },
             counterparty_refs: Vec::new(),
             goal: GoalSpec {
-                summary: "index repository".to_string(),
+                summary: capability.to_string(),
                 details: None,
             },
-            capability: "repo.index".to_string(),
-            inputs: BTreeMap::from([(
-                "workspace_root".to_string(),
-                serde_json::json!(workspace_root.display().to_string()),
-            )]),
+            capability: capability.to_string(),
+            inputs,
             contract: ExecutionContract::default(),
             execution_strategy: None,
             grant_refs: Vec::new(),
@@ -390,5 +748,61 @@ mod tests {
             indexed.owners.get("src/lib.rs").cloned(),
             Some(vec!["@team/core".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn repo_reviewer_emits_structured_findings() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join("src")).await.unwrap();
+        fs::create_dir_all(workspace.join("config")).await.unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn value() -> u32 { 42 } // TODO tighten checks\n",
+        )
+        .await
+        .unwrap();
+        fs::write(workspace.join("config/secrets.env"), "PASSWORD=unsafe\n")
+            .await
+            .unwrap();
+
+        let state_dir = dir.path().join(".crawfish/state");
+        let index_executor = RepoIndexerDeterministicExecutor::new(state_dir.clone());
+        let index_outputs = index_executor
+            .execute(&action_with_workspace(&workspace))
+            .await
+            .unwrap();
+        let repo_index_ref = index_outputs.artifacts[0].clone();
+        let repo_index = load_json_artifact::<RepoIndexArtifact>(&repo_index_ref)
+            .await
+            .unwrap();
+
+        let review_action = action_with_capability(
+            "repo.review",
+            BTreeMap::from([
+                (
+                    "workspace_root".to_string(),
+                    serde_json::json!(workspace.display().to_string()),
+                ),
+                (
+                    "changed_files".to_string(),
+                    serde_json::json!(["src/lib.rs", "config/secrets.env"]),
+                ),
+            ]),
+        );
+        let reviewer =
+            RepoReviewerDeterministicExecutor::new(state_dir, repo_index, Some(repo_index_ref));
+        let outputs = reviewer.execute(&review_action).await.unwrap();
+
+        assert_eq!(outputs.artifacts.len(), 3);
+        let artifact = fs::read_to_string(&outputs.artifacts[1].path)
+            .await
+            .unwrap();
+        let review: ReviewFindingsArtifact = serde_json::from_str(&artifact).unwrap();
+        assert_eq!(review.risk_level, ReviewRiskLevel::High);
+        assert!(review
+            .findings
+            .iter()
+            .any(|finding| finding.title == "Potential secret material detected"));
     }
 }

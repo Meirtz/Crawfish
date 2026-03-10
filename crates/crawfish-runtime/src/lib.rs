@@ -22,7 +22,10 @@ use crawfish_types::{
     CapabilityDescriptor, ContinuityModeName, CounterpartyRef, DegradedProfileName,
     EncounterRecord, EncounterState, HealthStatus, LifecycleRecord, Mutability, TrustDomain,
 };
-use hero::RepoIndexerDeterministicExecutor;
+use hero::{
+    load_json_artifact, required_input_string, RepoIndexerDeterministicExecutor,
+    RepoReviewerDeterministicExecutor,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,9 +39,6 @@ pub struct Supervisor {
     config: CrawfishConfig,
     store: SqliteStore,
 }
-
-#[derive(Debug, Clone)]
-struct ReviewDeterministicExecutor;
 
 #[derive(Debug, thiserror::Error)]
 enum RuntimeError {
@@ -166,6 +166,91 @@ impl Supervisor {
 
     fn state_dir(&self) -> PathBuf {
         self.config.state_dir(&self.root)
+    }
+
+    async fn ensure_repo_index_for_workspace(
+        &self,
+        workspace_root: &str,
+    ) -> anyhow::Result<(
+        crawfish_types::ArtifactRef,
+        crawfish_types::RepoIndexArtifact,
+    )> {
+        if let Some(action) = self
+            .store
+            .latest_completed_action("repo_indexer", "repo.index")
+            .await?
+        {
+            if action
+                .outputs
+                .metadata
+                .get("workspace_root")
+                .and_then(|value| value.as_str())
+                == Some(workspace_root)
+            {
+                if let Some(artifact_ref) = action.outputs.artifacts.first() {
+                    let artifact =
+                        load_json_artifact::<crawfish_types::RepoIndexArtifact>(artifact_ref)
+                            .await?;
+                    return Ok((artifact_ref.clone(), artifact));
+                }
+            }
+        }
+
+        let bootstrap_action = Action {
+            id: format!("inline-index-{}", Uuid::new_v4()),
+            target_agent_id: "repo_indexer".to_string(),
+            requester: action_requester("system"),
+            initiator_owner: self.synthetic_owner(),
+            counterparty_refs: Vec::new(),
+            goal: crawfish_types::GoalSpec {
+                summary: "inline repo index bootstrap".to_string(),
+                details: None,
+            },
+            capability: "repo.index".to_string(),
+            inputs: std::collections::BTreeMap::from([(
+                "workspace_root".to_string(),
+                serde_json::json!(workspace_root),
+            )]),
+            contract: self.config.contracts.org_defaults.clone(),
+            execution_strategy: None,
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            encounter_ref: None,
+            audit_receipt_ref: None,
+            data_boundary: "owner_local".to_string(),
+            schedule: crawfish_types::ScheduleSpec::default(),
+            phase: ActionPhase::Running,
+            created_at: now_timestamp(),
+            started_at: Some(now_timestamp()),
+            finished_at: None,
+            checkpoint_ref: None,
+            continuity_mode: None,
+            degradation_profile: None,
+            failure_reason: None,
+            selected_executor: Some("deterministic.repo_index".to_string()),
+            recovery_stage: None,
+            external_refs: Vec::new(),
+            outputs: ActionOutputs::default(),
+        };
+
+        let executor = RepoIndexerDeterministicExecutor::new(self.state_dir());
+        let outputs = executor.execute(&bootstrap_action).await?;
+        let artifact_ref = outputs
+            .artifacts
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("repo.index did not emit an artifact"))?;
+        let artifact =
+            load_json_artifact::<crawfish_types::RepoIndexArtifact>(&artifact_ref).await?;
+        Ok((artifact_ref, artifact))
+    }
+
+    fn synthetic_owner(&self) -> crawfish_types::OwnerRef {
+        crawfish_types::OwnerRef {
+            kind: crawfish_types::OwnerKind::ServiceAccount,
+            id: "crawfishd".to_string(),
+            display_name: Some("Crawfish Daemon".to_string()),
+        }
     }
 
     async fn reconcile_manifest(
@@ -362,7 +447,15 @@ impl Supervisor {
         }
 
         if action.capability == "repo.review" {
-            let executor = ReviewDeterministicExecutor;
+            let workspace_root = required_input_string(action, "workspace_root")?;
+            let (repo_index_ref, repo_index) = self
+                .ensure_repo_index_for_workspace(&workspace_root)
+                .await?;
+            let executor = RepoReviewerDeterministicExecutor::new(
+                self.state_dir(),
+                repo_index,
+                Some(repo_index_ref),
+            );
             let outputs = executor.execute(action).await?;
             return Ok(ExecutionOutcome::Completed {
                 outputs,
@@ -486,6 +579,13 @@ impl Supervisor {
         self.store.insert_encounter(&encounter).await?;
         self.store.insert_audit_receipt(&receipt).await?;
         Ok((encounter, receipt))
+    }
+}
+
+fn action_requester(id: &str) -> crawfish_types::RequesterRef {
+    crawfish_types::RequesterRef {
+        kind: crawfish_types::RequesterKind::System,
+        id: id.to_string(),
     }
 }
 
@@ -697,34 +797,6 @@ impl SupervisorControl for Supervisor {
     }
 }
 
-#[async_trait::async_trait]
-impl DeterministicExecutor for ReviewDeterministicExecutor {
-    async fn execute(&self, action: &Action) -> anyhow::Result<ActionOutputs> {
-        let mut outputs = ActionOutputs {
-            summary: Some(format!(
-                "Deterministic review summary for capability {}",
-                action.capability
-            )),
-            ..ActionOutputs::default()
-        };
-        outputs.metadata.insert(
-            "findings".to_string(),
-            serde_json::json!([
-                {
-                    "severity": "medium",
-                    "title": "Review coverage stub",
-                    "detail": "Deterministic executor produced a placeholder review summary."
-                }
-            ]),
-        );
-        outputs.metadata.insert(
-            "executor_class".to_string(),
-            serde_json::json!("deterministic"),
-        );
-        Ok(outputs)
-    }
-}
-
 fn trust_domain_defaults(trust_domain: TrustDomain) -> crawfish_types::EncounterPolicy {
     let mut policy = crawfish_types::EncounterPolicy {
         default_disposition: crawfish_types::DefaultDisposition::AllowWithLease,
@@ -907,11 +979,19 @@ mod tests {
         tokio::fs::create_dir_all(dir.join("agents")).await?;
         tokio::fs::create_dir_all(dir.join(".crawfish/state")).await?;
         tokio::fs::create_dir_all(dir.join(".crawfish/run")).await?;
+        tokio::fs::create_dir_all(dir.join("src")).await?;
+        tokio::fs::create_dir_all(dir.join("tests")).await?;
         tokio::fs::write(
             dir.join("Crawfish.toml"),
             include_str!("../../../examples/hero-fleet/Crawfish.toml"),
         )
         .await?;
+        tokio::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn value() -> u32 { 42 } // TODO follow up\n",
+        )
+        .await?;
+        tokio::fs::write(dir.join("tests/lib_test.rs"), "#[test] fn smoke() {}\n").await?;
         for agent in [
             "repo_indexer",
             "repo_reviewer",
@@ -954,7 +1034,16 @@ mod tests {
                     summary: "review pull request".to_string(),
                     details: None,
                 },
-                inputs: Default::default(),
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "changed_files".to_string(),
+                        serde_json::json!(["src/lib.rs"]),
+                    ),
+                ]),
                 contract_overrides: None,
                 execution_strategy: None,
                 schedule: None,
