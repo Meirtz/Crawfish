@@ -1,7 +1,7 @@
 mod hero;
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -19,10 +19,11 @@ use crawfish_core::{
 use crawfish_mcp::McpAdapter;
 use crawfish_store_sqlite::SqliteStore;
 use crawfish_types::{
-    Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, AuditOutcome,
-    AuditReceipt, CapabilityDescriptor, CapabilityLease, ConsentGrant, ContinuityModeName,
-    CounterpartyRef, DegradedProfileName, DeterministicCheckpoint, EncounterRecord, EncounterState,
-    ExternalRef, HealthStatus, LifecycleRecord, Mutability, TrustDomain,
+    Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, ApprovalPolicy,
+    AuditOutcome, AuditReceipt, CapabilityDescriptor, CapabilityLease, ConsentGrant,
+    ContinuityModeName, CounterpartyRef, DegradedProfileName, DeterministicCheckpoint,
+    EncounterRecord, EncounterState, ExternalRef, HealthStatus, LifecycleRecord, Mutability,
+    TrustDomain,
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
@@ -54,6 +55,11 @@ enum RuntimeError {
     Forbidden(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ActionListQuery {
+    phase: Option<String>,
 }
 
 impl IntoResponse for RuntimeError {
@@ -204,6 +210,56 @@ impl Supervisor {
                         "phase": "accepted",
                         "recovery_stage": recovery_stage,
                         "reason": "daemon restart requeued running action",
+                    }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn expire_awaiting_approval_actions(&self) -> anyhow::Result<()> {
+        let now = current_timestamp_seconds();
+        for mut action in self
+            .store
+            .list_actions_by_phase(Some("awaiting_approval"))
+            .await?
+        {
+            let Some(deadline_ms) = action.contract.delivery.deadline_ms else {
+                continue;
+            };
+            let created_at = action.created_at.parse::<u64>().unwrap_or_default();
+            if now.saturating_sub(created_at) * 1000 < deadline_ms {
+                continue;
+            }
+
+            action.phase = ActionPhase::Expired;
+            action.finished_at = Some(now.to_string());
+            action.failure_reason = Some("approval expired before deadline".to_string());
+            if let Some(encounter_ref) = &action.encounter_ref {
+                if let Some(mut encounter) = self.store.get_encounter(encounter_ref).await? {
+                    encounter.state = EncounterState::Expired;
+                    self.store.insert_encounter(&encounter).await?;
+                }
+                let receipt = self
+                    .emit_audit_receipt(
+                        encounter_ref,
+                        action.grant_refs.clone(),
+                        action.lease_ref.clone(),
+                        AuditOutcome::Expired,
+                        "approval expired before deadline".to_string(),
+                        None,
+                    )
+                    .await?;
+                action.audit_receipt_ref = Some(receipt.id.clone());
+            }
+            self.store.upsert_action(&action).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "expired",
+                    serde_json::json!({
+                        "reason": action.failure_reason,
+                        "finished_at": action.finished_at,
                     }),
                 )
                 .await?;
@@ -649,6 +705,8 @@ impl Supervisor {
             return Ok(());
         }
 
+        self.expire_awaiting_approval_actions().await?;
+
         while let Some(action) = self.store.claim_next_accepted_action().await? {
             self.process_claimed_action(action).await?;
         }
@@ -689,6 +747,39 @@ impl Supervisor {
                     &action.id,
                     "blocked",
                     serde_json::json!({"reason": action.failure_reason}),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        if let Err(error) = self.ensure_pre_execution_lease_valid(&action).await {
+            let reason = error.to_string();
+            action.phase = ActionPhase::Failed;
+            action.finished_at = Some(now_timestamp());
+            action.failure_reason = Some(reason.clone());
+            if let Some(encounter_ref) = &action.encounter_ref {
+                if let Some(mut encounter) = self.store.get_encounter(encounter_ref).await? {
+                    encounter.state = EncounterState::Denied;
+                    self.store.insert_encounter(&encounter).await?;
+                }
+                let receipt = self
+                    .emit_audit_receipt(
+                        encounter_ref,
+                        action.grant_refs.clone(),
+                        action.lease_ref.clone(),
+                        AuditOutcome::Denied,
+                        reason.clone(),
+                        None,
+                    )
+                    .await?;
+                action.audit_receipt_ref = Some(receipt.id);
+            }
+            self.store.upsert_action(&action).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "failed",
+                    serde_json::json!({"reason": reason, "finished_at": action.finished_at}),
                 )
                 .await?;
             return Ok(());
@@ -963,12 +1054,35 @@ impl Supervisor {
         )
     }
 
-    async fn record_encounter(
+    fn action_requires_approval(
+        &self,
+        request: &SubmitActionRequest,
+        manifest: &AgentManifest,
+        capability: &str,
+        approval_policy: &ApprovalPolicy,
+    ) -> bool {
+        if capability == "workspace.patch.apply" {
+            return true;
+        }
+
+        if request.workspace_write || request.secret_access || request.mutating {
+            return !matches!(approval_policy, ApprovalPolicy::None)
+                || matches!(
+                    manifest.workspace_policy.write_mode,
+                    crawfish_types::WorkspaceWriteMode::ApprovalGated
+                );
+        }
+
+        matches!(approval_policy, ApprovalPolicy::Always)
+    }
+
+    async fn create_encounter(
         &self,
         manifest: &AgentManifest,
         request: &EncounterRequest,
-        decision: &EncounterDecision,
-    ) -> anyhow::Result<(EncounterRecord, AuditReceipt)> {
+        _decision: &EncounterDecision,
+        state: EncounterState,
+    ) -> anyhow::Result<EncounterRecord> {
         let encounter = EncounterRecord {
             id: Uuid::new_v4().to_string(),
             initiator_ref: request.caller.clone(),
@@ -977,33 +1091,128 @@ impl Supervisor {
             trust_domain: request.caller.trust_domain.clone(),
             requested_capabilities: request.requested_capabilities.clone(),
             applied_policy_source: "system>owner>trust-domain>manifest".to_string(),
-            state: match decision.disposition {
-                EncounterDisposition::Deny => EncounterState::Denied,
-                EncounterDisposition::AwaitConsent => EncounterState::AwaitingConsent,
-                EncounterDisposition::IssueLease => EncounterState::Leased,
-            },
+            state,
             grant_refs: Vec::new(),
             lease_ref: None,
             created_at: now_timestamp(),
         };
+        self.store.insert_encounter(&encounter).await?;
+        Ok(encounter)
+    }
+
+    async fn emit_audit_receipt(
+        &self,
+        encounter_ref: &str,
+        grant_refs: Vec<String>,
+        lease_ref: Option<String>,
+        outcome: AuditOutcome,
+        reason: String,
+        approver_ref: Option<String>,
+    ) -> anyhow::Result<AuditReceipt> {
         let receipt = AuditReceipt {
             id: Uuid::new_v4().to_string(),
-            encounter_ref: encounter.id.clone(),
-            grant_refs: Vec::new(),
-            lease_ref: None,
-            outcome: match decision.disposition {
-                EncounterDisposition::Deny => AuditOutcome::Denied,
-                EncounterDisposition::AwaitConsent | EncounterDisposition::IssueLease => {
-                    AuditOutcome::Allowed
-                }
-            },
-            reason: decision.reason.clone(),
-            approver_ref: None,
+            encounter_ref: encounter_ref.to_string(),
+            grant_refs,
+            lease_ref,
+            outcome,
+            reason,
+            approver_ref,
             emitted_at: now_timestamp(),
         };
-        self.store.insert_encounter(&encounter).await?;
         self.store.insert_audit_receipt(&receipt).await?;
-        Ok((encounter, receipt))
+        Ok(receipt)
+    }
+
+    fn approval_expiry_for_action(&self, action: &Action) -> String {
+        let base = action.created_at.parse::<u64>().unwrap_or_default();
+        let deadline = action.contract.delivery.deadline_ms.unwrap_or(900_000);
+        (base.saturating_add(deadline / 1000)).to_string()
+    }
+
+    async fn issue_grant_and_lease(
+        &self,
+        action: &Action,
+        manifest: &AgentManifest,
+        encounter: &mut EncounterRecord,
+        approver_ref: Option<String>,
+        reason: String,
+    ) -> anyhow::Result<(ConsentGrant, CapabilityLease, AuditReceipt)> {
+        let expires_at = self.approval_expiry_for_action(action);
+        let grant = ConsentGrant {
+            id: Uuid::new_v4().to_string(),
+            grantor: manifest.owner.clone(),
+            grantee: action.initiator_owner.clone(),
+            purpose: action.goal.summary.clone(),
+            scope: vec![action.capability.clone()],
+            issued_at: now_timestamp(),
+            expires_at: expires_at.clone(),
+            revocable: true,
+            approver_ref: approver_ref.clone(),
+        };
+        self.store.upsert_consent_grant(&grant).await?;
+
+        let lease = CapabilityLease {
+            id: Uuid::new_v4().to_string(),
+            grant_ref: grant.id.clone(),
+            lessor: manifest.owner.clone(),
+            lessee: action.initiator_owner.clone(),
+            capability_refs: vec![action.capability.clone()],
+            scope: if action.contract.safety.tool_scope.is_empty() {
+                vec![action.capability.clone()]
+            } else {
+                action.contract.safety.tool_scope.clone()
+            },
+            issued_at: now_timestamp(),
+            expires_at,
+            revocation_reason: None,
+            audit_receipt_ref: String::new(),
+        };
+        self.store.upsert_capability_lease(&lease).await?;
+
+        encounter.state = EncounterState::Leased;
+        encounter.grant_refs = vec![grant.id.clone()];
+        encounter.lease_ref = Some(lease.id.clone());
+        self.store.insert_encounter(encounter).await?;
+
+        let receipt = self
+            .emit_audit_receipt(
+                &encounter.id,
+                vec![grant.id.clone()],
+                Some(lease.id.clone()),
+                AuditOutcome::Allowed,
+                reason,
+                approver_ref,
+            )
+            .await?;
+
+        let mut persisted_lease = lease;
+        persisted_lease.audit_receipt_ref = receipt.id.clone();
+        self.store.upsert_capability_lease(&persisted_lease).await?;
+
+        Ok((grant, persisted_lease, receipt))
+    }
+
+    async fn ensure_pre_execution_lease_valid(&self, action: &Action) -> anyhow::Result<()> {
+        let Some(lease_ref) = &action.lease_ref else {
+            if action.capability == "workspace.patch.apply" {
+                anyhow::bail!("mutation action requires an active capability lease");
+            }
+            return Ok(());
+        };
+        let lease = self
+            .store
+            .get_capability_lease(lease_ref)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("capability lease not found: {lease_ref}"))?;
+        if lease.revocation_reason.is_some() {
+            anyhow::bail!("capability lease {} has been revoked", lease.id);
+        }
+        let now = current_timestamp_seconds();
+        let expires_at = lease.expires_at.parse::<u64>().unwrap_or_default();
+        if expires_at > 0 && now >= expires_at {
+            anyhow::bail!("capability lease {} has expired", lease.id);
+        }
+        Ok(())
     }
 }
 
@@ -1154,6 +1363,23 @@ fn action_requester(id: &str) -> crawfish_types::RequesterRef {
     }
 }
 
+fn current_timestamp_seconds() -> u64 {
+    now_timestamp().parse::<u64>().unwrap_or_default()
+}
+
+fn action_phase_name(phase: &ActionPhase) -> &'static str {
+    match phase {
+        ActionPhase::Accepted => "accepted",
+        ActionPhase::Running => "running",
+        ActionPhase::Blocked => "blocked",
+        ActionPhase::AwaitingApproval => "awaiting_approval",
+        ActionPhase::Cancelling => "cancelling",
+        ActionPhase::Completed => "completed",
+        ActionPhase::Failed => "failed",
+        ActionPhase::Expired => "expired",
+    }
+}
+
 #[async_trait::async_trait]
 impl SupervisorControl for Supervisor {
     async fn list_status(&self) -> anyhow::Result<FleetStatusResponse> {
@@ -1173,7 +1399,7 @@ impl SupervisorControl for Supervisor {
                 id: action.id,
                 target_agent_id: action.target_agent_id,
                 capability: action.capability,
-                phase: format!("{:?}", action.phase).to_lowercase(),
+                phase: action_phase_name(&action.phase).to_string(),
                 created_at: action.created_at,
                 failure_reason: action.failure_reason,
                 encounter_ref: action.encounter_ref,
@@ -1209,13 +1435,19 @@ impl SupervisorControl for Supervisor {
         } else {
             None
         };
+        let grant_details = self.store.list_consent_grants(&action.grant_refs).await?;
+        let lease_detail = if let Some(lease_ref) = &action.lease_ref {
+            self.store.get_capability_lease(lease_ref).await?
+        } else {
+            None
+        };
         Ok(Some(ActionDetail {
             artifact_refs: action.outputs.artifacts.clone(),
             selected_executor: action.selected_executor.clone(),
             recovery_stage: action.recovery_stage.clone(),
             external_refs: action.external_refs.clone(),
-            grant_details: Vec::<ConsentGrant>::new(),
-            lease_detail: None::<CapabilityLease>,
+            grant_details,
+            lease_detail,
             action,
             encounter,
             latest_audit_receipt: audit_receipt,
@@ -1229,6 +1461,16 @@ impl SupervisorControl for Supervisor {
             .await?
             .ok_or_else(|| anyhow::anyhow!("agent not found: {}", request.target_agent_id))?;
         self.validate_submit_action_request(&manifest, &request)?;
+
+        let compiled = compile_execution_plan(
+            &self.config.contracts.org_defaults,
+            &manifest.contract_defaults,
+            &request.contract_overrides.clone().unwrap_or_default(),
+            &manifest.strategy_defaults,
+            &request.capability,
+            request.execution_strategy.clone(),
+        )
+        .map_err(|error| anyhow::anyhow!("invalid action request: {error}"))?;
 
         let caller = request
             .counterparty_refs
@@ -1250,25 +1492,42 @@ impl SupervisorControl for Supervisor {
             requests_mutating_capability: request.mutating,
         };
         let decision = self.authorize(&manifest, &encounter_request);
-        let (encounter, receipt) = self
-            .record_encounter(&manifest, &encounter_request, &decision)
+        let requires_approval = self.action_requires_approval(
+            &request,
+            &manifest,
+            &request.capability,
+            &compiled.contract.safety.approval_policy,
+        );
+        let encounter_state = if matches!(decision.disposition, EncounterDisposition::Deny) {
+            EncounterState::Denied
+        } else if requires_approval
+            || matches!(decision.disposition, EncounterDisposition::AwaitConsent)
+        {
+            EncounterState::AwaitingConsent
+        } else {
+            EncounterState::Leased
+        };
+        let mut encounter = self
+            .create_encounter(&manifest, &encounter_request, &decision, encounter_state)
             .await?;
-
         if matches!(decision.disposition, EncounterDisposition::Deny) {
+            let receipt = self
+                .emit_audit_receipt(
+                    &encounter.id,
+                    Vec::new(),
+                    None,
+                    AuditOutcome::Denied,
+                    decision.reason.clone(),
+                    None,
+                )
+                .await?;
+            let _ = receipt;
             anyhow::bail!(decision.reason);
         }
 
-        let compiled = compile_execution_plan(
-            &self.config.contracts.org_defaults,
-            &manifest.contract_defaults,
-            &request.contract_overrides.clone().unwrap_or_default(),
-            &manifest.strategy_defaults,
-            &request.capability,
-            request.execution_strategy.clone(),
-        )
-        .map_err(|error| anyhow::anyhow!("invalid action request: {error}"))?;
-
-        let action = Action {
+        let created_at = now_timestamp();
+        let encounter_id = encounter.id.clone();
+        let mut action = Action {
             id: Uuid::new_v4().to_string(),
             target_agent_id: request.target_agent_id,
             requester: request.requester,
@@ -1281,8 +1540,8 @@ impl SupervisorControl for Supervisor {
             execution_strategy: compiled.strategy,
             grant_refs: Vec::new(),
             lease_ref: None,
-            encounter_ref: Some(encounter.id),
-            audit_receipt_ref: Some(receipt.id),
+            encounter_ref: Some(encounter_id),
+            audit_receipt_ref: None,
             data_boundary: request.data_boundary.unwrap_or_else(|| {
                 manifest
                     .default_data_boundaries
@@ -1291,12 +1550,14 @@ impl SupervisorControl for Supervisor {
                     .unwrap_or_else(|| "owner_local".to_string())
             }),
             schedule: request.schedule.unwrap_or_default(),
-            phase: if matches!(decision.disposition, EncounterDisposition::AwaitConsent) {
+            phase: if requires_approval
+                || matches!(decision.disposition, EncounterDisposition::AwaitConsent)
+            {
                 ActionPhase::AwaitingApproval
             } else {
                 ActionPhase::Accepted
             },
-            created_at: now_timestamp(),
+            created_at,
             started_at: None,
             finished_at: None,
             checkpoint_ref: None,
@@ -1308,6 +1569,22 @@ impl SupervisorControl for Supervisor {
             external_refs: Vec::new(),
             outputs: ActionOutputs::default(),
         };
+
+        if matches!(action.phase, ActionPhase::Accepted) {
+            let (grant, lease, receipt) = self
+                .issue_grant_and_lease(
+                    &action,
+                    &manifest,
+                    &mut encounter,
+                    None,
+                    decision.reason.clone(),
+                )
+                .await?;
+            action.grant_refs = vec![grant.id];
+            action.lease_ref = Some(lease.id);
+            action.audit_receipt_ref = Some(receipt.id);
+        }
+
         self.store.upsert_action(&action).await?;
         self.store
             .append_action_event(
@@ -1325,6 +1602,8 @@ impl SupervisorControl for Supervisor {
                     "target_agent_id": action.target_agent_id,
                     "encounter_ref": action.encounter_ref,
                     "audit_receipt_ref": action.audit_receipt_ref,
+                    "grant_refs": action.grant_refs,
+                    "lease_ref": action.lease_ref,
                 }),
             )
             .await?;
@@ -1340,26 +1619,186 @@ impl SupervisorControl for Supervisor {
 
     async fn approve_action(
         &self,
-        _action_id: &str,
-        _request: ApproveActionRequest,
+        action_id: &str,
+        request: ApproveActionRequest,
     ) -> anyhow::Result<SubmittedAction> {
-        anyhow::bail!("approve action is not implemented yet");
+        let mut action = self
+            .store
+            .get_action(action_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("action not found: {action_id}"))?;
+        if !matches!(action.phase, ActionPhase::AwaitingApproval) {
+            anyhow::bail!("action {action_id} is not awaiting approval");
+        }
+        let encounter_ref = action
+            .encounter_ref
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("action {action_id} is missing encounter_ref"))?;
+        let mut encounter = self
+            .store
+            .get_encounter(&encounter_ref)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("encounter not found: {encounter_ref}"))?;
+        let manifest = self
+            .store
+            .get_agent_manifest(&action.target_agent_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("agent not found: {}", action.target_agent_id))?;
+
+        let reason = request
+            .note
+            .as_ref()
+            .map(|note| format!("action approved: {note}"))
+            .unwrap_or_else(|| "action approved by operator".to_string());
+        let (grant, lease, receipt) = self
+            .issue_grant_and_lease(
+                &action,
+                &manifest,
+                &mut encounter,
+                Some(request.approver_ref),
+                reason,
+            )
+            .await?;
+
+        action.grant_refs = vec![grant.id];
+        action.lease_ref = Some(lease.id);
+        action.audit_receipt_ref = Some(receipt.id);
+        action.phase = ActionPhase::Accepted;
+        action.failure_reason = None;
+        self.store.upsert_action(&action).await?;
+        self.store
+            .append_action_event(
+                &action.id,
+                "approved",
+                serde_json::json!({
+                    "phase": "accepted",
+                    "grant_refs": action.grant_refs,
+                    "lease_ref": action.lease_ref,
+                }),
+            )
+            .await?;
+
+        Ok(SubmittedAction {
+            action_id: action.id,
+            phase: "accepted".to_string(),
+        })
     }
 
     async fn reject_action(
         &self,
-        _action_id: &str,
-        _request: RejectActionRequest,
+        action_id: &str,
+        request: RejectActionRequest,
     ) -> anyhow::Result<SubmittedAction> {
-        anyhow::bail!("reject action is not implemented yet");
+        let mut action = self
+            .store
+            .get_action(action_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("action not found: {action_id}"))?;
+        if !matches!(action.phase, ActionPhase::AwaitingApproval) {
+            anyhow::bail!("action {action_id} is not awaiting approval");
+        }
+        let encounter_ref = action
+            .encounter_ref
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("action {action_id} is missing encounter_ref"))?;
+        if let Some(mut encounter) = self.store.get_encounter(&encounter_ref).await? {
+            encounter.state = EncounterState::Denied;
+            self.store.insert_encounter(&encounter).await?;
+        }
+        let receipt = self
+            .emit_audit_receipt(
+                &encounter_ref,
+                action.grant_refs.clone(),
+                action.lease_ref.clone(),
+                AuditOutcome::Denied,
+                request.reason.clone(),
+                Some(request.approver_ref),
+            )
+            .await?;
+        action.phase = ActionPhase::Failed;
+        action.finished_at = Some(now_timestamp());
+        action.failure_reason = Some("approval rejected".to_string());
+        action.audit_receipt_ref = Some(receipt.id);
+        self.store.upsert_action(&action).await?;
+        self.store
+            .append_action_event(
+                &action.id,
+                "rejected",
+                serde_json::json!({
+                    "phase": "failed",
+                    "reason": action.failure_reason,
+                    "finished_at": action.finished_at,
+                }),
+            )
+            .await?;
+
+        Ok(SubmittedAction {
+            action_id: action.id,
+            phase: "failed".to_string(),
+        })
     }
 
     async fn revoke_lease(
         &self,
-        _lease_id: &str,
-        _request: RevokeLeaseRequest,
+        lease_id: &str,
+        request: RevokeLeaseRequest,
     ) -> anyhow::Result<AdminActionResponse> {
-        anyhow::bail!("revoke lease is not implemented yet");
+        let mut lease = self
+            .store
+            .get_capability_lease(lease_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("capability lease not found: {lease_id}"))?;
+        lease.revocation_reason = Some(request.reason.clone());
+        self.store.upsert_capability_lease(&lease).await?;
+
+        for mut action in self.store.list_actions_by_phase(None).await? {
+            if action.lease_ref.as_deref() != Some(lease_id) {
+                continue;
+            }
+            if matches!(
+                action.phase,
+                ActionPhase::Completed | ActionPhase::Failed | ActionPhase::Expired
+            ) {
+                continue;
+            }
+
+            if let Some(encounter_ref) = &action.encounter_ref {
+                if let Some(mut encounter) = self.store.get_encounter(encounter_ref).await? {
+                    encounter.state = EncounterState::Revoked;
+                    self.store.insert_encounter(&encounter).await?;
+                }
+                let receipt = self
+                    .emit_audit_receipt(
+                        encounter_ref,
+                        action.grant_refs.clone(),
+                        Some(lease.id.clone()),
+                        AuditOutcome::Revoked,
+                        request.reason.clone(),
+                        Some(request.revoker_ref.clone()),
+                    )
+                    .await?;
+                action.audit_receipt_ref = Some(receipt.id);
+            }
+            action.phase = ActionPhase::Failed;
+            action.finished_at = Some(now_timestamp());
+            action.failure_reason = Some(format!("lease revoked: {}", request.reason));
+            self.store.upsert_action(&action).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "revoked",
+                    serde_json::json!({
+                        "phase": "failed",
+                        "lease_ref": lease.id,
+                        "reason": action.failure_reason,
+                    }),
+                )
+                .await?;
+        }
+
+        Ok(AdminActionResponse {
+            status: "revoked".to_string(),
+        })
     }
 
     async fn validate_policy_request(
@@ -1381,8 +1820,6 @@ impl SupervisorControl for Supervisor {
             requests_mutating_capability: request.mutating,
         };
         let decision = self.authorize(&manifest, &encounter_request);
-        self.record_encounter(&manifest, &encounter_request, &decision)
-            .await?;
 
         Ok(PolicyValidationResponse {
             disposition: format!("{:?}", decision.disposition).to_lowercase(),
@@ -1468,8 +1905,14 @@ fn api_router(supervisor: Arc<Supervisor>) -> Router {
         .route("/v1/health", get(health_handler))
         .route("/v1/agents", get(list_agents_handler))
         .route("/v1/agents/{id}", get(agent_detail_handler))
+        .route(
+            "/v1/actions",
+            get(list_actions_handler).post(submit_action_handler),
+        )
         .route("/v1/actions/{id}", get(action_detail_handler))
-        .route("/v1/actions", post(submit_action_handler))
+        .route("/v1/actions/{id}/approve", post(approve_action_handler))
+        .route("/v1/actions/{id}/reject", post(reject_action_handler))
+        .route("/v1/leases/{id}/revoke", post(revoke_lease_handler))
         .route("/v1/admin/drain", post(drain_handler))
         .route("/v1/admin/resume", post(resume_handler))
         .route("/v1/policy/validate", post(policy_validate_handler))
@@ -1524,6 +1967,18 @@ async fn action_detail_handler(
         .ok_or_else(|| RuntimeError::NotFound(format!("action not found: {id}")))
 }
 
+async fn list_actions_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    Query(query): Query<ActionListQuery>,
+) -> Result<Json<ActionListResponse>, RuntimeError> {
+    Ok(Json(
+        supervisor
+            .list_actions(query.phase.as_deref())
+            .await
+            .map_err(RuntimeError::Internal)?,
+    ))
+}
+
 async fn submit_action_handler(
     State(supervisor): State<Arc<Supervisor>>,
     Json(request): Json<SubmitActionRequest>,
@@ -1540,6 +1995,60 @@ async fn submit_action_handler(
                 Err(RuntimeError::Forbidden(message))
             } else {
                 Err(RuntimeError::Internal(error))
+            }
+        }
+    }
+}
+
+async fn approve_action_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ApproveActionRequest>,
+) -> Result<Json<SubmittedAction>, RuntimeError> {
+    match supervisor.approve_action(&id, request).await {
+        Ok(submitted) => Ok(Json(submitted)),
+        Err(error) => {
+            let message = error.to_string();
+            if message.starts_with("action not found:") {
+                Err(RuntimeError::NotFound(message))
+            } else {
+                Err(RuntimeError::BadRequest(message))
+            }
+        }
+    }
+}
+
+async fn reject_action_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<RejectActionRequest>,
+) -> Result<Json<SubmittedAction>, RuntimeError> {
+    match supervisor.reject_action(&id, request).await {
+        Ok(submitted) => Ok(Json(submitted)),
+        Err(error) => {
+            let message = error.to_string();
+            if message.starts_with("action not found:") {
+                Err(RuntimeError::NotFound(message))
+            } else {
+                Err(RuntimeError::BadRequest(message))
+            }
+        }
+    }
+}
+
+async fn revoke_lease_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<RevokeLeaseRequest>,
+) -> Result<Json<AdminActionResponse>, RuntimeError> {
+    match supervisor.revoke_lease(&id, request).await {
+        Ok(response) => Ok(Json(response)),
+        Err(error) => {
+            let message = error.to_string();
+            if message.starts_with("capability lease not found:") {
+                Err(RuntimeError::NotFound(message))
+            } else {
+                Err(RuntimeError::BadRequest(message))
             }
         }
     }
