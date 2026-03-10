@@ -8,6 +8,7 @@ manifests_dir = "agents"
 [api]
 socket_path = ".crawfish/run/crawfishd.sock"
 
+# Hero P0 currently supports MCP over SSE only.
 [mcp.servers.hero_remote]
 transport = "sse"
 url = "http://127.0.0.1:8877/sse"
@@ -53,5 +54,6 @@ minimum_confidence = 0.6
 [contracts.org_defaults.recovery]
 resumability = "checkpoint_resume"
 fallback_behavior = "degrade"
+# Prefer deterministic continuity first, then queueing, then operator handoff.
 continuity_preference = ["deterministic_only", "store_and_forward", "human_handoff"]
 deterministic_fallbacks = ["local.rule_engine"]

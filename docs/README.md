@@ -22,6 +22,17 @@ Current spec entry points:
 - [`spec/v0.1-plan.md`](spec/v0.1-plan.md)
 - [`spec/glossary.md`](spec/glossary.md)
 
+## Runnable Example
+
+The live alpha example fleet is tracked under:
+
+- [`../examples/hero-fleet/Crawfish.toml`](../examples/hero-fleet/Crawfish.toml)
+- [`../examples/hero-fleet/agents/repo_indexer.toml`](../examples/hero-fleet/agents/repo_indexer.toml)
+- [`../examples/hero-fleet/agents/repo_reviewer.toml`](../examples/hero-fleet/agents/repo_reviewer.toml)
+- [`../examples/hero-fleet/agents/ci_triage.toml`](../examples/hero-fleet/agents/ci_triage.toml)
+
+That example is the current implementation reference for Hero P0: deterministic `repo.index`, deterministic-first `repo.review`, and `ci.triage` with either direct log input or SSE MCP-backed log fetch.
+
 ## Export Policy
 
 The latest consolidated DOCX export is tracked at:
@@ -37,4 +48,3 @@ python3 scripts/export_docset.py
 ## Archive Policy
 
 Historical materials are retained under `docs/archive/` for provenance and comparison, but they are not editable specs.
-

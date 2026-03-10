@@ -169,6 +169,18 @@ Continuity baseline is delivered through these same P0 systems. It is not a sepa
 
 OpenClaw interoperability, `ACP`, and `A2A` remain important parts of the product story, but they are intentionally deferred until after the lifecycle, contract, and recovery model is proven in P0.
 
+## Current Alpha Slice
+
+The current Rust alpha already covers one runnable Hero P0 slice:
+
+- `repo.index` scans a local workspace and emits `repo_index.json`.
+- `repo.review` runs deterministic review checks and reuses or bootstraps the latest repo index.
+- `ci.triage` classifies CI failures from direct logs or from an SSE MCP tool route.
+- `inspect` surfaces artifact refs, checkpoint refs, recovery stage, continuity mode, encounter metadata, and external refs.
+- restart recovery requeues `running` actions and resumes deterministic work from checkpoint metadata.
+
+The first external tool transport implemented in code is `MCP over SSE`. `repo_reviewer` remains deterministic-first, while `ci_triage` can fetch remote log material through MCP and then complete the actual classification locally.
+
 ## Quickstart
 
 Start with the design docs:
@@ -192,6 +204,17 @@ cargo run -p crawfish-cli --bin crawfish -- status --json
 cargo run -p crawfish-cli --bin crawfish -- action submit \
   --target-agent repo_reviewer \
   --capability repo.review \
-  --goal "review pull request"
+  --goal "review pull request" \
+  --inputs-json "{\"workspace_root\":\"$(pwd)\",\"changed_files\":[\"src/lib.rs\"]}" \
+  --json
+cargo run -p crawfish-cli --bin crawfish -- action submit \
+  --target-agent ci_triage \
+  --capability ci.triage \
+  --goal "triage local logs" \
+  --inputs-json "{\"log_text\":\"error: test failed, to rerun pass \`cargo test\`\"}" \
+  --json
+cargo run -p crawfish-cli --bin crawfish -- inspect <action-id> --json
 kill $CRAWFISH_PID
 ```
+
+For a full sample configuration, start from [`examples/hero-fleet/Crawfish.toml`](examples/hero-fleet/Crawfish.toml) and the agent manifests under [`examples/hero-fleet/agents/`](examples/hero-fleet/agents/).
