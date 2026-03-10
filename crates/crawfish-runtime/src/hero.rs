@@ -3,8 +3,10 @@ use async_trait::async_trait;
 use crawfish_core::DeterministicExecutor;
 use crawfish_types::{
     Action, ActionOutputs, ArtifactRef, CiFailureFamily, CiTriageArtifact, RepoIndexArtifact,
-    ReviewFinding, ReviewFindingsArtifact, ReviewRiskLevel,
+    ReviewFinding, ReviewFindingsArtifact, ReviewRiskLevel, WorkspaceApplyResult, WorkspaceEdit,
+    WorkspaceEditOp, WorkspaceRejectedEdit,
 };
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -21,6 +23,10 @@ pub struct RepoReviewerDeterministicExecutor {
 }
 
 pub struct CiTriageDeterministicExecutor {
+    state_dir: PathBuf,
+}
+
+pub struct WorkspacePatchApplyDeterministicExecutor {
     state_dir: PathBuf,
 }
 
@@ -45,6 +51,12 @@ impl RepoReviewerDeterministicExecutor {
 }
 
 impl CiTriageDeterministicExecutor {
+    pub fn new(state_dir: PathBuf) -> Self {
+        Self { state_dir }
+    }
+}
+
+impl WorkspacePatchApplyDeterministicExecutor {
     pub fn new(state_dir: PathBuf) -> Self {
         Self { state_dir }
     }
@@ -273,6 +285,70 @@ impl DeterministicExecutor for CiTriageDeterministicExecutor {
     }
 }
 
+#[async_trait]
+impl DeterministicExecutor for WorkspacePatchApplyDeterministicExecutor {
+    async fn execute(&self, action: &Action) -> anyhow::Result<ActionOutputs> {
+        let workspace_root = required_input_string(action, "workspace_root")?;
+        let workspace_path = PathBuf::from(&workspace_root);
+        if !workspace_path.is_dir() {
+            return Err(anyhow!(
+                "workspace_root must point to an existing directory: {workspace_root}"
+            ));
+        }
+
+        let edits = workspace_edits_from_action(action)?;
+        if edits.is_empty() {
+            return Err(anyhow!("workspace.patch.apply requires at least one edit"));
+        }
+
+        let mut result = WorkspaceApplyResult {
+            applied: Vec::new(),
+            rejected: Vec::new(),
+        };
+
+        for edit in edits {
+            match apply_workspace_edit(&workspace_path, &edit).await {
+                Ok(()) => result.applied.push(edit.path.clone()),
+                Err(error) => result.rejected.push(WorkspaceRejectedEdit {
+                    path: edit.path.clone(),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        let artifact_ref = write_json_artifact(
+            &self.state_dir,
+            &action.id,
+            "workspace_apply_result.json",
+            &result,
+        )
+        .await?;
+
+        Ok(ActionOutputs {
+            summary: Some(format!(
+                "Applied {} edits, rejected {} edits",
+                result.applied.len(),
+                result.rejected.len()
+            )),
+            artifacts: vec![artifact_ref],
+            metadata: BTreeMap::from([
+                (
+                    "executor_class".to_string(),
+                    serde_json::json!("deterministic"),
+                ),
+                (
+                    "applied_count".to_string(),
+                    serde_json::json!(result.applied.len()),
+                ),
+                (
+                    "rejected_count".to_string(),
+                    serde_json::json!(result.rejected.len()),
+                ),
+            ]),
+        })
+    }
+}
+
 pub async fn write_json_artifact<T: serde::Serialize>(
     state_dir: &Path,
     action_id: &str,
@@ -328,6 +404,101 @@ pub async fn load_json_artifact<T: serde::de::DeserializeOwned>(
 ) -> anyhow::Result<T> {
     let contents = fs::read_to_string(&artifact_ref.path).await?;
     Ok(serde_json::from_str(&contents)?)
+}
+
+fn workspace_edits_from_action(action: &Action) -> anyhow::Result<Vec<WorkspaceEdit>> {
+    let value = action
+        .inputs
+        .get("edits")
+        .cloned()
+        .ok_or_else(|| anyhow!("workspace.patch.apply requires edits"))?;
+    Ok(serde_json::from_value(value)?)
+}
+
+async fn apply_workspace_edit(workspace_root: &Path, edit: &WorkspaceEdit) -> anyhow::Result<()> {
+    let relative = Path::new(&edit.path);
+    if relative.is_absolute() {
+        return Err(anyhow!("path must be relative to workspace_root"));
+    }
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "path traversal outside workspace_root is not allowed"
+        ));
+    }
+
+    let target_path = workspace_root.join(relative);
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| anyhow!("edit path must have a parent"))?;
+    if !fs::try_exists(parent).await? {
+        fs::create_dir_all(parent).await?;
+    }
+    let canonical_parent = fs::canonicalize(parent).await?;
+    let canonical_root = fs::canonicalize(workspace_root).await?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(anyhow!("path escapes workspace_root"));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&target_path).await {
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!("symlink targets are not allowed"));
+        }
+    }
+
+    match edit.op {
+        WorkspaceEditOp::Create => {
+            let contents = edit
+                .contents
+                .as_ref()
+                .ok_or_else(|| anyhow!("create edits require contents"))?;
+            if fs::try_exists(&target_path).await? {
+                return Err(anyhow!("create edit target already exists"));
+            }
+            fs::write(&target_path, contents).await?;
+        }
+        WorkspaceEditOp::Replace => {
+            let contents = edit
+                .contents
+                .as_ref()
+                .ok_or_else(|| anyhow!("replace edits require contents"))?;
+            let expected_sha = edit
+                .expected_sha256
+                .as_ref()
+                .ok_or_else(|| anyhow!("replace edits require expected_sha256"))?;
+            let existing = fs::read(&target_path)
+                .await
+                .with_context(|| format!("replace target missing: {}", edit.path))?;
+            if sha256_hex(&existing) != *expected_sha {
+                return Err(anyhow!("replace edit expected_sha256 mismatch"));
+            }
+            fs::write(&target_path, contents).await?;
+        }
+        WorkspaceEditOp::Delete => {
+            let expected_sha = edit
+                .expected_sha256
+                .as_ref()
+                .ok_or_else(|| anyhow!("delete edits require expected_sha256"))?;
+            let existing = fs::read(&target_path)
+                .await
+                .with_context(|| format!("delete target missing: {}", edit.path))?;
+            if sha256_hex(&existing) != *expected_sha {
+                return Err(anyhow!("delete edit expected_sha256 mismatch"));
+            }
+            fs::remove_file(&target_path).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 fn collect_repo_files(workspace_root: &Path) -> Vec<String> {

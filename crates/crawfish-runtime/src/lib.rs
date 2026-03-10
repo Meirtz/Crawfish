@@ -23,11 +23,12 @@ use crawfish_types::{
     AuditOutcome, AuditReceipt, CapabilityDescriptor, CapabilityLease, ConsentGrant,
     ContinuityModeName, CounterpartyRef, DegradedProfileName, DeterministicCheckpoint,
     EncounterRecord, EncounterState, ExternalRef, HealthStatus, LifecycleRecord, Mutability,
-    TrustDomain,
+    TrustDomain, WorkspaceEdit, WorkspaceEditOp,
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
     RepoIndexerDeterministicExecutor, RepoReviewerDeterministicExecutor,
+    WorkspacePatchApplyDeterministicExecutor,
 };
 use serde_json::Value;
 use std::fs;
@@ -367,6 +368,77 @@ impl Supervisor {
                     anyhow::bail!(
                         "invalid action request: ci.triage requires log_text, log_file, or mcp_resource_ref"
                     );
+                }
+            }
+            "workspace.patch.apply" => {
+                let workspace_root = request
+                    .inputs
+                    .get("workspace_root")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid action request: workspace.patch.apply requires workspace_root"
+                        )
+                    })?;
+                if !Path::new(workspace_root).is_dir() {
+                    anyhow::bail!(
+                        "invalid action request: workspace_root must be an existing directory"
+                    );
+                }
+
+                let edits_value = request.inputs.get("edits").cloned().ok_or_else(|| {
+                    anyhow::anyhow!("invalid action request: workspace.patch.apply requires edits")
+                })?;
+                let edits: Vec<WorkspaceEdit> = serde_json::from_value(edits_value)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "invalid action request: workspace.patch.apply edits are invalid: {error}"
+                        )
+                    })?;
+                if edits.is_empty() {
+                    anyhow::bail!(
+                        "invalid action request: workspace.patch.apply requires at least one edit"
+                    );
+                }
+                for edit in edits {
+                    if edit.path.trim().is_empty() {
+                        anyhow::bail!(
+                            "invalid action request: workspace.patch.apply edit path cannot be empty"
+                        );
+                    }
+                    match edit.op {
+                        WorkspaceEditOp::Create => {
+                            if edit.contents.is_none() {
+                                anyhow::bail!(
+                                    "invalid action request: create edits require contents"
+                                );
+                            }
+                        }
+                        WorkspaceEditOp::Replace => {
+                            if edit.contents.is_none() {
+                                anyhow::bail!(
+                                    "invalid action request: replace edits require contents"
+                                );
+                            }
+                            if edit.expected_sha256.is_none() {
+                                anyhow::bail!(
+                                    "invalid action request: replace edits require expected_sha256"
+                                );
+                            }
+                        }
+                        WorkspaceEditOp::Delete => {
+                            if edit.contents.is_some() {
+                                anyhow::bail!(
+                                    "invalid action request: delete edits must not include contents"
+                                );
+                            }
+                            if edit.expected_sha256.is_none() {
+                                anyhow::bail!(
+                                    "invalid action request: delete edits require expected_sha256"
+                                );
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -982,6 +1054,19 @@ impl Supervisor {
                     action,
                     "deterministic.ci_triage",
                     "classifying",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
+        }
+
+        if action.capability == "workspace.patch.apply" {
+            let executor = WorkspacePatchApplyDeterministicExecutor::new(self.state_dir());
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.workspace_patch_apply",
+                    "applying",
                     Vec::new(),
                     &executor,
                 )

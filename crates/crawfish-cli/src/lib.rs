@@ -245,6 +245,10 @@ fn init_workspace(path: &Path) -> anyhow::Result<()> {
         &path.join("agents/incident_enricher.toml"),
         include_str!("../../../examples/hero-fleet/agents/incident_enricher.toml"),
     )?;
+    write_if_missing(
+        &path.join("agents/workspace_editor.toml"),
+        include_str!("../../../examples/hero-fleet/agents/workspace_editor.toml"),
+    )?;
     println!("initialized Crawfish workspace at {}", path.display());
     Ok(())
 }
