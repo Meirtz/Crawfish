@@ -1,3 +1,5 @@
+mod hero;
+
 use axum::{
     extract::{Path as AxumPath, State},
     http::StatusCode,
@@ -20,6 +22,7 @@ use crawfish_types::{
     CapabilityDescriptor, ContinuityModeName, CounterpartyRef, DegradedProfileName,
     EncounterRecord, EncounterState, HealthStatus, LifecycleRecord, Mutability, TrustDomain,
 };
+use hero::RepoIndexerDeterministicExecutor;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,7 +73,10 @@ impl IntoResponse for RuntimeError {
 
 #[derive(Debug)]
 enum ExecutionOutcome {
-    Completed(ActionOutputs),
+    Completed {
+        outputs: ActionOutputs,
+        selected_executor: String,
+    },
     Blocked {
         reason: String,
         continuity_mode: ContinuityModeName,
@@ -156,6 +162,10 @@ impl Supervisor {
 
     pub fn store(&self) -> &SqliteStore {
         &self.store
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.config.state_dir(&self.root)
     }
 
     async fn reconcile_manifest(
@@ -279,11 +289,15 @@ impl Supervisor {
         }
 
         match self.execute_action(&action, &manifest).await {
-            Ok(ExecutionOutcome::Completed(outputs)) => {
+            Ok(ExecutionOutcome::Completed {
+                outputs,
+                selected_executor,
+            }) => {
                 action.phase = ActionPhase::Completed;
                 action.outputs = outputs;
                 action.finished_at = Some(now_timestamp());
                 action.failure_reason = None;
+                action.selected_executor = Some(selected_executor);
                 self.store.upsert_action(&action).await?;
                 self.store
                     .append_action_event(
@@ -338,10 +352,22 @@ impl Supervisor {
         action: &Action,
         manifest: &AgentManifest,
     ) -> anyhow::Result<ExecutionOutcome> {
+        if action.capability == "repo.index" {
+            let executor = RepoIndexerDeterministicExecutor::new(self.state_dir());
+            let outputs = executor.execute(action).await?;
+            return Ok(ExecutionOutcome::Completed {
+                outputs,
+                selected_executor: "deterministic.repo_index".to_string(),
+            });
+        }
+
         if action.capability == "repo.review" {
             let executor = ReviewDeterministicExecutor;
             let outputs = executor.execute(action).await?;
-            return Ok(ExecutionOutcome::Completed(outputs));
+            return Ok(ExecutionOutcome::Completed {
+                outputs,
+                selected_executor: "deterministic.repo_review".to_string(),
+            });
         }
 
         if manifest
@@ -351,7 +377,10 @@ impl Supervisor {
         {
             let adapter = McpAdapter::new("local-mcp-stub");
             let outputs = adapter.run(action).await?;
-            return Ok(ExecutionOutcome::Completed(outputs));
+            return Ok(ExecutionOutcome::Completed {
+                outputs,
+                selected_executor: format!("mcp.{}", adapter.name()),
+            });
         }
 
         let mode = action

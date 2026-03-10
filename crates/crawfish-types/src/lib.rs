@@ -1155,7 +1155,10 @@ pub struct RepoIndexArtifact {
     #[serde(default)]
     pub test_files: Vec<String>,
     #[serde(default)]
+    pub test_file_map: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     pub owners: BTreeMap<String, Vec<String>>,
+    pub ownership_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
