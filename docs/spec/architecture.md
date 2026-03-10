@@ -186,6 +186,87 @@ pub struct AuditReceipt {
 }
 ```
 
+### Governance Doctrine And Evaluation Primitives
+
+The runtime now carries a second layer above encounter policy: doctrine and evaluation. This is the difference between having rules and being able to prove they were enforced.
+
+```rust
+pub struct DoctrinePack {
+  pub id: String,
+  pub name: String,
+  pub jurisdiction: JurisdictionClass,
+  pub rules: Vec<DoctrineRule>,
+}
+
+pub enum JurisdictionClass {
+  SameOwnerLocal,
+  SameDeviceForeignOwner,
+  RemoteHarness,
+  ExternalUnknown,
+}
+
+pub enum OversightCheckpoint {
+  Admission,
+  PreDispatch,
+  PreMutation,
+  PostResult,
+}
+
+pub struct EnforcementRecord {
+  pub id: String,
+  pub action_id: String,
+  pub checkpoint: OversightCheckpoint,
+  pub outcome: CheckpointOutcome,
+  pub reason: String,
+  pub created_at: String,
+}
+
+pub struct PolicyIncident {
+  pub id: String,
+  pub action_id: String,
+  pub doctrine_pack_id: String,
+  pub jurisdiction: JurisdictionClass,
+  pub code: String,
+  pub summary: String,
+  pub severity: PolicyIncidentSeverity,
+  pub checkpoint: Option<OversightCheckpoint>,
+  pub created_at: String,
+}
+
+pub struct TraceBundle {
+  pub id: String,
+  pub action_id: String,
+  pub capability: String,
+  pub selected_executor: Option<String>,
+  pub artifact_refs: Vec<ArtifactRef>,
+  pub external_refs: Vec<ExternalRef>,
+  pub events: Vec<BTreeMap<String, serde_json::Value>>,
+  pub enforcement_records: Vec<EnforcementRecord>,
+  pub policy_incidents: Vec<PolicyIncident>,
+}
+
+pub struct EvaluationRecord {
+  pub id: String,
+  pub action_id: String,
+  pub evaluator: String,
+  pub status: EvaluationStatus,
+  pub score: Option<f64>,
+  pub summary: String,
+  pub findings: Vec<String>,
+  pub feedback_note_id: Option<String>,
+  pub created_at: String,
+}
+
+pub struct ReviewQueueItem {
+  pub id: String,
+  pub action_id: String,
+  pub source: String,
+  pub status: ReviewQueueStatus,
+  pub summary: String,
+  pub evaluation_ref: Option<String>,
+}
+```
+
 ### Supporting Shapes
 
 ```rust
@@ -567,6 +648,28 @@ Examples:
 
 Governance resolution is separate from execution contract compilation. It decides whether two parties may interact at all, under what boundaries, and through what lease.
 
+### Governance Doctrine Layer
+
+Encounter policy answers whether an interaction is allowed. Doctrine answers whether the runtime can prove that the interaction is being governed correctly.
+
+This is the architecture-level answer to the frontier problem:
+
+- a constitution or policy may say what should happen
+- the runtime still needs jurisdiction
+- the runtime still needs checkpoints
+- the runtime still needs evidence that the checkpoints ran
+- the runtime still needs escalation when enforcement is incomplete
+
+Each action should therefore compile:
+
+- `JurisdictionClass`
+- `DoctrinePack`
+- `CheckpointStatus`
+- `EnforcementRecord`
+- `PolicyIncident`
+
+If a required checkpoint cannot be satisfied, the action must not silently continue. The only legal exits are deny, store-and-forward, or human handoff.
+
 ### Governance Precedence
 
 Governance is resolved in this order:
@@ -607,6 +710,19 @@ function authorizeEncounter(
 - read access may still require redaction or approval depending on the effective `EncounterPolicy`
 - resource arbitration for shared local targets must be deterministic and owner-aware rather than first-writer-wins
 
+### Oversight Checkpoints
+
+The minimum doctrine checkpoints are:
+
+| Checkpoint | Meaning |
+| --- | --- |
+| `admission` | the action was admitted under a valid jurisdiction, contract, and encounter decision |
+| `pre_dispatch` | execution is still allowed at dispatch time under current lease, route, and policy state |
+| `pre_mutation` | any mutating work still has valid approval, lease, lock, and workspace authority |
+| `post_result` | results are accompanied by enough evidence, evaluation, or escalation before the action is treated as safely complete |
+
+This is where “constitution is not self-enforcing” becomes runtime behavior rather than philosophy alone.
+
 ## Capability Normalization Model
 
 Every execution surface must produce or map to a `CapabilityDescriptor`. Crawfish schedules against capabilities, not against raw protocol objects.
@@ -637,10 +753,10 @@ Every execution surface must produce or map to a `CapabilityDescriptor`. Crawfis
 | Plane | Primary protocol | Role |
 | --- | --- | --- |
 | tool plane | MCP | connect tools and services into the runtime |
-| harness plane | OpenClaw Gateway plus ACP-compatible adapters | invoke specialized execution harnesses for planning, research, operations, investigation, or coding |
+| harness plane | local CLI wrappers, OpenClaw Gateway, and ACP-compatible adapters | invoke specialized general-purpose harnesses for planning, research, operations, investigation, or coding |
+| agent plane | A2A | delegate work to remote agent systems |
 
 `P1e` adds a native local harness sub-surface inside the harness plane. Claude Code and Codex are wrapped as per-action ephemeral subprocesses under Rust control, with allowlisted environment propagation, workspace inheritance rules, and normalized event and failure reporting.
-| agent plane | A2A | delegate work to remote agent systems |
 
 The harness plane matters because a specialized agent harness is neither just a tool nor just a remote agent. It has richer session semantics, permission prompts, workspace expectations, and cancellation behavior. Crawfish should treat that difference explicitly. See [OpenClaw's Agent Loop](https://docs.openclaw.ai/concepts/agent-loop), [OpenClaw Gateway protocol](https://docs.openclaw.ai/gateway/protocol), [ACP at Zed](https://zed.dev/acp), and the [Agent Client Protocol specification](https://github.com/agentclientprotocol/agent-client-protocol) for the protocol layers Crawfish should sit above.
 
@@ -867,6 +983,8 @@ The scheduler is deadline-aware and policy-aware.
 
 ## Observability
 
+Observability is not only logs and traces. In Crawfish it now includes the evaluation spine that turns runtime evidence into reviewable quality state.
+
 ### Required Trace Spans
 
 - action lifecycle
@@ -896,6 +1014,37 @@ The scheduler is deadline-aware and policy-aware.
 - approval wait time
 - token and dollar burn per successful action
 
+## Evaluation Spine
+
+The evaluation spine is a LangSmith-like backend substrate for the swarm control plane. It is not a hosted product UI yet; it is the runtime layer that later UI and hosted control planes can build on.
+
+The current post-execution chain is:
+
+1. execute action
+2. assemble `TraceBundle`
+3. run deterministic evaluation hook
+4. persist `EvaluationRecord`
+5. create `ReviewQueueItem` when policy or evaluator requires human attention
+6. persist `FeedbackNote` and review resolution without rewriting action history
+7. emit alert events when doctrine or evaluation requires escalation
+
+### Initial Evaluation Hooks
+
+| Hook | Behavior |
+| --- | --- |
+| `deterministic_scorecard` | emit a durable evaluation record immediately after completion |
+| `operator_review_queue` | emit an evaluation record and open a review item for operator action |
+
+The initial capability set is:
+
+- `task.plan`
+- `repo.review`
+- `incident.enrich`
+
+`verify_loop` is part of the same spine. Verification failures are recorded as evaluations, not only as action events.
+
+LangSmith's [observability](https://docs.langchain.com/langsmith/observability) and [evaluation](https://docs.langchain.com/langsmith/evaluation) are useful reference shapes here. Anthropic's [Claude's Constitution](https://www.anthropic.com/constitution) and [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) are useful reference shapes for rule-guided behavior. Crawfish lifts both ideas into runtime governance: checkpoints, evidence, incidents, review, and escalation.
+
 ## Reference Stack For v0.1
 
 | Area | v0.1 decision |
@@ -919,6 +1068,11 @@ The P0 CLI surface is:
 - `crawfish run`
 - `crawfish status`
 - `crawfish inspect`
+- `crawfish action events`
+- `crawfish action trace`
+- `crawfish action evals`
+- `crawfish review list`
+- `crawfish review resolve`
 - `crawfish drain`
 - `crawfish resume`
 - `crawfish policy validate`
@@ -927,6 +1081,10 @@ The P0 CLI surface is:
 
 - `status` shows lifecycle state, owner, trust domain, degradation profile, and continuity mode for each agent
 - `inspect` accepts agent id or action id and surfaces compiled contract, execution strategy, selected adapter or harness, external run ids such as OpenClaw `runId`, encounter state, grant refs, lease refs, dependency health, recent transitions, degradation profile, continuity mode, and failure reasons
+- `action trace` returns the trace bundle for one action, including event lineage, artifact refs, external refs, enforcement records, and policy incidents
+- `action evals` returns deterministic evaluations and verification-linked scorecards for one action
+- `review list` returns operator review queue items opened by doctrine or evaluation
+- `review resolve` records operator resolution and feedback without rewriting the action history
 - `drain` prevents new work assignment and reports progress until agents are inactive or finalized
 - `resume` re-enables drained agents or reschedules resumable actions
 - `policy validate` reports whether a manifest, encounter policy, or action override violates hard policy before runtime execution

@@ -30,6 +30,9 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - native Rust local harness adapters for Claude Code and Codex under `crawfish-harness-local`
 - local-first `task.plan` routing across Claude Code, Codex, OpenClaw, and deterministic fallback
 - normalized local harness failure taxonomy and process event lineage for `task.plan`
+- doctrine-layer runtime types, checkpoint status, enforcement records, and policy incidents
+- evaluation spine primitives for trace bundles, evaluations, review queue items, feedback notes, and alert-oriented event lineage
+- operator commands and UDS endpoints for `action trace`, `action evals`, `review list`, and `review resolve`
 
 ### Changed
 
@@ -46,6 +49,7 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - `task_planner` now prefers local harnesses before OpenClaw, and the public example/demo reflects that local-first route order
 - `task.plan` now normalizes `context_files` as the primary contextual file input while still accepting the alpha-era `files_of_interest` alias
 - the public implementation boundary is now documented as Rust-first, not Rust-only
+- the public philosophy and architecture now explicitly distinguish constitutions from runtime enforcement, and position evaluation as a swarm control-plane substrate rather than a future UI-only concern
 
 ### Security
 

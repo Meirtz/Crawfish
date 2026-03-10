@@ -15,6 +15,8 @@ The emerging environment is different:
 
 This document defines the forward-looking philosophy that the rest of the spec set should inherit.
 
+It also adopts one hard lesson from frontier history: a constitution can define a lawful order without actually producing one. When capability expands faster than institutions, the gap between stated rules and enforceable order becomes a systems problem. Crawfish is designed for that gap.
+
 ## Principle 1: Build For Swarm-Age Governance, Not Single-Agent Demos
 
 The future category is not the single assistant with a convenient shell. It is the governed swarm: many bounded workers, many execution surfaces, many owners, many risk envelopes, and many possible encounter paths.
@@ -73,7 +75,57 @@ That lag is predictable. Systems should not wait for every policy regime, enterp
 
 Crawfish should be law-like earlier than the market feels comfortable with, because the capability curve will move first.
 
-## Principle 5: Design For Future Multi-Owner Encounters, Not Yesterday's App Sandbox
+## Principle 5: Constitutions Do Not Enforce Themselves
+
+High-level rules are necessary. They are still incomplete.
+
+Anthropic's [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) and [Claude's Constitution](https://www.anthropic.com/constitution) are important reference points for rule-guided model behavior. They show how principles can shape a model. They do not by themselves solve the runtime problem of roaming agents, mixed owners, mutable workspaces, or external harnesses.
+
+A runtime has to answer harder questions:
+
+- which jurisdiction applies here
+- which checkpoint must run before execution continues
+- what evidence proves the checkpoint happened
+- what escalation path exists when the check cannot be enforced
+
+Without checkpoints, evidence, and escalation, a constitution is advisory text. Crawfish therefore treats doctrine as executable runtime structure: doctrine packs, jurisdiction classes, oversight checkpoints, enforcement records, and policy incidents.
+
+## Principle 6: Frontier Enforcement Gap Is A Runtime Problem, Not Just A Policy Problem
+
+The most dangerous failures in swarm systems will not be only “bad rules.” They will be cases where good rules exist but the runtime cannot prove enforcement.
+
+That frontier gap appears when:
+
+- policy says a review is required but no post-result checkpoint exists
+- a capability is proposal-only in theory but a harness can still mutate by accident
+- a trust boundary is named but not compiled into admission and dispatch behavior
+- a doctrine exists but no operator signal appears when the doctrine is bypassed or underspecified
+
+Crawfish should surface this gap explicitly. It should not silently treat missing enforcement as success.
+
+That is why the runtime needs:
+
+- policy incidents
+- checkpoint status
+- doctrine summaries on inspected actions
+- review queues and alerts when enforcement is incomplete
+
+## Principle 7: Evaluation Is How A Swarm Learns Without Becoming Opaque
+
+The swarm will not become reliable by accumulating more raw traces alone.
+
+LangSmith provides a useful reference shape for this through its [observability](https://docs.langchain.com/langsmith/observability) and [evaluation](https://docs.langchain.com/langsmith/evaluation) model: traces, evaluation, review, and feedback loops. Crawfish should absorb that lesson at the runtime layer.
+
+This means:
+
+- every significant action should become a trace bundle
+- deterministic scorecards should produce durable evaluation records
+- review queues should capture “needs human eyes” cases without erasing history
+- feedback should be structured and reusable, not trapped in ad-hoc operator memory
+
+Evaluation is not just reporting. It is how the swarm improves while staying inspectable.
+
+## Principle 8: Design For Future Multi-Owner Encounters, Not Yesterday's App Sandbox
 
 The same laptop is already a frontier.
 
@@ -101,6 +153,9 @@ These principles imply concrete architectural choices:
 - continuity and governance are product surfaces
   - not hidden in internal scripts
   - not left to application glue
+- doctrine and evaluation are runtime layers
+  - not just documentation language
+  - not only future UI ideas
 - public terminology should stay future-correct
   - `swarm`, not `fleet`
   - `general-purpose harness`, not `coding-only harness`
@@ -111,6 +166,8 @@ The roadmap should bias toward:
 
 - stronger verification
 - stronger governance
+- stronger doctrine enforcement and visible frontier-gap reporting
+- richer evaluation spines and operator review flows
 - richer harness interoperability without category confusion
 - better operator visibility
 

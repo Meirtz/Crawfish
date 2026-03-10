@@ -28,6 +28,8 @@ Crawfish is built around eight philosophical commitments:
 - **Graceful degradation is better than brittle autonomy.** A production system should shrink safely under pressure before it fails hard.
 - **Continuity matters more than peak cleverness.** The product is judged by the safest useful work it can keep doing when the reasoning layer is impaired, not only by the best-case intelligence of a healthy model route.
 - **Institutions lag capability growth.** Runtime guardrails, encounter policy, and revocation semantics should arrive before the ecosystem feels fully comfortable with them.
+- **Constitutions are necessary but insufficient.** High-level rules matter, but runtime checkpoints and evidence are what turn them into governance.
+- **Evaluation is a control-plane primitive.** Traces, scorecards, review queues, and feedback loops should be runtime objects, not only analytics afterthoughts.
 
 ## Agent Philosophy
 
@@ -171,6 +173,44 @@ Crawfish should be that law layer:
 - capability leases instead of permanent implied permission
 - audit receipts and revocation instead of best-effort memory
 
+## Why Constitutions Do Not Solve The Frontier Problem
+
+[Claude's Constitution](https://www.anthropic.com/constitution) is an important example of rule-guided behavior. Anthropic's [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) work showed how principles can steer a model. That is useful. It is still upstream of the runtime problem.
+
+The frontier problem starts when many agents and harnesses begin operating across owners, workspaces, and execution surfaces:
+
+- a constitution can influence what a model prefers
+- it does not guarantee which checkpoint ran
+- it does not produce durable evidence that a checkpoint ran
+- it does not decide what to do when enforcement is missing
+
+Crawfish therefore distinguishes:
+
+- **model guidance**
+  - principles that shape behavior
+- **runtime governance**
+  - jurisdiction
+  - checkpoint enforcement
+  - evidence
+  - escalation
+
+This is the product reason for a doctrine layer. Without it, systems can carry good principles and still behave like the frontier.
+
+## Why Evaluation Spine Matters
+
+The swarm also needs a quality memory, not just an event log.
+
+[LangSmith](https://docs.langchain.com/langsmith/observability) is a useful reference because it shows the right operational shape: observability, evaluation, review, and feedback should be connected. Crawfish should absorb that lesson at the control-plane layer rather than copying a hosted UI directly.
+
+That means:
+
+- every significant action should yield a trace bundle
+- deterministic scorecards should produce durable evaluation records
+- review queues should capture work that deserves operator attention
+- feedback should flow into future iterations without erasing the historical record
+
+In other words, evaluation is how a swarm learns without becoming opaque.
+
 ## What Crawfish Is And Is Not
 
 | Question | Crawfish | Not Crawfish |
@@ -312,6 +352,8 @@ The same logic also explains where Crawfish sits relative to [OpenAI Agents SDK]
 
 The same gap appears for specialized harnesses and gateways. [ACP](https://zed.dev/acp) and the [Agent Client Protocol specification](https://github.com/agentclientprotocol/agent-client-protocol) create a standard way for clients to talk to specialized agents and other harnesses. [OpenClaw's Gateway protocol and plugins](https://docs.openclaw.ai/gateway/protocol) create another practical integration surface for interactive agent loops. Those are valuable, but they still do not answer which harness should run, under which policy, with which fallback, or how its failure should affect the rest of a swarm. Crawfish exists above that layer.
 
+The same gap appears inside a single model vendor's own philosophy. Rule-guided behavior can shape a harness, but it still leaves open the runtime questions of jurisdiction, checkpoint coverage, review queues, and operator alerts. Crawfish exists above that layer too.
+
 ## Target Users
 
 | Role | Primary pain | Job to be done | Why Crawfish fits |
@@ -341,6 +383,7 @@ P1 extends the story in two concrete ways:
 
 - an OpenClaw session or plugin can submit work into Crawfish for durable execution
 - proposal-only actions such as `task.plan` can already route out to OpenClaw or another harness and run under a verified execution strategy when deterministic proof is required
+- doctrine, checkpoint status, trace bundles, evaluations, and review queues make the enforcement gap visible instead of treating governance as a static config file
 - a same-device foreign-owner agent encounter must pass encounter policy, explicit consent, and revocable leasing before it can cross local boundaries
 
 ## Product Principles

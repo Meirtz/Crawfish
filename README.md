@@ -3,9 +3,11 @@
 # Crawfish
 
 > **Crawfish is the control plane for governed agent swarms.**
+>
+> **Harnesses are abundant. Constitutions are not enough. Evaluation is how a swarm learns without becoming opaque.**
 
 Harnesses are abundant. Cognition is volatile. Governance is lagging.  
-Crawfish exists for the layer above all of that: lifecycle, contracts, continuity, verification, and multi-owner control.
+Crawfish exists for the layer above all of that: lifecycle, contracts, continuity, verification, doctrine, and multi-owner control.
 
 Crawfish is a **lifecycle-managed runtime** for agent swarms that need to survive real operating conditions: budgets, approvals, outages, degraded dependencies, foreign-owner encounters, and model churn. It is not another assistant shell, not another graph toy, and not a harness trying to pretend it is the whole system.
 
@@ -21,6 +23,29 @@ The agent stack is changing faster than the rules around it.
 Most teams are still driving by the rear-view mirror: building with yesterday's application assumptions while swarm-scale agency is arriving with today's tools.
 
 Crawfish is built for that mismatch.
+
+## Why Constitutions Are Not Enough
+
+High-level principles matter. They are still not governance.
+
+Anthropic's [Claude's Constitution](https://www.anthropic.com/constitution) is a strong example of rule-guided model behavior. Anthropic's earlier [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) work made the same point at training time: written principles can shape behavior. But a constitution does not enforce itself once agents begin roaming across workspaces, owners, harnesses, and execution surfaces.
+
+The frontier problem is different:
+
+- a principle can say "do not overreach"
+- the runtime still needs a `pre_dispatch` checkpoint
+- the system still needs evidence that the checkpoint ran
+- the operator still needs escalation when the check cannot be enforced
+
+That is why Crawfish now treats governance as runtime structure, not policy prose:
+
+- doctrine packs
+- jurisdiction classes
+- oversight checkpoints
+- enforcement records
+- policy incidents
+
+If a rule exists but no checkpoint, no evidence, and no escalation path exists, the swarm is still operating in a wild-west mode.
 
 ## Why Swarm, Not Assistant
 
@@ -111,6 +136,32 @@ Today that surface can be:
 This is where the project starts to look beyond the current generation of agent demos.  
 Reasoning quality will keep changing. Verification and control have to outlive that churn.
 
+## Evaluation Spine
+
+Tracing alone is not enough. Evaluation alone is not enough. A control plane needs both.
+
+LangSmith provides a useful reference shape here through its [observability](https://docs.langchain.com/langsmith/observability) and [evaluation](https://docs.langchain.com/langsmith/evaluation) model: traces, datasets, evaluators, review, and alerts. Crawfish does not copy LangSmith's product. It lifts that shape into swarm runtime infrastructure.
+
+The runtime now builds an **evaluation spine**:
+
+- `trace -> evaluation -> review queue -> feedback note -> alert`
+
+That spine is attached to real action execution:
+
+- `task.plan`
+- `repo.review`
+- `incident.enrich`
+
+The point is not to build a hosted dashboard first. The point is to make swarms inspectable and corrigible before the UI arrives.
+
+In Crawfish:
+
+- `TraceBundle` captures inputs, executor lineage, artifacts, events, external refs, and verification outputs
+- `EvaluationRecord` turns deterministic checks into durable quality evidence
+- `ReviewQueueItem` escalates work that should not quietly auto-complete
+- `FeedbackNote` lets operator judgment flow back into future iterations without rewriting history
+- `AlertRule` turns governance or evaluation failures into visible operator signals
+
 ## Philosophy
 
 The forward-looking product philosophy lives in [`docs/spec/philosophy.md`](docs/spec/philosophy.md).
@@ -121,6 +172,9 @@ The short version:
 - harnesses are replaceable, control planes are strategic
 - reasoning is volatile; contracts and verification must survive model churn
 - institutions lag capability growth; runtime guardrails cannot
+- constitutions do not enforce themselves
+- frontier enforcement gaps are runtime failures, not merely policy failures
+- evaluation is how a swarm learns without becoming opaque
 - design for future multi-owner encounters, not yesterday's app sandbox
 
 The supporting spec set lives in:
@@ -156,6 +210,11 @@ cargo run -p crawfish-cli --bin crawfish -- action submit \
     "desired_outputs": ["rollout checklist"]
   }' \
   --json
+
+cargo run -p crawfish-cli --bin crawfish -- action events <action-id> --json
+cargo run -p crawfish-cli --bin crawfish -- action trace <action-id> --json
+cargo run -p crawfish-cli --bin crawfish -- action evals <action-id> --json
+cargo run -p crawfish-cli --bin crawfish -- review list --json
 ```
 
 For the full reference walkthrough, run [`examples/hero-swarm/demo.sh`](examples/hero-swarm/demo.sh).
