@@ -449,6 +449,23 @@ fn build_agent_prompt(action: &Action) -> String {
                 .join(", ")
         })
         .unwrap_or_default();
+    let desired_outputs = action
+        .inputs
+        .get("desired_outputs")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let verification_feedback = action
+        .inputs
+        .get("verification_feedback")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
 
     let mut lines = vec![
         "Produce a proposal-only task plan.".to_string(),
@@ -459,8 +476,16 @@ fn build_agent_prompt(action: &Action) -> String {
     if !files.is_empty() {
         lines.push(format!("Files of interest: {files}"));
     }
+    if !desired_outputs.is_empty() {
+        lines.push(format!("Desired outputs: {desired_outputs}"));
+    }
     if let Some(workspace_root) = action.inputs.get("workspace_root").and_then(Value::as_str) {
         lines.push(format!("Workspace root: {workspace_root}"));
+    }
+    if !verification_feedback.trim().is_empty() {
+        lines.push(format!(
+            "Verification feedback to address: {verification_feedback}"
+        ));
     }
     lines.push(
         "Return a concise plan with target files, ordered steps, risks, assumptions, and test suggestions.".to_string(),

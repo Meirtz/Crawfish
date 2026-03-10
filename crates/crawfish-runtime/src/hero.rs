@@ -394,6 +394,8 @@ impl DeterministicExecutor for TaskPlannerDeterministicExecutor {
         let objective = task_plan_objective_from_action(action)?;
         let files_of_interest = input_string_array(action, "files_of_interest");
         let constraints = input_string_array(action, "constraints");
+        let desired_outputs = input_string_array(action, "desired_outputs");
+        let verification_feedback = optional_input_string(action, "verification_feedback");
         let target_files = select_task_plan_target_files(
             &repo_files,
             &objective,
@@ -401,12 +403,23 @@ impl DeterministicExecutor for TaskPlannerDeterministicExecutor {
             &constraints,
         );
         let risks = task_plan_risks(&target_files, &constraints);
-        let assumptions = task_plan_assumptions(action, &target_files);
-        let test_suggestions = task_plan_test_suggestions(&target_files);
+        let assumptions = task_plan_assumptions(
+            action,
+            &target_files,
+            &desired_outputs,
+            verification_feedback.as_deref(),
+        );
+        let test_suggestions = task_plan_test_suggestions(&target_files, &desired_outputs);
 
         let artifact = TaskPlanArtifact {
             target_files: target_files.clone(),
-            ordered_steps: task_plan_steps(&objective, &target_files, &constraints),
+            ordered_steps: task_plan_steps(
+                &objective,
+                &target_files,
+                &constraints,
+                &desired_outputs,
+                verification_feedback.as_deref(),
+            ),
             risks,
             assumptions,
             test_suggestions,
@@ -415,7 +428,13 @@ impl DeterministicExecutor for TaskPlannerDeterministicExecutor {
 
         let json_ref =
             write_json_artifact(&self.state_dir, &action.id, "task_plan.json", &artifact).await?;
-        let markdown = build_task_plan_markdown(&artifact, action, &objective);
+        let markdown = build_task_plan_markdown(
+            &artifact,
+            action,
+            &objective,
+            &desired_outputs,
+            verification_feedback.as_deref(),
+        );
         let markdown_ref =
             write_text_artifact(&self.state_dir, &action.id, "task_plan.md", &markdown).await?;
 
@@ -437,6 +456,10 @@ impl DeterministicExecutor for TaskPlannerDeterministicExecutor {
                 (
                     "workspace_bound".to_string(),
                     serde_json::json!(workspace_root.is_some()),
+                ),
+                (
+                    "desired_output_count".to_string(),
+                    serde_json::json!(desired_outputs.len()),
                 ),
             ]),
         })
@@ -952,6 +975,8 @@ fn task_plan_steps(
     objective: &str,
     target_files: &[String],
     constraints: &[String],
+    desired_outputs: &[String],
+    verification_feedback: Option<&str>,
 ) -> Vec<TaskPlanStep> {
     let target_files_summary = if target_files.is_empty() {
         "the current workspace".to_string()
@@ -964,7 +989,7 @@ fn task_plan_steps(
         format!("Honor these constraints: {}.", constraints.join("; "))
     };
 
-    vec![
+    let mut steps = vec![
         TaskPlanStep {
             title: "Confirm scope".to_string(),
             detail: format!(
@@ -985,7 +1010,26 @@ fn task_plan_steps(
             title: "Plan validation".to_string(),
             detail: "List deterministic checks, tests, and edge cases that should confirm the patch is safe before any mutation path is used.".to_string(),
         },
-    ]
+    ];
+
+    if !desired_outputs.is_empty() {
+        steps.push(TaskPlanStep {
+            title: "Shape the deliverable".to_string(),
+            detail: format!(
+                "Ensure the proposal explicitly covers these desired outputs: {}.",
+                desired_outputs.join(", ")
+            ),
+        });
+    }
+
+    if let Some(feedback) = verification_feedback.filter(|feedback| !feedback.trim().is_empty()) {
+        steps.push(TaskPlanStep {
+            title: "Address verification feedback".to_string(),
+            detail: feedback.to_string(),
+        });
+    }
+
+    steps
 }
 
 fn task_plan_risks(target_files: &[String], constraints: &[String]) -> Vec<String> {
@@ -1008,7 +1052,12 @@ fn task_plan_risks(target_files: &[String], constraints: &[String]) -> Vec<Strin
     risks
 }
 
-fn task_plan_assumptions(action: &Action, target_files: &[String]) -> Vec<String> {
+fn task_plan_assumptions(
+    action: &Action,
+    target_files: &[String],
+    desired_outputs: &[String],
+    verification_feedback: Option<&str>,
+) -> Vec<String> {
     let mut assumptions = Vec::new();
     if target_files.is_empty() {
         assumptions.push(
@@ -1024,14 +1073,31 @@ fn task_plan_assumptions(action: &Action, target_files: &[String]) -> Vec<String
     assumptions.push(
         "This capability produces a proposal only and does not mutate the workspace.".to_string(),
     );
+    if !desired_outputs.is_empty() {
+        assumptions.push(format!(
+            "The final plan should explicitly cover these outputs: {}.",
+            desired_outputs.join(", ")
+        ));
+    }
+    if let Some(feedback) = verification_feedback.filter(|feedback| !feedback.trim().is_empty()) {
+        assumptions.push(format!(
+            "The latest verification feedback must be addressed before follow-on execution: {feedback}"
+        ));
+    }
     assumptions
 }
 
-fn task_plan_test_suggestions(target_files: &[String]) -> Vec<String> {
+fn task_plan_test_suggestions(target_files: &[String], desired_outputs: &[String]) -> Vec<String> {
     let mut suggestions = vec![
         "Run the narrowest existing test target that covers the changed modules.".to_string(),
         "Add or update deterministic tests for the intended behavior delta.".to_string(),
     ];
+    if !desired_outputs.is_empty() {
+        suggestions.push(format!(
+            "Confirm the resulting proposal includes {}.",
+            desired_outputs.join(", ")
+        ));
+    }
     if target_files.iter().any(|file| file.ends_with(".rs")) {
         suggestions.push(
             "Run `cargo test --workspace` and targeted Rust checks for the touched crate."
@@ -1060,6 +1126,8 @@ fn build_task_plan_markdown(
     artifact: &TaskPlanArtifact,
     action: &Action,
     objective: &str,
+    desired_outputs: &[String],
+    verification_feedback: Option<&str>,
 ) -> String {
     let mut markdown = vec![
         "# Task Plan".to_string(),
@@ -1067,8 +1135,21 @@ fn build_task_plan_markdown(
         format!("Request: {}", action.goal.summary),
         format!("Objective: {objective}"),
         String::new(),
-        "## Target Files".to_string(),
     ];
+
+    if !desired_outputs.is_empty() {
+        markdown.push("## Desired Outputs".to_string());
+        markdown.extend(desired_outputs.iter().map(|output| format!("- {output}")));
+        markdown.push(String::new());
+    }
+
+    if let Some(feedback) = verification_feedback.filter(|feedback| !feedback.trim().is_empty()) {
+        markdown.push("## Verification Feedback".to_string());
+        markdown.push(feedback.to_string());
+        markdown.push(String::new());
+    }
+
+    markdown.push("## Target Files".to_string());
 
     if artifact.target_files.is_empty() {
         markdown.push("- No concrete file set was identified.".to_string());

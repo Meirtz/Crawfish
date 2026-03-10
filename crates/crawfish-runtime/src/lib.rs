@@ -25,8 +25,10 @@ use crawfish_types::{
     Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, ApprovalPolicy,
     AuditOutcome, AuditReceipt, CallerOwnerMapping, CapabilityDescriptor, CapabilityLease,
     CapabilityVisibility, ConsentGrant, ContinuityModeName, CounterpartyRef, DegradedProfileName,
-    DeterministicCheckpoint, EncounterRecord, EncounterState, ExternalRef, HealthStatus,
-    LifecycleRecord, Mutability, OwnerKind, OwnerRef, TrustDomain, WorkspaceEdit, WorkspaceEditOp,
+    DeterministicCheckpoint, EncounterRecord, EncounterState, ExecutionStrategy,
+    ExecutionStrategyMode, ExternalRef, FeedbackPolicy, HealthStatus, LifecycleRecord, Mutability,
+    OwnerKind, OwnerRef, StrategyCheckpointState, TrustDomain, VerificationStatus,
+    VerificationSummary, VerifyLoopFailureMode, WorkspaceEdit, WorkspaceEditOp,
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
@@ -168,6 +170,21 @@ enum ExecutionOutcome {
         external_refs: Vec<ExternalRef>,
         surface_events: Vec<crawfish_core::SurfaceActionEvent>,
     },
+    Failed {
+        reason: String,
+        failure_code: String,
+        outputs: ActionOutputs,
+        checkpoint: Option<DeterministicCheckpoint>,
+        external_refs: Vec<ExternalRef>,
+        surface_events: Vec<crawfish_core::SurfaceActionEvent>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct TaskPlanVerificationResult {
+    passed: bool,
+    summary: VerificationSummary,
+    feedback: Option<String>,
 }
 
 impl Supervisor {
@@ -692,6 +709,588 @@ impl Supervisor {
         })
     }
 
+    async fn execute_task_plan(
+        &self,
+        action: &mut Action,
+        manifest: &AgentManifest,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        match action
+            .execution_strategy
+            .as_ref()
+            .map(|strategy| strategy.mode.clone())
+            .unwrap_or(ExecutionStrategyMode::SinglePass)
+        {
+            ExecutionStrategyMode::VerifyLoop => {
+                let strategy = action
+                    .execution_strategy
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("verify_loop requires an execution strategy"))?;
+                self.execute_task_plan_verify_loop(action, manifest, &strategy)
+                    .await
+            }
+            ExecutionStrategyMode::SinglePass => {
+                self.execute_task_plan_single_pass(action, manifest).await
+            }
+        }
+    }
+
+    async fn execute_task_plan_verify_loop(
+        &self,
+        action: &mut Action,
+        manifest: &AgentManifest,
+        strategy: &ExecutionStrategy,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        if strategy
+            .verification_spec
+            .as_ref()
+            .map(|spec| !spec.checks.is_empty())
+            .unwrap_or(false)
+        {
+            return Ok(ExecutionOutcome::Failed {
+                reason: "task.plan verify_loop only supports built-in verification checks in alpha"
+                    .to_string(),
+                failure_code: failure_code_verification_spec_invalid().to_string(),
+                outputs: ActionOutputs::default(),
+                checkpoint: None,
+                external_refs: Vec::new(),
+                surface_events: Vec::new(),
+            });
+        }
+
+        let max_iterations = strategy
+            .stop_budget
+            .as_ref()
+            .map(|budget| budget.max_iterations)
+            .unwrap_or(3)
+            .max(1);
+        let on_failure = strategy
+            .verification_spec
+            .as_ref()
+            .map(|spec| spec.on_failure.clone())
+            .unwrap_or(VerifyLoopFailureMode::RetryWithFeedback);
+
+        let mut start_iteration = 1;
+        let mut carried_feedback = None;
+        let mut previous_artifact_refs = Vec::new();
+        let mut aggregated_external_refs = action.external_refs.clone();
+
+        if let Some(checkpoint) = self.load_deterministic_checkpoint(action).await? {
+            if let Some(strategy_state) = checkpoint.strategy_state.clone() {
+                aggregated_external_refs =
+                    merge_external_refs(aggregated_external_refs, action.external_refs.clone());
+                match (
+                    checkpoint.stage.as_str(),
+                    strategy_state
+                        .verification_summary
+                        .as_ref()
+                        .map(|summary| summary.status.clone()),
+                ) {
+                    ("completed", Some(VerificationStatus::Passed))
+                        if artifact_refs_exist(&checkpoint.artifact_refs) =>
+                    {
+                        action.selected_executor = Some(checkpoint.executor_kind.clone());
+                        action.recovery_stage = Some(checkpoint.stage.clone());
+                        action.external_refs = aggregated_external_refs.clone();
+                        return Ok(ExecutionOutcome::Completed {
+                            outputs: recovered_outputs_from_checkpoint(&checkpoint),
+                            selected_executor: checkpoint.executor_kind.clone(),
+                            checkpoint: Some(checkpoint),
+                            external_refs: aggregated_external_refs,
+                            surface_events: Vec::new(),
+                        });
+                    }
+                    ("completed", Some(VerificationStatus::Failed)) => {
+                        start_iteration = strategy_state.iteration.saturating_add(1);
+                        carried_feedback = strategy_state.verification_feedback.clone();
+                        previous_artifact_refs = merge_artifact_refs(
+                            strategy_state.previous_artifact_refs.clone(),
+                            checkpoint.artifact_refs.clone(),
+                        );
+                    }
+                    ("verification_failed", Some(VerificationStatus::Failed)) => {
+                        start_iteration = strategy_state.iteration.saturating_add(1);
+                        carried_feedback = strategy_state.verification_feedback.clone();
+                        previous_artifact_refs = merge_artifact_refs(
+                            strategy_state.previous_artifact_refs.clone(),
+                            checkpoint.artifact_refs.clone(),
+                        );
+                    }
+                    ("planning", _) | ("completed", None) => {
+                        start_iteration = strategy_state.iteration.max(1);
+                        carried_feedback = strategy_state.verification_feedback.clone();
+                        previous_artifact_refs = merge_artifact_refs(
+                            strategy_state.previous_artifact_refs.clone(),
+                            checkpoint.artifact_refs.clone(),
+                        );
+                    }
+                    (
+                        "verification_budget_exhausted",
+                        Some(VerificationStatus::BudgetExhausted),
+                    ) => {
+                        start_iteration = strategy_state.iteration.saturating_add(1);
+                        carried_feedback = strategy_state.verification_feedback.clone();
+                        previous_artifact_refs = merge_artifact_refs(
+                            strategy_state.previous_artifact_refs.clone(),
+                            checkpoint.artifact_refs.clone(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if start_iteration > max_iterations {
+            let summary = VerificationSummary {
+                status: VerificationStatus::BudgetExhausted,
+                iterations_completed: max_iterations,
+                last_feedback: carried_feedback.clone(),
+                last_failure_code: Some(failure_code_verification_budget_exhausted().to_string()),
+            };
+            let mut outputs = ActionOutputs {
+                summary: Some(
+                    "Verification budget exhausted before a fresh iteration could start"
+                        .to_string(),
+                ),
+                artifacts: previous_artifact_refs.clone(),
+                ..ActionOutputs::default()
+            };
+            outputs.metadata.insert(
+                "strategy_mode".to_string(),
+                serde_json::json!("verify_loop"),
+            );
+            outputs.metadata.insert(
+                "verification_summary".to_string(),
+                serde_json::to_value(&summary)?,
+            );
+            let mut checkpoint = build_checkpoint(
+                action,
+                action
+                    .selected_executor
+                    .as_deref()
+                    .unwrap_or("verify_loop.task_plan"),
+                "verification_budget_exhausted",
+                previous_artifact_refs,
+            )?;
+            checkpoint.strategy_state = Some(StrategyCheckpointState {
+                mode: ExecutionStrategyMode::VerifyLoop,
+                iteration: max_iterations,
+                verification_feedback: carried_feedback.clone(),
+                previous_artifact_refs: Vec::new(),
+                verification_summary: Some(summary),
+            });
+            return Ok(ExecutionOutcome::Failed {
+                reason: carried_feedback
+                    .unwrap_or_else(|| "task.plan exhausted its verification budget".to_string()),
+                failure_code: failure_code_verification_budget_exhausted().to_string(),
+                outputs,
+                checkpoint: Some(checkpoint),
+                external_refs: aggregated_external_refs,
+                surface_events: Vec::new(),
+            });
+        }
+
+        for iteration in start_iteration..=max_iterations {
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "verify_loop_iteration_started",
+                    serde_json::json!({
+                        "iteration": iteration,
+                        "max_iterations": max_iterations,
+                        "strategy_mode": "verify_loop",
+                        "feedback_present": carried_feedback.is_some(),
+                    }),
+                )
+                .await?;
+
+            let mut iteration_action = action.clone();
+            if let Some(feedback) = &carried_feedback {
+                iteration_action.inputs.insert(
+                    "verification_feedback".to_string(),
+                    serde_json::json!(feedback),
+                );
+            } else {
+                iteration_action.inputs.remove("verification_feedback");
+            }
+
+            let outcome = self
+                .execute_task_plan_single_pass(&mut iteration_action, manifest)
+                .await?;
+
+            match outcome {
+                ExecutionOutcome::Completed {
+                    mut outputs,
+                    selected_executor,
+                    checkpoint,
+                    external_refs,
+                    surface_events,
+                } => {
+                    aggregated_external_refs =
+                        merge_external_refs(aggregated_external_refs, external_refs);
+                    for event in surface_events {
+                        self.store
+                            .append_action_event(&action.id, &event.event_type, event.payload)
+                            .await?;
+                    }
+
+                    let verification = verify_task_plan_outputs(
+                        &iteration_action,
+                        &outputs,
+                        iteration,
+                        &strategy.feedback_policy,
+                    )
+                    .await?;
+                    let mut checkpoint = checkpoint.unwrap_or(build_checkpoint(
+                        &iteration_action,
+                        &selected_executor,
+                        "completed",
+                        outputs.artifacts.clone(),
+                    )?);
+
+                    checkpoint.stage = if verification.passed {
+                        "completed".to_string()
+                    } else {
+                        "verification_failed".to_string()
+                    };
+                    checkpoint.strategy_state = Some(StrategyCheckpointState {
+                        mode: ExecutionStrategyMode::VerifyLoop,
+                        iteration,
+                        verification_feedback: verification.feedback.clone(),
+                        previous_artifact_refs: previous_artifact_refs.clone(),
+                        verification_summary: Some(verification.summary.clone()),
+                    });
+                    self.write_checkpoint_for_action(action, &checkpoint)
+                        .await?;
+
+                    self.store
+                        .append_action_event(
+                            &action.id,
+                            "verify_loop_iteration_completed",
+                            serde_json::json!({
+                                "iteration": iteration,
+                                "selected_executor": selected_executor,
+                                "status": if verification.passed { "passed" } else { "failed" },
+                            }),
+                        )
+                        .await?;
+
+                    if verification.passed {
+                        self.store
+                            .append_action_event(
+                                &action.id,
+                                "verification_passed",
+                                serde_json::json!({
+                                    "iteration": iteration,
+                                    "summary": verification.summary.clone(),
+                                }),
+                            )
+                            .await?;
+                        outputs.metadata.insert(
+                            "strategy_mode".to_string(),
+                            serde_json::json!("verify_loop"),
+                        );
+                        outputs.metadata.insert(
+                            "strategy_iteration".to_string(),
+                            serde_json::json!(iteration),
+                        );
+                        outputs.metadata.insert(
+                            "verification_summary".to_string(),
+                            serde_json::to_value(
+                                checkpoint
+                                    .strategy_state
+                                    .as_ref()
+                                    .and_then(|state| state.verification_summary.clone())
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("missing verification summary")
+                                    })?,
+                            )?,
+                        );
+                        return Ok(ExecutionOutcome::Completed {
+                            outputs,
+                            selected_executor,
+                            checkpoint: Some(checkpoint),
+                            external_refs: aggregated_external_refs,
+                            surface_events: Vec::new(),
+                        });
+                    }
+
+                    self.store
+                        .append_action_event(
+                            &action.id,
+                            "verification_failed",
+                            serde_json::json!({
+                                "iteration": iteration,
+                                "summary": verification.summary.clone(),
+                                "feedback": verification.feedback.clone(),
+                            }),
+                        )
+                        .await?;
+
+                    previous_artifact_refs =
+                        merge_artifact_refs(previous_artifact_refs, outputs.artifacts.clone());
+                    carried_feedback = verification.feedback.clone();
+
+                    match on_failure {
+                        VerifyLoopFailureMode::RetryWithFeedback if iteration < max_iterations => {
+                            continue;
+                        }
+                        VerifyLoopFailureMode::HumanHandoff => {
+                            return Ok(ExecutionOutcome::Blocked {
+                                reason: carried_feedback.clone().unwrap_or_else(|| {
+                                    "task.plan requires human handoff after verification failed"
+                                        .to_string()
+                                }),
+                                failure_code: failure_code_verification_failed().to_string(),
+                                continuity_mode: Some(ContinuityModeName::HumanHandoff),
+                                outputs,
+                                external_refs: aggregated_external_refs,
+                                surface_events: Vec::new(),
+                            });
+                        }
+                        VerifyLoopFailureMode::Fail => {
+                            outputs.metadata.insert(
+                                "strategy_mode".to_string(),
+                                serde_json::json!("verify_loop"),
+                            );
+                            outputs.metadata.insert(
+                                "strategy_iteration".to_string(),
+                                serde_json::json!(iteration),
+                            );
+                            outputs.metadata.insert(
+                                "verification_summary".to_string(),
+                                serde_json::to_value(
+                                    checkpoint
+                                        .strategy_state
+                                        .as_ref()
+                                        .and_then(|state| state.verification_summary.clone())
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!("missing verification summary")
+                                        })?,
+                                )?,
+                            );
+                            return Ok(ExecutionOutcome::Failed {
+                                reason: carried_feedback.clone().unwrap_or_else(|| {
+                                    "task.plan failed deterministic verification".to_string()
+                                }),
+                                failure_code: failure_code_verification_failed().to_string(),
+                                outputs,
+                                checkpoint: Some(checkpoint),
+                                external_refs: aggregated_external_refs,
+                                surface_events: Vec::new(),
+                            });
+                        }
+                        VerifyLoopFailureMode::RetryWithFeedback => {}
+                    }
+                }
+                ExecutionOutcome::Blocked {
+                    reason,
+                    failure_code,
+                    continuity_mode,
+                    outputs,
+                    external_refs,
+                    surface_events,
+                } => {
+                    return Ok(ExecutionOutcome::Blocked {
+                        reason,
+                        failure_code,
+                        continuity_mode,
+                        outputs,
+                        external_refs: merge_external_refs(aggregated_external_refs, external_refs),
+                        surface_events,
+                    });
+                }
+                ExecutionOutcome::Failed {
+                    reason,
+                    failure_code,
+                    outputs,
+                    checkpoint,
+                    external_refs,
+                    surface_events,
+                } => {
+                    return Ok(ExecutionOutcome::Failed {
+                        reason,
+                        failure_code,
+                        outputs,
+                        checkpoint,
+                        external_refs: merge_external_refs(aggregated_external_refs, external_refs),
+                        surface_events,
+                    });
+                }
+            }
+        }
+
+        let summary = VerificationSummary {
+            status: VerificationStatus::BudgetExhausted,
+            iterations_completed: max_iterations,
+            last_feedback: carried_feedback.clone(),
+            last_failure_code: Some(failure_code_verification_budget_exhausted().to_string()),
+        };
+        self.store
+            .append_action_event(
+                &action.id,
+                "verification_budget_exhausted",
+                serde_json::json!({
+                    "iterations_completed": max_iterations,
+                    "summary": summary,
+                }),
+            )
+            .await?;
+        let mut outputs = ActionOutputs {
+            summary: Some("task.plan exhausted its verification budget".to_string()),
+            artifacts: previous_artifact_refs.clone(),
+            ..ActionOutputs::default()
+        };
+        outputs.metadata.insert(
+            "strategy_mode".to_string(),
+            serde_json::json!("verify_loop"),
+        );
+        outputs.metadata.insert(
+            "strategy_iteration".to_string(),
+            serde_json::json!(max_iterations),
+        );
+        outputs.metadata.insert(
+            "verification_summary".to_string(),
+            serde_json::to_value(&summary)?,
+        );
+        let mut checkpoint = build_checkpoint(
+            action,
+            action
+                .selected_executor
+                .as_deref()
+                .unwrap_or("verify_loop.task_plan"),
+            "verification_budget_exhausted",
+            previous_artifact_refs,
+        )?;
+        checkpoint.strategy_state = Some(StrategyCheckpointState {
+            mode: ExecutionStrategyMode::VerifyLoop,
+            iteration: max_iterations,
+            verification_feedback: carried_feedback.clone(),
+            previous_artifact_refs: Vec::new(),
+            verification_summary: Some(summary),
+        });
+        Ok(ExecutionOutcome::Failed {
+            reason: carried_feedback
+                .unwrap_or_else(|| "task.plan exhausted its verification budget".to_string()),
+            failure_code: failure_code_verification_budget_exhausted().to_string(),
+            outputs,
+            checkpoint: Some(checkpoint),
+            external_refs: aggregated_external_refs,
+            surface_events: Vec::new(),
+        })
+    }
+
+    async fn execute_task_plan_single_pass(
+        &self,
+        action: &mut Action,
+        manifest: &AgentManifest,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        let deterministic_fallback = action
+            .contract
+            .execution
+            .fallback_chain
+            .iter()
+            .any(|route| route == "deterministic");
+        let prefers_openclaw = action
+            .contract
+            .execution
+            .preferred_harnesses
+            .iter()
+            .any(|route| route == "openclaw");
+
+        if prefers_openclaw {
+            match self.resolve_openclaw_adapter(manifest)? {
+                Some((adapter, base_refs)) => match adapter.run(action).await {
+                    Ok(result) => {
+                        return Ok(ExecutionOutcome::Completed {
+                            outputs: result.outputs,
+                            selected_executor: format!("openclaw.{}", adapter.name()),
+                            checkpoint: None,
+                            external_refs: merge_external_refs(base_refs, result.external_refs),
+                            surface_events: result.events,
+                        });
+                    }
+                    Err(error) => {
+                        self.store
+                            .append_action_event(
+                                &action.id,
+                                "route_degraded",
+                                serde_json::json!({
+                                    "selected_surface": "openclaw",
+                                    "reason": error.to_string(),
+                                    "code": failure_code_route_unavailable(),
+                                    "fallback": if deterministic_fallback { "deterministic" } else { "continuity" },
+                                }),
+                            )
+                            .await?;
+                        if deterministic_fallback {
+                            let executor = TaskPlannerDeterministicExecutor::new(self.state_dir());
+                            let mut outcome = self
+                                .run_deterministic_executor(
+                                    action,
+                                    "deterministic.task_plan",
+                                    "planning",
+                                    base_refs,
+                                    &executor,
+                                )
+                                .await?;
+                            if let ExecutionOutcome::Completed { surface_events, .. } = &mut outcome
+                            {
+                                surface_events.push(crawfish_core::SurfaceActionEvent {
+                                    event_type: "continuity_selected".to_string(),
+                                    payload: serde_json::json!({
+                                        "selected_surface": "deterministic",
+                                        "reason": error.to_string(),
+                                        "continuity_mode": "deterministic_only",
+                                    }),
+                                });
+                            }
+                            return Ok(outcome);
+                        }
+                        return Ok(self.continuity_blocked_outcome(
+                            action,
+                            error.to_string(),
+                            false,
+                            base_refs,
+                        ));
+                    }
+                },
+                None => {
+                    if deterministic_fallback {
+                        self.store
+                            .append_action_event(
+                                &action.id,
+                                "route_degraded",
+                                serde_json::json!({
+                                    "selected_surface": "openclaw",
+                                    "reason": "no OpenClaw binding is configured for task.plan",
+                                    "code": failure_code_route_unavailable(),
+                                    "fallback": "deterministic",
+                                }),
+                            )
+                            .await?;
+                    } else {
+                        return Ok(self.continuity_blocked_outcome(
+                            action,
+                            "no OpenClaw binding is configured for task.plan",
+                            false,
+                            Vec::new(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let executor = TaskPlannerDeterministicExecutor::new(self.state_dir());
+        self.run_deterministic_executor(
+            action,
+            "deterministic.task_plan",
+            "planning",
+            Vec::new(),
+            &executor,
+        )
+        .await
+    }
+
     fn resolve_mcp_adapter(
         &self,
         manifest: &AgentManifest,
@@ -1123,6 +1722,41 @@ impl Supervisor {
                     )
                     .await?;
             }
+            Ok(ExecutionOutcome::Failed {
+                reason,
+                failure_code,
+                outputs,
+                checkpoint,
+                external_refs,
+                surface_events,
+            }) => {
+                set_action_failed(&mut action, &failure_code, reason.clone());
+                action.outputs = outputs;
+                action.external_refs = external_refs;
+                if let Some(checkpoint) = checkpoint {
+                    self.write_checkpoint_for_action(&mut action, &checkpoint)
+                        .await?;
+                }
+                self.store.upsert_action(&action).await?;
+                for event in surface_events {
+                    self.store
+                        .append_action_event(&action.id, &event.event_type, event.payload)
+                        .await?;
+                }
+                self.store
+                    .append_action_event(
+                        &action.id,
+                        "failed",
+                        serde_json::json!({
+                            "reason": reason,
+                            "code": action.failure_code,
+                            "checkpoint_ref": action.checkpoint_ref,
+                            "recovery_stage": action.recovery_stage,
+                            "finished_at": action.finished_at
+                        }),
+                    )
+                    .await?;
+            }
             Err(error) => {
                 let reason = error.to_string();
                 set_action_failed(&mut action, failure_code_executor_error(), reason.clone());
@@ -1385,114 +2019,7 @@ impl Supervisor {
         }
 
         if is_task_plan_capability(&action.capability) {
-            let deterministic_fallback = action
-                .contract
-                .execution
-                .fallback_chain
-                .iter()
-                .any(|route| route == "deterministic");
-            let prefers_openclaw = action
-                .contract
-                .execution
-                .preferred_harnesses
-                .iter()
-                .any(|route| route == "openclaw");
-
-            if prefers_openclaw {
-                match self.resolve_openclaw_adapter(manifest)? {
-                    Some((adapter, base_refs)) => match adapter.run(action).await {
-                        Ok(result) => {
-                            return Ok(ExecutionOutcome::Completed {
-                                outputs: result.outputs,
-                                selected_executor: format!("openclaw.{}", adapter.name()),
-                                checkpoint: None,
-                                external_refs: merge_external_refs(base_refs, result.external_refs),
-                                surface_events: result.events,
-                            });
-                        }
-                        Err(error) => {
-                            self.store
-                                .append_action_event(
-                                    &action.id,
-                                    "route_degraded",
-                                    serde_json::json!({
-                                        "selected_surface": "openclaw",
-                                        "reason": error.to_string(),
-                                        "code": failure_code_route_unavailable(),
-                                        "fallback": if deterministic_fallback { "deterministic" } else { "continuity" },
-                                    }),
-                                )
-                                .await?;
-                            if deterministic_fallback {
-                                let executor =
-                                    TaskPlannerDeterministicExecutor::new(self.state_dir());
-                                let mut outcome = self
-                                    .run_deterministic_executor(
-                                        action,
-                                        "deterministic.task_plan",
-                                        "planning",
-                                        base_refs,
-                                        &executor,
-                                    )
-                                    .await?;
-                                if let ExecutionOutcome::Completed { surface_events, .. } =
-                                    &mut outcome
-                                {
-                                    surface_events.push(crawfish_core::SurfaceActionEvent {
-                                        event_type: "continuity_selected".to_string(),
-                                        payload: serde_json::json!({
-                                            "selected_surface": "deterministic",
-                                            "reason": error.to_string(),
-                                            "continuity_mode": "deterministic_only",
-                                        }),
-                                    });
-                                }
-                                return Ok(outcome);
-                            }
-                            return Ok(self.continuity_blocked_outcome(
-                                action,
-                                error.to_string(),
-                                false,
-                                base_refs,
-                            ));
-                        }
-                    },
-                    None => {
-                        if deterministic_fallback {
-                            self.store
-                                .append_action_event(
-                                    &action.id,
-                                    "route_degraded",
-                                    serde_json::json!({
-                                        "selected_surface": "openclaw",
-                                        "reason": "no OpenClaw binding is configured for task.plan",
-                                        "code": failure_code_route_unavailable(),
-                                        "fallback": "deterministic",
-                                    }),
-                                )
-                                .await?;
-                        } else {
-                            return Ok(self.continuity_blocked_outcome(
-                                action,
-                                "no OpenClaw binding is configured for task.plan",
-                                false,
-                                Vec::new(),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            let executor = TaskPlannerDeterministicExecutor::new(self.state_dir());
-            return self
-                .run_deterministic_executor(
-                    action,
-                    "deterministic.task_plan",
-                    "planning",
-                    Vec::new(),
-                    &executor,
-                )
-                .await;
+            return self.execute_task_plan(action, manifest).await;
         }
 
         if let Some((adapter, external_refs)) = self.resolve_mcp_adapter(manifest, action)? {
@@ -2292,6 +2819,7 @@ fn build_checkpoint(
             .to_string(),
         input_digest: input_digest(&action.inputs)?,
         artifact_refs,
+        strategy_state: None,
         last_updated_at: now_timestamp(),
     })
 }
@@ -2321,26 +2849,39 @@ fn artifact_refs_exist(artifact_refs: &[crawfish_types::ArtifactRef]) -> bool {
 }
 
 fn recovered_outputs_from_checkpoint(checkpoint: &DeterministicCheckpoint) -> ActionOutputs {
+    let mut metadata = std::collections::BTreeMap::from([
+        (
+            "recovered_from_checkpoint".to_string(),
+            serde_json::json!(true),
+        ),
+        (
+            "executor_kind".to_string(),
+            serde_json::json!(checkpoint.executor_kind),
+        ),
+        (
+            "input_digest".to_string(),
+            serde_json::json!(checkpoint.input_digest),
+        ),
+    ]);
+    if let Some(strategy_state) = &checkpoint.strategy_state {
+        metadata.insert(
+            "strategy_iteration".to_string(),
+            serde_json::json!(strategy_state.iteration),
+        );
+        if let Some(summary) = &strategy_state.verification_summary {
+            metadata.insert(
+                "verification_summary".to_string(),
+                serde_json::to_value(summary).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
     ActionOutputs {
         summary: Some(format!(
             "Recovered outputs from {} checkpoint at stage {}",
             checkpoint.executor_kind, checkpoint.stage
         )),
         artifacts: checkpoint.artifact_refs.clone(),
-        metadata: std::collections::BTreeMap::from([
-            (
-                "recovered_from_checkpoint".to_string(),
-                serde_json::json!(true),
-            ),
-            (
-                "executor_kind".to_string(),
-                serde_json::json!(checkpoint.executor_kind),
-            ),
-            (
-                "input_digest".to_string(),
-                serde_json::json!(checkpoint.input_digest),
-            ),
-        ]),
+        metadata,
     }
 }
 
@@ -2462,6 +3003,18 @@ fn failure_code_executor_error() -> &'static str {
 
 fn failure_code_requeued_after_restart() -> &'static str {
     "requeued_after_restart"
+}
+
+fn failure_code_verification_failed() -> &'static str {
+    "verification_failed"
+}
+
+fn failure_code_verification_budget_exhausted() -> &'static str {
+    "verification_budget_exhausted"
+}
+
+fn failure_code_verification_spec_invalid() -> &'static str {
+    "verification_spec_invalid"
 }
 
 fn lease_failure_code(reason: &str) -> &'static str {
@@ -2610,6 +3163,7 @@ impl SupervisorControl for Supervisor {
         let Some(action) = self.store.get_action(action_id).await? else {
             return Ok(None);
         };
+        let checkpoint = self.load_deterministic_checkpoint(&action).await?;
         let encounter = if let Some(encounter_ref) = &action.encounter_ref {
             self.store.get_encounter(encounter_ref).await?
         } else {
@@ -2626,11 +3180,34 @@ impl SupervisorControl for Supervisor {
         } else {
             None
         };
+        let strategy_mode = action
+            .execution_strategy
+            .as_ref()
+            .map(|strategy| strategy.mode.clone());
+        let strategy_iteration = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.strategy_state.as_ref())
+            .map(|state| state.iteration);
+        let verification_summary = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.strategy_state.as_ref())
+            .and_then(|state| state.verification_summary.clone())
+            .or_else(|| {
+                action
+                    .outputs
+                    .metadata
+                    .get("verification_summary")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+            });
         Ok(Some(ActionDetail {
             artifact_refs: action.outputs.artifacts.clone(),
             selected_executor: action.selected_executor.clone(),
             recovery_stage: action.recovery_stage.clone(),
             external_refs: action.external_refs.clone(),
+            strategy_mode,
+            strategy_iteration,
+            verification_summary,
             grant_details,
             lease_detail,
             blocked_reason: if matches!(action.phase, ActionPhase::Blocked) {
@@ -3070,6 +3647,180 @@ fn merge_external_refs(mut lhs: Vec<ExternalRef>, rhs: Vec<ExternalRef>) -> Vec<
         }
     }
     lhs
+}
+
+fn merge_artifact_refs(
+    mut lhs: Vec<crawfish_types::ArtifactRef>,
+    rhs: Vec<crawfish_types::ArtifactRef>,
+) -> Vec<crawfish_types::ArtifactRef> {
+    for artifact in rhs {
+        let exists = lhs
+            .iter()
+            .any(|candidate| candidate.kind == artifact.kind && candidate.path == artifact.path);
+        if !exists {
+            lhs.push(artifact);
+        }
+    }
+    lhs
+}
+
+async fn verify_task_plan_outputs(
+    action: &Action,
+    outputs: &ActionOutputs,
+    iteration: u32,
+    feedback_policy: &FeedbackPolicy,
+) -> anyhow::Result<TaskPlanVerificationResult> {
+    let json_artifact = outputs
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.path.ends_with("task_plan.json"))
+        .cloned();
+    let markdown_artifact = outputs
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.path.ends_with("task_plan.md"))
+        .cloned();
+
+    let mut failures = Vec::new();
+    if json_artifact.is_none() {
+        failures.push("missing task_plan.json artifact".to_string());
+    }
+    if markdown_artifact.is_none() {
+        failures.push("missing task_plan.md artifact".to_string());
+    }
+
+    let artifact = if let Some(json_artifact) = &json_artifact {
+        Some(load_json_artifact::<crawfish_types::TaskPlanArtifact>(json_artifact).await?)
+    } else {
+        None
+    };
+    let markdown = if let Some(markdown_artifact) = &markdown_artifact {
+        Some(tokio::fs::read_to_string(&markdown_artifact.path).await?)
+    } else {
+        None
+    };
+
+    if let Some(artifact) = &artifact {
+        if artifact.ordered_steps.len() < 2 {
+            failures.push("task plan must contain at least two ordered steps".to_string());
+        }
+        if artifact.risks.is_empty() {
+            failures.push("task plan must include at least one risk".to_string());
+        }
+        if artifact.assumptions.is_empty() {
+            failures.push("task plan must include at least one assumption".to_string());
+        }
+        if artifact.confidence_summary.trim().is_empty() {
+            failures.push("task plan must include a confidence summary".to_string());
+        }
+    }
+
+    let mut combined_text = String::new();
+    if let Some(artifact) = &artifact {
+        combined_text.push_str(&serde_json::to_string(artifact)?);
+        combined_text.push('\n');
+    }
+    if let Some(markdown) = &markdown {
+        combined_text.push_str(markdown);
+    }
+    let lowered = combined_text.to_lowercase();
+
+    if let Some(objective) = action.inputs.get("objective").and_then(Value::as_str) {
+        let missing_tokens = extract_key_tokens(objective)
+            .into_iter()
+            .filter(|token| !lowered.contains(token))
+            .collect::<Vec<_>>();
+        if !missing_tokens.is_empty() {
+            failures.push(format!(
+                "task plan does not sufficiently cover objective tokens: {}",
+                missing_tokens.join(", ")
+            ));
+        }
+    }
+
+    let missing_outputs = metadata_string_array(&action.inputs, "desired_outputs")
+        .into_iter()
+        .filter(|output| !lowered.contains(&output.to_lowercase()))
+        .collect::<Vec<_>>();
+    if !missing_outputs.is_empty() {
+        failures.push(format!(
+            "task plan does not cover desired outputs: {}",
+            missing_outputs.join(", ")
+        ));
+    }
+
+    if failures.is_empty() {
+        return Ok(TaskPlanVerificationResult {
+            passed: true,
+            summary: VerificationSummary {
+                status: VerificationStatus::Passed,
+                iterations_completed: iteration,
+                last_feedback: None,
+                last_failure_code: None,
+            },
+            feedback: None,
+        });
+    }
+
+    let feedback = build_task_plan_feedback(feedback_policy, &failures);
+    Ok(TaskPlanVerificationResult {
+        passed: false,
+        summary: VerificationSummary {
+            status: VerificationStatus::Failed,
+            iterations_completed: iteration,
+            last_feedback: Some(feedback.clone()),
+            last_failure_code: Some(failure_code_verification_failed().to_string()),
+        },
+        feedback: Some(feedback),
+    })
+}
+
+fn build_task_plan_feedback(policy: &FeedbackPolicy, failures: &[String]) -> String {
+    let report = failures.join("; ");
+    match policy {
+        FeedbackPolicy::InjectReason => {
+            format!("Address the following verification gaps: {report}")
+        }
+        FeedbackPolicy::AppendReport => {
+            format!("Verification report:\n- {}", failures.join("\n- "))
+        }
+        FeedbackPolicy::Handoff => {
+            format!("Verification did not pass and needs explicit operator review: {report}")
+        }
+    }
+}
+
+fn extract_key_tokens(text: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "about", "after", "around", "before", "build", "change", "changes", "check", "checks",
+        "ensure", "from", "into", "plan", "safe", "task", "that", "the", "this", "with",
+    ];
+
+    let mut tokens = text
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            let lowered = token.trim().to_lowercase();
+            if lowered.len() < 4 || STOPWORDS.contains(&lowered.as_str()) {
+                return None;
+            }
+            Some(lowered)
+        })
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens.truncate(3);
+    tokens
+}
+
+fn metadata_string_array(metadata: &crawfish_types::Metadata, key: &str) -> Vec<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn api_router(supervisor: Arc<Supervisor>) -> Router {
@@ -3665,94 +4416,131 @@ mod tests {
     async fn spawn_mock_openclaw_gateway() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let run_counter = Arc::new(AtomicUsize::new(0));
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let ws = accept_hdr_async(stream, |_request: &WsRequest, response: WsResponse| {
-                Ok(response)
-            })
-            .await
-            .unwrap();
-            let (mut sink, mut source) = ws.split();
-            while let Some(message) = source.next().await {
-                let WsMessage::Text(text) = message.unwrap() else {
-                    continue;
-                };
-                let frame: Value = serde_json::from_str(&text).unwrap();
-                let method = frame.get("method").and_then(Value::as_str).unwrap();
-                let id = frame.get("id").and_then(Value::as_str).unwrap();
-                match method {
-                    "connect" => {
-                        sink.send(WsMessage::Text(
-                            serde_json::json!({
-                                "type":"res",
-                                "id": id,
-                                "ok": true,
-                                "result": {"sessionKey":"gateway-session"}
-                            })
-                            .to_string()
-                            .into(),
-                        ))
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let run_counter = Arc::clone(&run_counter);
+                tokio::spawn(async move {
+                    let ws =
+                        accept_hdr_async(stream, |_request: &WsRequest, response: WsResponse| {
+                            Ok(response)
+                        })
                         .await
                         .unwrap();
+                    let (mut sink, mut source) = ws.split();
+                    let mut active_run_id: Option<String> = None;
+                    let mut last_prompt = String::new();
+                    while let Some(message) = source.next().await {
+                        let WsMessage::Text(text) = message.unwrap() else {
+                            continue;
+                        };
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        let method = frame.get("method").and_then(Value::as_str).unwrap();
+                        let id = frame.get("id").and_then(Value::as_str).unwrap();
+                        match method {
+                            "connect" => {
+                                sink.send(WsMessage::Text(
+                                    serde_json::json!({
+                                        "type":"res",
+                                        "id": id,
+                                        "ok": true,
+                                        "result": {"sessionKey":"gateway-session"}
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                            "agent" => {
+                                let attempt = run_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                                let run_id = format!("run-{attempt}");
+                                last_prompt = frame
+                                    .pointer("/params/message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                active_run_id = Some(run_id.clone());
+                                sink.send(WsMessage::Text(
+                                    serde_json::json!({
+                                        "type":"event",
+                                        "event":"assistant",
+                                        "runId":run_id,
+                                        "payload":{
+                                            "stream":"assistant",
+                                            "text": format!("OpenClaw planning attempt {attempt}")
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                sink.send(WsMessage::Text(
+                                    serde_json::json!({
+                                        "type":"res",
+                                        "id": id,
+                                        "ok": true,
+                                        "result": {"runId": active_run_id}
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                            "agent.wait" => {
+                                let run_id = active_run_id
+                                    .clone()
+                                    .expect("agent.wait should follow agent");
+                                let has_feedback =
+                                    last_prompt.contains("Verification feedback to address:");
+                                sink.send(WsMessage::Text(
+                                    serde_json::json!({
+                                        "type":"event",
+                                        "event":"tool",
+                                        "runId":run_id,
+                                        "payload":{
+                                            "stream":"tool",
+                                            "message":"read target files and shape proposal"
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                let result = if has_feedback {
+                                    serde_json::json!({
+                                        "status":"completed",
+                                        "confidence":"High confidence once the checklist and rollout notes are included.",
+                                        "text":"# Task Plan\n1. Inspect `src/lib.rs` and the repo indexing boundary.\n2. Add validation checks around the indexing path and capture a rollout checklist.\n3. Update tests and document the rollout checklist.\nRisks: config drift can hide indexing regressions.\nAssumptions: the rollout checklist can stay proposal-only for this task.\nTest: cargo test --workspace\nChecklist: include rollout checklist in the final proposal."
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "status":"completed",
+                                        "text":"# Task Plan\n1. Inspect `src/lib.rs`.\n2. Add validation checks around the repo indexing path.\nRisks: config drift.\nTest: cargo test --workspace"
+                                    })
+                                };
+                                sink.send(WsMessage::Text(
+                                    serde_json::json!({
+                                        "type":"res",
+                                        "id": id,
+                                        "ok": true,
+                                        "result": result
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                break;
+                            }
+                            other => panic!("unexpected gateway method: {other}"),
+                        }
                     }
-                    "agent" => {
-                        sink.send(WsMessage::Text(
-                            serde_json::json!({
-                                "type":"event",
-                                "event":"assistant",
-                                "runId":"run-123",
-                                "payload":{"stream":"assistant","text":"Outline the patch plan"}
-                            })
-                            .to_string()
-                            .into(),
-                        ))
-                        .await
-                        .unwrap();
-                        sink.send(WsMessage::Text(
-                            serde_json::json!({
-                                "type":"res",
-                                "id": id,
-                                "ok": true,
-                                "result": {"runId":"run-123"}
-                            })
-                            .to_string()
-                            .into(),
-                        ))
-                        .await
-                        .unwrap();
-                    }
-                    "agent.wait" => {
-                        sink.send(WsMessage::Text(
-                            serde_json::json!({
-                                "type":"event",
-                                "event":"tool",
-                                "runId":"run-123",
-                                "payload":{"stream":"tool","message":"read target files"}
-                            })
-                            .to_string()
-                            .into(),
-                        ))
-                        .await
-                        .unwrap();
-                        sink.send(WsMessage::Text(
-                            serde_json::json!({
-                                "type":"res",
-                                "id": id,
-                                "ok": true,
-                                "result": {
-                                    "status":"completed",
-                                    "text":"# Task Plan\n1. Inspect `src/lib.rs`\n2. Add validation checks\n3. Update tests\nRisks: config drift\nTest: cargo test --workspace"
-                                }
-                            })
-                            .to_string()
-                            .into(),
-                        ))
-                        .await
-                        .unwrap();
-                        break;
-                    }
-                    other => panic!("unexpected gateway method: {other}"),
-                }
+                });
             }
         });
         format!("ws://{address}")
@@ -3859,6 +4647,10 @@ mod tests {
                         "files_of_interest".to_string(),
                         serde_json::json!(["src/lib.rs"]),
                     ),
+                    (
+                        "desired_outputs".to_string(),
+                        serde_json::json!(["rollout checklist"]),
+                    ),
                 ]),
                 contract_overrides: None,
                 execution_strategy: None,
@@ -3883,14 +4675,46 @@ mod tests {
             detail.selected_executor.as_deref(),
             Some("openclaw.task-planner")
         );
+        assert_eq!(
+            detail.strategy_mode,
+            Some(ExecutionStrategyMode::VerifyLoop)
+        );
+        assert_eq!(detail.strategy_iteration, Some(2));
+        assert_eq!(
+            detail
+                .verification_summary
+                .as_ref()
+                .map(|summary| summary.status.clone()),
+            Some(VerificationStatus::Passed)
+        );
         assert!(detail
             .external_refs
             .iter()
-            .any(|reference| reference.kind == "openclaw.run_id" && reference.value == "run-123"));
+            .any(|reference| reference.kind == "openclaw.run_id" && reference.value == "run-1"));
+        assert!(detail
+            .external_refs
+            .iter()
+            .any(|reference| reference.kind == "openclaw.run_id" && reference.value == "run-2"));
         let events = supervisor
             .list_action_events(&submitted.action_id)
             .await
             .unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "verify_loop_iteration_started"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "verify_loop_iteration_completed"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "verification_failed"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "verification_passed"));
         assert!(events
             .events
             .iter()
@@ -3940,6 +4764,10 @@ mod tests {
                         "objective".to_string(),
                         serde_json::json!("Plan a safe fallback-only task flow"),
                     ),
+                    (
+                        "desired_outputs".to_string(),
+                        serde_json::json!(["fallback checklist"]),
+                    ),
                 ]),
                 contract_overrides: None,
                 execution_strategy: None,
@@ -3964,6 +4792,18 @@ mod tests {
             detail.selected_executor.as_deref(),
             Some("deterministic.task_plan")
         );
+        assert_eq!(
+            detail.strategy_mode,
+            Some(ExecutionStrategyMode::VerifyLoop)
+        );
+        assert_eq!(detail.strategy_iteration, Some(1));
+        assert_eq!(
+            detail
+                .verification_summary
+                .as_ref()
+                .map(|summary| summary.status.clone()),
+            Some(VerificationStatus::Passed)
+        );
         let events = supervisor
             .list_action_events(&submitted.action_id)
             .await
@@ -3976,6 +4816,10 @@ mod tests {
             .events
             .iter()
             .any(|event| event.event_type == "continuity_selected"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "verification_passed"));
     }
 
     #[tokio::test]
@@ -4375,6 +5219,159 @@ depends_on = []
             .events
             .iter()
             .any(|event| event.event_type == "recovered"));
+    }
+
+    #[tokio::test]
+    async fn verify_loop_action_recovers_iteration_lineage_after_restart() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let mut action = Action {
+            id: "verify-loop-running-action".to_string(),
+            target_agent_id: "task_planner".to_string(),
+            requester: RequesterRef {
+                kind: RequesterKind::User,
+                id: "operator".to_string(),
+            },
+            initiator_owner: crawfish_types::OwnerRef {
+                kind: crawfish_types::OwnerKind::Human,
+                id: "local-dev".to_string(),
+                display_name: None,
+            },
+            counterparty_refs: Vec::new(),
+            goal: crawfish_types::GoalSpec {
+                summary: "plan task".to_string(),
+                details: None,
+            },
+            capability: "task.plan".to_string(),
+            inputs: std::collections::BTreeMap::from([
+                (
+                    "workspace_root".to_string(),
+                    serde_json::json!(dir.path().display().to_string()),
+                ),
+                (
+                    "objective".to_string(),
+                    serde_json::json!("Plan the repo indexing rollout"),
+                ),
+                (
+                    "desired_outputs".to_string(),
+                    serde_json::json!(["rollout checklist"]),
+                ),
+            ]),
+            contract: supervisor.config().contracts.org_defaults.clone(),
+            execution_strategy: Some(crawfish_types::ExecutionStrategy {
+                mode: ExecutionStrategyMode::VerifyLoop,
+                verification_spec: Some(crawfish_types::VerificationSpec {
+                    checks: Vec::new(),
+                    require_all: true,
+                    on_failure: crawfish_types::VerifyLoopFailureMode::RetryWithFeedback,
+                }),
+                stop_budget: Some(crawfish_types::StopBudget {
+                    max_iterations: 3,
+                    max_cost_usd: None,
+                    max_elapsed_ms: None,
+                }),
+                feedback_policy: FeedbackPolicy::InjectReason,
+            }),
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            encounter_ref: None,
+            audit_receipt_ref: None,
+            data_boundary: "owner_local".to_string(),
+            schedule: Default::default(),
+            phase: ActionPhase::Running,
+            created_at: now_timestamp(),
+            started_at: Some(now_timestamp()),
+            finished_at: None,
+            checkpoint_ref: None,
+            continuity_mode: None,
+            degradation_profile: None,
+            failure_reason: None,
+            failure_code: None,
+            selected_executor: Some("deterministic.task_plan".to_string()),
+            recovery_stage: None,
+            lock_detail: None,
+            external_refs: Vec::new(),
+            outputs: ActionOutputs::default(),
+        };
+        let mut checkpoint = build_checkpoint(
+            &action,
+            "deterministic.task_plan",
+            "verification_failed",
+            Vec::new(),
+        )
+        .unwrap();
+        checkpoint.strategy_state = Some(StrategyCheckpointState {
+            mode: ExecutionStrategyMode::VerifyLoop,
+            iteration: 1,
+            verification_feedback: Some(
+                "Address the following verification gaps: task plan must cover rollout checklist"
+                    .to_string(),
+            ),
+            previous_artifact_refs: Vec::new(),
+            verification_summary: Some(VerificationSummary {
+                status: VerificationStatus::Failed,
+                iterations_completed: 1,
+                last_feedback: Some(
+                    "Address the following verification gaps: task plan must cover rollout checklist"
+                        .to_string(),
+                ),
+                last_failure_code: Some(failure_code_verification_failed().to_string()),
+            }),
+        });
+        let checkpoint_ref = checkpoint_ref_for_executor(&checkpoint.executor_kind);
+        supervisor
+            .store()
+            .put_checkpoint(
+                &action.id,
+                &checkpoint_ref,
+                &serde_json::to_vec_pretty(&checkpoint).unwrap(),
+            )
+            .await
+            .unwrap();
+        action.checkpoint_ref = Some(checkpoint_ref);
+        supervisor.store().upsert_action(&action).await.unwrap();
+
+        let restarted = Supervisor::from_config_path(&dir.path().join("Crawfish.toml"))
+            .await
+            .unwrap();
+        restarted.run_once().await.unwrap();
+
+        let detail = restarted
+            .inspect_action("verify-loop-running-action")
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(
+            detail.strategy_mode,
+            Some(ExecutionStrategyMode::VerifyLoop)
+        );
+        assert_eq!(detail.strategy_iteration, Some(2));
+        assert_eq!(
+            detail
+                .verification_summary
+                .as_ref()
+                .map(|summary| summary.status.clone()),
+            Some(VerificationStatus::Passed)
+        );
+
+        let events = restarted
+            .list_action_events("verify-loop-running-action")
+            .await
+            .unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "recovered"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "verify_loop_iteration_started"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "verification_passed"));
     }
 
     #[tokio::test]

@@ -993,6 +993,14 @@ impl Default for ExecutionStrategyMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    Passed,
+    Failed,
+    BudgetExhausted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FeedbackPolicy {
     InjectReason,
     AppendReport,
@@ -1024,6 +1032,28 @@ pub struct VerificationSpec {
     pub require_all: bool,
     #[serde(default)]
     pub on_failure: VerifyLoopFailureMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationSummary {
+    pub status: VerificationStatus,
+    pub iterations_completed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_feedback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StrategyCheckpointState {
+    pub mode: ExecutionStrategyMode,
+    pub iteration: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_feedback: Option<String>,
+    #[serde(default)]
+    pub previous_artifact_refs: Vec<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_summary: Option<VerificationSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1191,6 +1221,8 @@ pub struct DeterministicCheckpoint {
     pub input_digest: String,
     #[serde(default)]
     pub artifact_refs: Vec<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_state: Option<StrategyCheckpointState>,
     pub last_updated_at: String,
 }
 

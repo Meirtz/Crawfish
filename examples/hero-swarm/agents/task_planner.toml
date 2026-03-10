@@ -18,6 +18,18 @@ fallback_chain = ["deterministic"]
 approval_policy = "on_mutation"
 mutation_mode = "proposal_only"
 
+[strategy_defaults."task.plan"]
+mode = "verify_loop"
+feedback_policy = "inject_reason"
+
+[strategy_defaults."task.plan".verification_spec]
+require_all = true
+on_failure = "retry_with_feedback"
+checks = []
+
+[strategy_defaults."task.plan".stop_budget]
+max_iterations = 3
+
 [[adapters]]
 adapter = "openclaw"
 gateway_url = "ws://127.0.0.1:9988/gateway"
