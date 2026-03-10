@@ -1,7 +1,8 @@
 use crate::ExecutionContractPatch;
 use crawfish_types::{
-    Action, AgentManifest, AuditReceipt, CounterpartyRef, EncounterRecord, ExecutionStrategy,
-    GoalSpec, LifecycleRecord, Metadata, OwnerRef, RequesterRef, ScheduleSpec, TrustDomain,
+    Action, AgentManifest, ArtifactRef, AuditReceipt, CounterpartyRef, EncounterRecord,
+    ExecutionStrategy, ExternalRef, GoalSpec, LifecycleRecord, Metadata, OwnerRef, RequesterRef,
+    ScheduleSpec, TrustDomain,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,14 @@ pub struct AgentDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionDetail {
     pub action: Action,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_executor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_stage: Option<String>,
+    #[serde(default)]
+    pub external_refs: Vec<ExternalRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encounter: Option<EncounterRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

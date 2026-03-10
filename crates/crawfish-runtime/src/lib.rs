@@ -496,6 +496,10 @@ impl SupervisorControl for Supervisor {
             None
         };
         Ok(Some(ActionDetail {
+            artifact_refs: action.outputs.artifacts.clone(),
+            selected_executor: action.selected_executor.clone(),
+            recovery_stage: action.recovery_stage.clone(),
+            external_refs: action.external_refs.clone(),
             action,
             encounter,
             audit_receipt,
@@ -581,6 +585,9 @@ impl SupervisorControl for Supervisor {
             continuity_mode: None,
             degradation_profile: None,
             failure_reason: None,
+            selected_executor: None,
+            recovery_stage: None,
+            external_refs: Vec::new(),
             outputs: ActionOutputs::default(),
         };
         self.store.upsert_action(&action).await?;

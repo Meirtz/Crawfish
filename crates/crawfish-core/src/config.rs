@@ -1,8 +1,10 @@
 use crawfish_types::{
     CapabilityVisibility, DataBoundaryPolicy, DefaultDisposition, EncounterPolicy,
-    ExecutionContract, NetworkBoundaryPolicy, ToolBoundaryPolicy, WorkspaceBoundaryPolicy,
+    ExecutionContract, McpServerConfig, NetworkBoundaryPolicy, ToolBoundaryPolicy,
+    WorkspaceBoundaryPolicy,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +24,12 @@ pub struct ApiConfig {
 pub struct ContractDefaultsConfig {
     #[serde(default)]
     pub org_defaults: ExecutionContract,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +55,8 @@ pub struct CrawfishConfig {
     pub fleet: FleetConfig,
     #[serde(default)]
     pub api: ApiConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
     #[serde(default)]
     pub contracts: ContractDefaultsConfig,
     #[serde(default)]
@@ -139,6 +149,7 @@ mod tests {
             api: ApiConfig {
                 socket_path: PathBuf::from(".crawfish/run/crawfishd.sock"),
             },
+            mcp: McpConfig::default(),
             contracts: ContractDefaultsConfig::default(),
             governance: GovernanceConfig::default(),
             runtime: RuntimeConfig::default(),

@@ -777,9 +777,23 @@ pub struct ActionOutputs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default)]
-    pub artifacts: Vec<String>,
+    pub artifacts: Vec<ArtifactRef>,
     #[serde(default)]
     pub metadata: Metadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactRef {
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalRef {
+    pub kind: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -794,8 +808,45 @@ pub enum AdapterBinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpToolBinding {
     pub capability: String,
+    pub server: String,
+    pub tool: String,
     #[serde(default)]
     pub default_scope: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransportKind {
+    Sse,
+}
+
+impl Default for McpTransportKind {
+    fn default() -> Self {
+        Self::Sse
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerConfig {
+    #[serde(default)]
+    pub transport: McpTransportKind,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_env: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default = "default_mcp_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    #[serde(default = "default_mcp_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+}
+
+fn default_mcp_connect_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_mcp_request_timeout_ms() -> u64 {
+    15_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1074,8 +1125,85 @@ pub struct Action {
     pub degradation_profile: Option<DegradedProfileName>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_executor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_stage: Option<String>,
+    #[serde(default)]
+    pub external_refs: Vec<ExternalRef>,
     #[serde(default)]
     pub outputs: ActionOutputs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeterministicCheckpoint {
+    pub executor_kind: String,
+    pub stage: String,
+    pub workspace_root: String,
+    pub input_digest: String,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactRef>,
+    pub last_updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepoIndexArtifact {
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub languages: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub test_files: Vec<String>,
+    #[serde(default)]
+    pub owners: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewFinding {
+    pub title: String,
+    pub detail: String,
+    pub severity: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewFindingsArtifact {
+    pub risk_level: ReviewRiskLevel,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    #[serde(default)]
+    pub findings: Vec<ReviewFinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CiFailureFamily {
+    Test,
+    Lint,
+    Typecheck,
+    Build,
+    DependencyInstall,
+    InfraTransient,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CiTriageArtifact {
+    pub family: CiFailureFamily,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub next_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

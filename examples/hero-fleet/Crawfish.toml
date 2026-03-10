@@ -8,6 +8,12 @@ manifests_dir = "agents"
 [api]
 socket_path = ".crawfish/run/crawfishd.sock"
 
+[mcp.servers.hero_remote]
+transport = "sse"
+url = "http://127.0.0.1:8877/sse"
+connect_timeout_ms = 5000
+request_timeout_ms = 15000
+
 [runtime]
 reconcile_interval_ms = 5000
 

@@ -14,5 +14,6 @@ display_name = "Local Developer"
 [[adapters]]
 adapter = "mcp"
 capability = "ci.runs.inspect"
+server = "hero_remote"
+tool = "ci_runs_inspect"
 default_scope = ["ci:read"]
-

@@ -13,5 +13,6 @@ display_name = "Local Developer"
 [[adapters]]
 adapter = "mcp"
 capability = "filesystem.read"
+server = "hero_remote"
+tool = "filesystem_read"
 default_scope = ["repo:read"]
-

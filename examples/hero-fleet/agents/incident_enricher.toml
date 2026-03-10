@@ -13,5 +13,6 @@ display_name = "Local Developer"
 [[adapters]]
 adapter = "mcp"
 capability = "observability.logs.read"
+server = "hero_remote"
+tool = "observability_logs_read"
 default_scope = ["logs:read"]
-

@@ -569,6 +569,9 @@ mod tests {
             continuity_mode: None,
             degradation_profile: None,
             failure_reason: None,
+            selected_executor: None,
+            recovery_stage: None,
+            external_refs: Vec::new(),
             outputs: ActionOutputs::default(),
         }
     }
