@@ -33,4 +33,5 @@ walkdir.workspace = true
 futures-util.workspace = true
 hyper-util.workspace = true
 hyperlocal.workspace = true
+sqlx.workspace = true
 tempfile.workspace = true

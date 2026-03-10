@@ -668,9 +668,10 @@ mod tests {
     use super::*;
     use crawfish_core::now_timestamp;
     use crawfish_types::{
-        ActionOutputs, ActionPhase, AgentManifest, AgentState, AuditOutcome, CounterpartyRef,
-        EncounterState, ExecutionContract, GoalSpec, HealthStatus, LifecycleRecord, OwnerKind,
-        OwnerRef, RequesterKind, RequesterRef, RuntimeProfile, TrustDomain,
+        ActionOutputs, ActionPhase, AgentManifest, AgentState, AuditOutcome, CapabilityLease,
+        ConsentGrant, CounterpartyRef, EncounterState, ExecutionContract, GoalSpec, HealthStatus,
+        LifecycleRecord, OwnerKind, OwnerRef, RequesterKind, RequesterRef, RuntimeProfile,
+        TrustDomain,
     };
     use tempfile::tempdir;
 
@@ -874,5 +875,80 @@ mod tests {
             "audit-1"
         );
         assert!(store.is_draining().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn consent_grant_and_capability_lease_round_trip() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("control.db");
+        let state_dir = dir.path().join("state");
+        let store = SqliteStore::connect(&db, &state_dir).await.unwrap();
+
+        let grant = ConsentGrant {
+            id: "grant-1".to_string(),
+            grantor: owner("alice"),
+            grantee: owner("bob"),
+            purpose: "review repo".to_string(),
+            scope: vec!["repo.review".to_string()],
+            issued_at: now_timestamp(),
+            expires_at: now_timestamp(),
+            revocable: true,
+            approver_ref: Some("alice".to_string()),
+        };
+        let lease = CapabilityLease {
+            id: "lease-1".to_string(),
+            grant_ref: grant.id.clone(),
+            lessor: owner("alice"),
+            lessee: owner("bob"),
+            capability_refs: vec!["repo.review".to_string()],
+            scope: vec!["repo.review".to_string()],
+            issued_at: now_timestamp(),
+            expires_at: now_timestamp(),
+            revocation_reason: None,
+            audit_receipt_ref: "audit-1".to_string(),
+        };
+
+        store.upsert_consent_grant(&grant).await.unwrap();
+        store.upsert_capability_lease(&lease).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_consent_grant("grant-1")
+                .await
+                .unwrap()
+                .expect("grant")
+                .id,
+            "grant-1"
+        );
+        assert_eq!(
+            store
+                .get_capability_lease("lease-1")
+                .await
+                .unwrap()
+                .expect("lease")
+                .id,
+            "lease-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_actions_can_filter_by_phase() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("control.db");
+        let state_dir = dir.path().join("state");
+        let store = SqliteStore::connect(&db, &state_dir).await.unwrap();
+
+        let mut awaiting = action("action-awaiting");
+        awaiting.phase = ActionPhase::AwaitingApproval;
+        let mut completed = action("action-completed");
+        completed.phase = ActionPhase::Completed;
+
+        store.upsert_action(&awaiting).await.unwrap();
+        store.upsert_action(&completed).await.unwrap();
+
+        assert_eq!(store.list_actions(None).await.unwrap().len(), 2);
+        let awaiting_actions = store.list_actions(Some("awaiting_approval")).await.unwrap();
+        assert_eq!(awaiting_actions.len(), 1);
+        assert_eq!(awaiting_actions[0].id, "action-awaiting");
     }
 }

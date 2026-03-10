@@ -1018,7 +1018,7 @@ mod tests {
     use crawfish_core::now_timestamp;
     use crawfish_types::{
         Action, ActionPhase, ExecutionContract, GoalSpec, OwnerKind, OwnerRef, RequesterKind,
-        RequesterRef, ScheduleSpec,
+        RequesterRef, ScheduleSpec, WorkspaceApplyResult,
     };
     use tempfile::tempdir;
 
@@ -1200,5 +1200,83 @@ mod tests {
             .unwrap();
         let triage: CiTriageArtifact = serde_json::from_str(&artifact).unwrap();
         assert_eq!(triage.family, CiFailureFamily::Test);
+    }
+
+    #[tokio::test]
+    async fn workspace_patch_apply_applies_and_rejects_safely() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join("nested")).await.unwrap();
+        fs::write(workspace.join("nested/file.txt"), "before\n")
+            .await
+            .unwrap();
+        fs::write(workspace.join("delete.txt"), "remove me\n")
+            .await
+            .unwrap();
+
+        let replace_sha = sha256_hex(b"before\n");
+        let delete_sha = sha256_hex(b"remove me\n");
+        let action = action_with_capability(
+            "workspace.patch.apply",
+            BTreeMap::from([
+                (
+                    "workspace_root".to_string(),
+                    serde_json::json!(workspace.display().to_string()),
+                ),
+                (
+                    "edits".to_string(),
+                    serde_json::json!([
+                        {
+                            "path": "created.txt",
+                            "op": "create",
+                            "contents": "created\n"
+                        },
+                        {
+                            "path": "nested/file.txt",
+                            "op": "replace",
+                            "contents": "after\n",
+                            "expected_sha256": replace_sha
+                        },
+                        {
+                            "path": "delete.txt",
+                            "op": "delete",
+                            "expected_sha256": delete_sha
+                        },
+                        {
+                            "path": "../escape.txt",
+                            "op": "create",
+                            "contents": "nope\n"
+                        }
+                    ]),
+                ),
+            ]),
+        );
+
+        let executor =
+            WorkspacePatchApplyDeterministicExecutor::new(dir.path().join(".crawfish/state"));
+        let outputs = executor.execute(&action).await.unwrap();
+
+        assert_eq!(outputs.artifacts.len(), 1);
+        assert_eq!(
+            fs::read_to_string(workspace.join("created.txt"))
+                .await
+                .unwrap(),
+            "created\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("nested/file.txt"))
+                .await
+                .unwrap(),
+            "after\n"
+        );
+        assert!(!workspace.join("delete.txt").exists());
+
+        let artifact = fs::read_to_string(&outputs.artifacts[0].path)
+            .await
+            .unwrap();
+        let result: WorkspaceApplyResult = serde_json::from_str(&artifact).unwrap();
+        assert_eq!(result.applied.len(), 3);
+        assert_eq!(result.rejected.len(), 1);
+        assert_eq!(result.rejected[0].path, "../escape.txt");
     }
 }
