@@ -1,9 +1,10 @@
 use crate::ExecutionContractPatch;
 use crawfish_types::{
-    Action, AgentManifest, ArtifactRef, AuditReceipt, CapabilityLease, ConsentGrant,
-    CounterpartyRef, EncounterRecord, ExecutionStrategy, ExecutionStrategyMode, ExternalRef,
-    GoalSpec, LifecycleRecord, Metadata, OwnerRef, RequesterRef, ScheduleSpec, TrustDomain,
-    VerificationSummary, WorkspaceLockDetail,
+    Action, AgentManifest, ArtifactRef, AuditReceipt, CapabilityLease, CheckpointStatus,
+    ConsentGrant, CounterpartyRef, DoctrinePack, EncounterRecord, EvaluationRecord,
+    ExecutionStrategy, ExecutionStrategyMode, ExternalRef, GoalSpec, JurisdictionClass,
+    LifecycleRecord, Metadata, OwnerRef, PolicyIncident, RequesterRef, ReviewQueueItem,
+    ScheduleSpec, TraceBundle, TrustDomain, VerificationSummary, WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -70,6 +71,16 @@ pub struct ActionDetail {
     pub terminal_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_detail: Option<WorkspaceLockDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jurisdiction_class: Option<JurisdictionClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctrine_summary: Option<DoctrinePack>,
+    #[serde(default)]
+    pub checkpoint_status: Vec<CheckpointStatus>,
+    #[serde(default)]
+    pub policy_incidents: Vec<PolicyIncident>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_evaluation: Option<EvaluationRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +115,34 @@ pub struct ActionEventRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionEventsResponse {
     pub events: Vec<ActionEventRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActionEvaluationsResponse {
+    pub evaluations: Vec<EvaluationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActionTraceResponse {
+    pub trace: TraceBundle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewQueueResponse {
+    pub items: Vec<ReviewQueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolveReviewQueueItemRequest {
+    pub resolver_ref: String,
+    pub resolution: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolveReviewQueueItemResponse {
+    pub item: ReviewQueueItem,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

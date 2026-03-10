@@ -1258,6 +1258,182 @@ pub struct Action {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JurisdictionClass {
+    SameOwnerLocal,
+    SameDeviceForeignOwner,
+    RemoteHarness,
+    ExternalUnknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OversightCheckpoint {
+    Admission,
+    PreDispatch,
+    PreMutation,
+    PostResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointOutcome {
+    Pending,
+    Passed,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointStatus {
+    pub checkpoint: OversightCheckpoint,
+    pub required: bool,
+    pub outcome: CheckpointOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctrineRule {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub required_checkpoints: Vec<OversightCheckpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctrinePack {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub jurisdiction: JurisdictionClass,
+    #[serde(default)]
+    pub rules: Vec<DoctrineRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnforcementRecord {
+    pub id: String,
+    pub action_id: String,
+    pub checkpoint: OversightCheckpoint,
+    pub outcome: CheckpointOutcome,
+    pub reason: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyIncidentSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyIncident {
+    pub id: String,
+    pub action_id: String,
+    pub doctrine_pack_id: String,
+    pub jurisdiction: JurisdictionClass,
+    pub code: String,
+    pub summary: String,
+    pub severity: PolicyIncidentSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<OversightCheckpoint>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceBundle {
+    pub id: String,
+    pub action_id: String,
+    pub capability: String,
+    pub goal_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_executor: Option<String>,
+    #[serde(default)]
+    pub inputs: Metadata,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub external_refs: Vec<ExternalRef>,
+    #[serde(default)]
+    pub events: Vec<Metadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_summary: Option<VerificationSummary>,
+    #[serde(default)]
+    pub enforcement_records: Vec<EnforcementRecord>,
+    #[serde(default)]
+    pub policy_incidents: Vec<PolicyIncident>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationStatus {
+    Passed,
+    Failed,
+    NeedsReview,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationRecord {
+    pub id: String,
+    pub action_id: String,
+    pub evaluator: String,
+    pub status: EvaluationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_note_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewQueueStatus {
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewQueueItem {
+    pub id: String,
+    pub action_id: String,
+    pub source: String,
+    pub status: ReviewQueueStatus,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_ref: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeedbackNote {
+    pub id: String,
+    pub action_id: String,
+    pub source: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertRule {
+    pub id: String,
+    pub name: String,
+    pub trigger: String,
+    pub severity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeterministicCheckpoint {
     pub executor_kind: String,
     pub stage: String,

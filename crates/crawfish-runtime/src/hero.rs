@@ -894,7 +894,7 @@ fn input_string_array(action: &Action, key: &str) -> Vec<String> {
         .collect()
 }
 
-fn task_plan_objective_from_action(action: &Action) -> anyhow::Result<String> {
+pub(crate) fn task_plan_objective_from_action(action: &Action) -> anyhow::Result<String> {
     [
         optional_input_string(action, "objective"),
         optional_input_string(action, "task"),

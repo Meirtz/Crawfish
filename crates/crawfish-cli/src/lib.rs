@@ -1,10 +1,11 @@
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crawfish_core::{
-    ActionDetail, ActionEventsResponse, ActionListResponse, AdminActionResponse, AgentDetail,
-    ApproveActionRequest, CrawfishConfig, ExecutionContractPatch, PolicyValidationRequest,
-    PolicyValidationResponse, RejectActionRequest, RevokeLeaseRequest, SubmitActionRequest,
-    SubmittedAction, SwarmStatusResponse,
+    ActionDetail, ActionEvaluationsResponse, ActionEventsResponse, ActionListResponse,
+    ActionTraceResponse, AdminActionResponse, AgentDetail, ApproveActionRequest, CrawfishConfig,
+    ExecutionContractPatch, PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest,
+    ResolveReviewQueueItemRequest, ResolveReviewQueueItemResponse, ReviewQueueResponse,
+    RevokeLeaseRequest, SubmitActionRequest, SubmittedAction, SwarmStatusResponse,
 };
 use crawfish_runtime::Supervisor;
 use crawfish_types::{
@@ -37,12 +38,15 @@ pub enum Commands {
     Policy(PolicyCommand),
     Action(ActionCommand),
     Lease(LeaseCommand),
+    Review(ReviewCommand),
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ActionSubcommands {
     List(ListActionsCommand),
     Events(ActionEventsCommand),
+    Trace(ActionTraceCommand),
+    Evals(ActionEvaluationsCommand),
     Submit(SubmitActionCommand),
     Approve(ApproveActionCommand),
     Reject(RejectActionCommand),
@@ -63,6 +67,18 @@ pub enum LeaseSubcommands {
 pub struct LeaseCommand {
     #[command(subcommand)]
     pub command: LeaseSubcommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReviewSubcommands {
+    List(ListReviewQueueCommand),
+    Resolve(ResolveReviewQueueCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ReviewCommand {
+    #[command(subcommand)]
+    pub command: ReviewSubcommands,
 }
 
 #[derive(Debug, Args)]
@@ -208,6 +224,24 @@ pub struct ActionEventsCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct ActionTraceCommand {
+    pub action_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ActionEvaluationsCommand {
+    pub action_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct ApproveActionCommand {
     pub action_id: String,
     #[arg(long, default_value = "Crawfish.toml")]
@@ -242,6 +276,29 @@ pub struct RevokeLeaseCommand {
     pub revoker: String,
     #[arg(long)]
     pub reason: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ListReviewQueueCommand {
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ResolveReviewQueueCommand {
+    pub review_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub resolver: String,
+    #[arg(long)]
+    pub resolution: String,
+    #[arg(long)]
+    pub note: Option<String>,
     #[arg(long)]
     pub json: bool,
 }
@@ -286,12 +343,18 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Commands::Action(action) => match action.command {
             ActionSubcommands::List(command) => list_actions_command(command).await,
             ActionSubcommands::Events(command) => action_events_command(command).await,
+            ActionSubcommands::Trace(command) => action_trace_command(command).await,
+            ActionSubcommands::Evals(command) => action_evaluations_command(command).await,
             ActionSubcommands::Submit(command) => submit_action_command(command).await,
             ActionSubcommands::Approve(command) => approve_action_command(command).await,
             ActionSubcommands::Reject(command) => reject_action_command(command).await,
         },
         Commands::Lease(lease) => match lease.command {
             LeaseSubcommands::Revoke(command) => revoke_lease_command(command).await,
+        },
+        Commands::Review(review) => match review.command {
+            ReviewSubcommands::List(command) => list_review_queue_command(command).await,
+            ReviewSubcommands::Resolve(command) => resolve_review_queue_command(command).await,
         },
     }
 }
@@ -492,6 +555,24 @@ async fn action_events_command(command: ActionEventsCommand) -> anyhow::Result<(
     Ok(())
 }
 
+async fn action_trace_command(command: ActionTraceCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: ActionTraceResponse = client
+        .get_json(&format!("/v1/actions/{}/trace", command.action_id))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn action_evaluations_command(command: ActionEvaluationsCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: ActionEvaluationsResponse = client
+        .get_json(&format!("/v1/actions/{}/evaluations", command.action_id))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
 async fn approve_action_command(command: ApproveActionCommand) -> anyhow::Result<()> {
     let client = DaemonClient::from_config(&command.config)?;
     let response: SubmittedAction = client
@@ -530,6 +611,29 @@ async fn revoke_lease_command(command: RevokeLeaseCommand) -> anyhow::Result<()>
             &RevokeLeaseRequest {
                 revoker_ref: command.revoker,
                 reason: command.reason,
+            },
+        )
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn list_review_queue_command(command: ListReviewQueueCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: ReviewQueueResponse = client.get_json("/v1/review-queue").await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn resolve_review_queue_command(command: ResolveReviewQueueCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: ResolveReviewQueueItemResponse = client
+        .post_json(
+            &format!("/v1/review-queue/{}/resolve", command.review_id),
+            &ResolveReviewQueueItemRequest {
+                resolver_ref: command.resolver,
+                resolution: command.resolution,
+                note: command.note,
             },
         )
         .await?;

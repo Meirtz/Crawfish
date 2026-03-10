@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use crawfish_core::{ActionEventRecord, ActionStore, CheckpointStore, QueueSummary};
 use crawfish_types::{
     Action, AgentManifest, AuditReceipt, CapabilityLease, ConsentGrant, EncounterRecord,
-    LifecycleRecord,
+    EvaluationRecord, FeedbackNote, LifecycleRecord, PolicyIncident, ReviewQueueItem, TraceBundle,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, Pool, Row, Sqlite, SqlitePool};
@@ -344,6 +344,208 @@ impl SqliteStore {
         .transpose()
     }
 
+    pub async fn upsert_trace_bundle(&self, bundle: &TraceBundle) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(bundle)?;
+        sqlx::query(
+            r#"
+            INSERT INTO trace_bundles (action_id, trace_id, trace_json, created_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(action_id) DO UPDATE SET
+              trace_id = excluded.trace_id,
+              trace_json = excluded.trace_json,
+              created_at = excluded.created_at
+            "#,
+        )
+        .bind(&bundle.action_id)
+        .bind(&bundle.id)
+        .bind(payload)
+        .bind(&bundle.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_trace_bundle(&self, action_id: &str) -> anyhow::Result<Option<TraceBundle>> {
+        let row = sqlx::query("SELECT trace_json FROM trace_bundles WHERE action_id = ?1")
+            .bind(action_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("trace_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn insert_evaluation_record(
+        &self,
+        evaluation: &EvaluationRecord,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(evaluation)?;
+        sqlx::query(
+            r#"
+            INSERT INTO evaluations (id, action_id, evaluator, status, created_at, evaluation_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+              action_id = excluded.action_id,
+              evaluator = excluded.evaluator,
+              status = excluded.status,
+              created_at = excluded.created_at,
+              evaluation_json = excluded.evaluation_json
+            "#,
+        )
+        .bind(&evaluation.id)
+        .bind(&evaluation.action_id)
+        .bind(&evaluation.evaluator)
+        .bind(format!("{:?}", evaluation.status).to_lowercase())
+        .bind(&evaluation.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_evaluation_records(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<EvaluationRecord>> {
+        let rows = sqlx::query(
+            "SELECT evaluation_json FROM evaluations WHERE action_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(action_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("evaluation_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
+    pub async fn upsert_review_queue_item(&self, item: &ReviewQueueItem) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(item)?;
+        sqlx::query(
+            r#"
+            INSERT INTO review_queue_items (
+              id,
+              action_id,
+              status,
+              summary,
+              created_at,
+              resolved_at,
+              review_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+              action_id = excluded.action_id,
+              status = excluded.status,
+              summary = excluded.summary,
+              created_at = excluded.created_at,
+              resolved_at = excluded.resolved_at,
+              review_json = excluded.review_json
+            "#,
+        )
+        .bind(&item.id)
+        .bind(&item.action_id)
+        .bind(format!("{:?}", item.status).to_lowercase())
+        .bind(&item.summary)
+        .bind(&item.created_at)
+        .bind(&item.resolved_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_review_queue_items(&self) -> anyhow::Result<Vec<ReviewQueueItem>> {
+        let rows = sqlx::query(
+            "SELECT review_json FROM review_queue_items ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("review_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
+    pub async fn insert_feedback_note(&self, note: &FeedbackNote) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(note)?;
+        sqlx::query(
+            r#"
+            INSERT INTO feedback_notes (id, action_id, created_at, feedback_json)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+              action_id = excluded.action_id,
+              created_at = excluded.created_at,
+              feedback_json = excluded.feedback_json
+            "#,
+        )
+        .bind(&note.id)
+        .bind(&note.action_id)
+        .bind(&note.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_feedback_note(&self, note_id: &str) -> anyhow::Result<Option<FeedbackNote>> {
+        let row = sqlx::query("SELECT feedback_json FROM feedback_notes WHERE id = ?1")
+            .bind(note_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("feedback_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn insert_policy_incident(&self, incident: &PolicyIncident) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(incident)?;
+        sqlx::query(
+            r#"
+            INSERT INTO policy_incidents (id, action_id, code, created_at, incident_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              action_id = excluded.action_id,
+              code = excluded.code,
+              created_at = excluded.created_at,
+              incident_json = excluded.incident_json
+            "#,
+        )
+        .bind(&incident.id)
+        .bind(&incident.action_id)
+        .bind(&incident.code)
+        .bind(&incident.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_policy_incidents(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<PolicyIncident>> {
+        let rows = sqlx::query(
+            "SELECT incident_json FROM policy_incidents WHERE action_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(action_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("incident_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
     pub async fn latest_completed_action(
         &self,
         target_agent_id: &str,
@@ -614,6 +816,50 @@ impl ActionStore for SqliteStore {
         }
 
         Ok(summary)
+    }
+
+    async fn put_trace_bundle(&self, bundle: &TraceBundle) -> anyhow::Result<()> {
+        self.upsert_trace_bundle(bundle).await
+    }
+
+    async fn get_trace_bundle(&self, action_id: &str) -> anyhow::Result<Option<TraceBundle>> {
+        SqliteStore::get_trace_bundle(self, action_id).await
+    }
+
+    async fn insert_evaluation(&self, evaluation: &EvaluationRecord) -> anyhow::Result<()> {
+        self.insert_evaluation_record(evaluation).await
+    }
+
+    async fn list_evaluations(&self, action_id: &str) -> anyhow::Result<Vec<EvaluationRecord>> {
+        self.list_evaluation_records(action_id).await
+    }
+
+    async fn insert_review_queue_item(&self, item: &ReviewQueueItem) -> anyhow::Result<()> {
+        self.upsert_review_queue_item(item).await
+    }
+
+    async fn list_review_queue_items(&self) -> anyhow::Result<Vec<ReviewQueueItem>> {
+        SqliteStore::list_review_queue_items(self).await
+    }
+
+    async fn resolve_review_queue_item(&self, item: &ReviewQueueItem) -> anyhow::Result<()> {
+        self.upsert_review_queue_item(item).await
+    }
+
+    async fn insert_feedback_note(&self, note: &FeedbackNote) -> anyhow::Result<()> {
+        SqliteStore::insert_feedback_note(self, note).await
+    }
+
+    async fn get_feedback_note(&self, note_id: &str) -> anyhow::Result<Option<FeedbackNote>> {
+        SqliteStore::get_feedback_note(self, note_id).await
+    }
+
+    async fn insert_policy_incident(&self, incident: &PolicyIncident) -> anyhow::Result<()> {
+        SqliteStore::insert_policy_incident(self, incident).await
+    }
+
+    async fn list_policy_incidents(&self, action_id: &str) -> anyhow::Result<Vec<PolicyIncident>> {
+        SqliteStore::list_policy_incidents(self, action_id).await
     }
 }
 

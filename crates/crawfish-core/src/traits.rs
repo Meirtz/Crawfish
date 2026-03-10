@@ -19,6 +19,43 @@ pub trait ActionStore: Send + Sync {
     async fn list_actions_by_phase(&self, phase: Option<&str>) -> anyhow::Result<Vec<Action>>;
     async fn claim_next_accepted_action(&self) -> anyhow::Result<Option<Action>>;
     async fn queue_summary(&self) -> anyhow::Result<crate::QueueSummary>;
+    async fn put_trace_bundle(&self, bundle: &crawfish_types::TraceBundle) -> anyhow::Result<()>;
+    async fn get_trace_bundle(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Option<crawfish_types::TraceBundle>>;
+    async fn insert_evaluation(
+        &self,
+        evaluation: &crawfish_types::EvaluationRecord,
+    ) -> anyhow::Result<()>;
+    async fn list_evaluations(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<crawfish_types::EvaluationRecord>>;
+    async fn insert_review_queue_item(
+        &self,
+        item: &crawfish_types::ReviewQueueItem,
+    ) -> anyhow::Result<()>;
+    async fn list_review_queue_items(&self)
+        -> anyhow::Result<Vec<crawfish_types::ReviewQueueItem>>;
+    async fn resolve_review_queue_item(
+        &self,
+        item: &crawfish_types::ReviewQueueItem,
+    ) -> anyhow::Result<()>;
+    async fn insert_feedback_note(&self, note: &crawfish_types::FeedbackNote)
+        -> anyhow::Result<()>;
+    async fn get_feedback_note(
+        &self,
+        note_id: &str,
+    ) -> anyhow::Result<Option<crawfish_types::FeedbackNote>>;
+    async fn insert_policy_incident(
+        &self,
+        incident: &crawfish_types::PolicyIncident,
+    ) -> anyhow::Result<()>;
+    async fn list_policy_incidents(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<crawfish_types::PolicyIncident>>;
 }
 
 #[async_trait]
@@ -77,6 +114,20 @@ pub trait SupervisorControl: Send + Sync {
         &self,
         action_id: &str,
     ) -> anyhow::Result<crate::ActionEventsResponse>;
+    async fn get_action_trace(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Option<crate::ActionTraceResponse>>;
+    async fn list_action_evaluations(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<crate::ActionEvaluationsResponse>;
+    async fn list_review_queue(&self) -> anyhow::Result<crate::ReviewQueueResponse>;
+    async fn resolve_review_queue_item(
+        &self,
+        review_id: &str,
+        request: crate::ResolveReviewQueueItemRequest,
+    ) -> anyhow::Result<crate::ResolveReviewQueueItemResponse>;
     async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<crate::AgentDetail>>;
     async fn inspect_action(&self, action_id: &str) -> anyhow::Result<Option<crate::ActionDetail>>;
     async fn submit_action(

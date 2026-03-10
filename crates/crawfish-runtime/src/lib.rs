@@ -9,14 +9,16 @@ use axum::{
 };
 use crawfish_core::{
     authorize_encounter, compile_execution_plan, neutral_policy, now_timestamp,
-    owner_policy_for_manifest, ActionDetail, ActionEventsResponse, ActionListResponse, ActionStore,
-    ActionSummary, AdminActionResponse, AgentDetail, ApproveActionRequest, CheckpointStore,
-    CompiledExecutionPlan, CrawfishConfig, DeterministicExecutor, EncounterDecision,
-    EncounterDisposition, EncounterRequest, ExecutionContractPatch, ExecutionSurface,
-    GovernanceContext, HealthResponse, OpenClawAgentStatusResponse, OpenClawCallerContext,
-    OpenClawInboundActionRequest, OpenClawInboundActionResponse, OpenClawInspectionContext,
-    PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest, RevokeLeaseRequest,
-    SubmitActionRequest, SubmittedAction, SupervisorControl, SwarmStatusResponse,
+    owner_policy_for_manifest, ActionDetail, ActionEvaluationsResponse, ActionEventsResponse,
+    ActionListResponse, ActionStore, ActionSummary, ActionTraceResponse, AdminActionResponse,
+    AgentDetail, ApproveActionRequest, CheckpointStore, CompiledExecutionPlan, CrawfishConfig,
+    DeterministicExecutor, EncounterDecision, EncounterDisposition, EncounterRequest,
+    ExecutionContractPatch, ExecutionSurface, GovernanceContext, HealthResponse,
+    OpenClawAgentStatusResponse, OpenClawCallerContext, OpenClawInboundActionRequest,
+    OpenClawInboundActionResponse, OpenClawInspectionContext, PolicyValidationRequest,
+    PolicyValidationResponse, RejectActionRequest, ResolveReviewQueueItemRequest,
+    ResolveReviewQueueItemResponse, ReviewQueueResponse, RevokeLeaseRequest, SubmitActionRequest,
+    SubmittedAction, SupervisorControl, SwarmStatusResponse,
 };
 use crawfish_harness_local::{LocalHarnessAdapter, LocalHarnessError};
 use crawfish_mcp::McpAdapter;
@@ -25,17 +27,19 @@ use crawfish_store_sqlite::SqliteStore;
 use crawfish_types::{
     Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, ApprovalPolicy,
     AuditOutcome, AuditReceipt, CallerOwnerMapping, CapabilityDescriptor, CapabilityLease,
-    CapabilityVisibility, ConsentGrant, ContinuityModeName, CounterpartyRef, DegradedProfileName,
-    DeterministicCheckpoint, EncounterRecord, EncounterState, ExecutionStrategy,
-    ExecutionStrategyMode, ExternalRef, FeedbackPolicy, HealthStatus, LifecycleRecord,
-    LocalHarnessKind, Mutability, OwnerKind, OwnerRef, StrategyCheckpointState, TrustDomain,
-    VerificationStatus, VerificationSummary, VerifyLoopFailureMode, WorkspaceEdit, WorkspaceEditOp,
+    CapabilityVisibility, CheckpointStatus, ConsentGrant, ContinuityModeName, CounterpartyRef,
+    DegradedProfileName, DeterministicCheckpoint, DoctrinePack, EncounterRecord, EncounterState,
+    EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode, ExternalRef, FeedbackNote,
+    FeedbackPolicy, HealthStatus, JurisdictionClass, LifecycleRecord, LocalHarnessKind, Mutability,
+    OwnerKind, OwnerRef, PolicyIncident, ReviewQueueItem, ReviewQueueStatus,
+    StrategyCheckpointState, TraceBundle, TrustDomain, VerificationStatus, VerificationSummary,
+    VerifyLoopFailureMode, WorkspaceEdit, WorkspaceEditOp,
 };
 use hero::{
-    load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
-    IncidentEnricherDeterministicExecutor, RepoIndexerDeterministicExecutor,
-    RepoReviewerDeterministicExecutor, TaskPlannerDeterministicExecutor,
-    WorkspacePatchApplyDeterministicExecutor,
+    load_json_artifact, required_input_string, task_plan_objective_from_action,
+    CiTriageDeterministicExecutor, IncidentEnricherDeterministicExecutor,
+    RepoIndexerDeterministicExecutor, RepoReviewerDeterministicExecutor,
+    TaskPlannerDeterministicExecutor, WorkspacePatchApplyDeterministicExecutor,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -642,6 +646,545 @@ impl Supervisor {
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
 
+    async fn postprocess_terminal_action(&self, action: &mut Action) -> anyhow::Result<()> {
+        let evaluations = self.evaluate_action_outputs(action).await?;
+        for evaluation in &evaluations {
+            self.store.insert_evaluation(evaluation).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "evaluation_recorded",
+                    serde_json::json!({
+                        "evaluation_id": evaluation.id,
+                        "evaluator": evaluation.evaluator,
+                        "status": format!("{:?}", evaluation.status).to_lowercase(),
+                    }),
+                )
+                .await?;
+        }
+
+        if let Some(item) = self
+            .maybe_enqueue_review_item(action, evaluations.last())
+            .await?
+        {
+            self.store.insert_review_queue_item(&item).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "review_queue_item_created",
+                    serde_json::json!({
+                        "review_id": item.id,
+                        "source": item.source,
+                        "status": format!("{:?}", item.status).to_lowercase(),
+                    }),
+                )
+                .await?;
+        }
+
+        let incidents = self.policy_incidents_for_action(action, evaluations.last());
+        for incident in &incidents {
+            self.store.insert_policy_incident(incident).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "policy_incident_recorded",
+                    serde_json::json!({
+                        "incident_id": incident.id,
+                        "code": incident.code,
+                        "severity": format!("{:?}", incident.severity).to_lowercase(),
+                    }),
+                )
+                .await?;
+        }
+
+        if let Some(reason) =
+            self.post_result_enforcement_gap_reason(action, evaluations.last(), &incidents)
+        {
+            set_action_blocked(
+                action,
+                failure_code_policy_enforcement_gap(),
+                reason.clone(),
+            );
+            action.continuity_mode = Some(ContinuityModeName::HumanHandoff);
+            self.store.upsert_action(action).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "blocked",
+                    serde_json::json!({
+                        "reason": reason,
+                        "code": action.failure_code,
+                        "continuity_mode": action.continuity_mode.as_ref().map(continuity_mode_name),
+                    }),
+                )
+                .await?;
+        }
+
+        for alert in self.alert_rules_for_action(action, evaluations.last(), &incidents) {
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "alert_triggered",
+                    serde_json::json!({
+                        "rule_id": alert.id,
+                        "name": alert.name,
+                        "trigger": alert.trigger,
+                        "severity": alert.severity,
+                    }),
+                )
+                .await?;
+        }
+
+        let trace = self.build_trace_bundle_for_action(action).await?;
+        self.store.put_trace_bundle(&trace).await?;
+        self.store
+            .append_action_event(
+                &action.id,
+                "trace_bundle_recorded",
+                serde_json::json!({
+                    "trace_id": trace.id,
+                    "event_count": trace.events.len(),
+                }),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn build_trace_bundle_for_action(&self, action: &Action) -> anyhow::Result<TraceBundle> {
+        let events = self.store.list_action_events(&action.id).await?;
+        let incidents = self.store.list_policy_incidents(&action.id).await?;
+        let doctrine = default_doctrine_pack(action);
+        let trace = TraceBundle {
+            id: format!("trace-{}", action.id),
+            action_id: action.id.clone(),
+            capability: action.capability.clone(),
+            goal_summary: action.goal.summary.clone(),
+            selected_executor: action.selected_executor.clone(),
+            inputs: action.inputs.clone(),
+            artifact_refs: action.outputs.artifacts.clone(),
+            external_refs: action.external_refs.clone(),
+            events: events
+                .into_iter()
+                .map(|event| {
+                    BTreeMap::from([
+                        (
+                            "event_type".to_string(),
+                            serde_json::json!(event.event_type),
+                        ),
+                        ("payload".to_string(), event.payload),
+                        (
+                            "created_at".to_string(),
+                            serde_json::json!(event.created_at),
+                        ),
+                    ])
+                })
+                .collect(),
+            verification_summary: action
+                .outputs
+                .metadata
+                .get("verification_summary")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
+            enforcement_records: checkpoint_status_for_action(action, &doctrine, None, None)
+                .into_iter()
+                .map(|status| crawfish_types::EnforcementRecord {
+                    id: format!(
+                        "enforcement-{}-{}",
+                        action.id,
+                        runtime_enum_to_snake(&status.checkpoint)
+                    ),
+                    action_id: action.id.clone(),
+                    checkpoint: status.checkpoint,
+                    outcome: status.outcome,
+                    reason: status
+                        .reason
+                        .unwrap_or_else(|| "no reason supplied".to_string()),
+                    created_at: now_timestamp(),
+                })
+                .collect(),
+            policy_incidents: incidents,
+            created_at: now_timestamp(),
+        };
+        Ok(trace)
+    }
+
+    async fn evaluate_action_outputs(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<Vec<EvaluationRecord>> {
+        let Some(hook) = effective_evaluation_hook(action) else {
+            return Ok(Vec::new());
+        };
+
+        let record = match hook.as_str() {
+            "deterministic_scorecard" | "operator_review_queue" => {
+                self.build_deterministic_evaluation_record(action, &hook)
+                    .await?
+            }
+            _ => return Ok(Vec::new()),
+        };
+
+        Ok(vec![record])
+    }
+
+    async fn build_deterministic_evaluation_record(
+        &self,
+        action: &Action,
+        hook: &str,
+    ) -> anyhow::Result<EvaluationRecord> {
+        match action.capability.as_str() {
+            "task.plan" | "coding.patch.plan" => {
+                let artifact_ref = action
+                    .outputs
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.path.ends_with("task_plan.json"))
+                    .ok_or_else(|| anyhow::anyhow!("missing task_plan.json artifact"))?;
+                let artifact: crawfish_types::TaskPlanArtifact =
+                    load_json_artifact(artifact_ref).await?;
+                let mut findings = Vec::new();
+                let mut passed = 0_u32;
+                let total = 4_u32;
+                if artifact.ordered_steps.len() >= 2 {
+                    passed += 1;
+                } else {
+                    findings.push("ordered_steps must contain at least 2 entries".to_string());
+                }
+                if !artifact.risks.is_empty()
+                    && !artifact.assumptions.is_empty()
+                    && !artifact.confidence_summary.trim().is_empty()
+                {
+                    passed += 1;
+                } else {
+                    findings.push(
+                        "risks, assumptions, and confidence_summary must be populated".to_string(),
+                    );
+                }
+                let objective = task_plan_objective_from_action(action)?;
+                let serialized = serde_json::to_string(&artifact)?;
+                if objective_tokens(&objective)
+                    .into_iter()
+                    .all(|token| serialized.to_lowercase().contains(&token))
+                {
+                    passed += 1;
+                } else {
+                    findings.push("objective coverage is incomplete".to_string());
+                }
+                let desired_outputs = metadata_string_array(&action.inputs, "desired_outputs");
+                if desired_outputs.is_empty()
+                    || desired_outputs
+                        .iter()
+                        .all(|value| serialized.contains(value))
+                {
+                    passed += 1;
+                } else {
+                    findings.push("desired output coverage is incomplete".to_string());
+                }
+                let status = if findings.is_empty() {
+                    crawfish_types::EvaluationStatus::Passed
+                } else if hook == "operator_review_queue" {
+                    crawfish_types::EvaluationStatus::NeedsReview
+                } else {
+                    crawfish_types::EvaluationStatus::Failed
+                };
+                Ok(EvaluationRecord {
+                    id: Uuid::new_v4().to_string(),
+                    action_id: action.id.clone(),
+                    evaluator: hook.to_string(),
+                    status,
+                    score: Some(f64::from(passed) / f64::from(total)),
+                    summary: "Deterministic scorecard for task.plan".to_string(),
+                    findings,
+                    feedback_note_id: None,
+                    created_at: now_timestamp(),
+                })
+            }
+            "repo.review" => {
+                let artifact_ref = action
+                    .outputs
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.path.ends_with("review_findings.json"))
+                    .ok_or_else(|| anyhow::anyhow!("missing review_findings.json artifact"))?;
+                let artifact: crawfish_types::ReviewFindingsArtifact =
+                    load_json_artifact(artifact_ref).await?;
+                let mut findings = Vec::new();
+                let status = if artifact.changed_files.is_empty() {
+                    findings.push("changed_files is empty".to_string());
+                    crawfish_types::EvaluationStatus::Failed
+                } else if matches!(artifact.risk_level, crawfish_types::ReviewRiskLevel::High) {
+                    findings.push("high-risk review should be operator-reviewed".to_string());
+                    crawfish_types::EvaluationStatus::NeedsReview
+                } else {
+                    crawfish_types::EvaluationStatus::Passed
+                };
+                Ok(EvaluationRecord {
+                    id: Uuid::new_v4().to_string(),
+                    action_id: action.id.clone(),
+                    evaluator: hook.to_string(),
+                    status,
+                    score: Some(if findings.is_empty() { 1.0 } else { 0.5 }),
+                    summary: "Deterministic scorecard for repo.review".to_string(),
+                    findings,
+                    feedback_note_id: None,
+                    created_at: now_timestamp(),
+                })
+            }
+            "incident.enrich" => {
+                let artifact_ref = action
+                    .outputs
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.path.ends_with("incident_enrichment.json"))
+                    .ok_or_else(|| anyhow::anyhow!("missing incident_enrichment.json artifact"))?;
+                let artifact: crawfish_types::IncidentEnrichmentArtifact =
+                    load_json_artifact(artifact_ref).await?;
+                let mut findings = Vec::new();
+                let has_signal = !artifact.probable_blast_radius.is_empty()
+                    || !artifact.error_signatures.is_empty()
+                    || !artifact.repeated_symptoms.is_empty();
+                let status = if has_signal && !artifact.next_steps.is_empty() {
+                    crawfish_types::EvaluationStatus::Passed
+                } else {
+                    if !has_signal {
+                        findings.push(
+                            "incident enrichment lacks blast radius or signal evidence".to_string(),
+                        );
+                    }
+                    if artifact.next_steps.is_empty() {
+                        findings
+                            .push("incident enrichment lacks deterministic next steps".to_string());
+                    }
+                    crawfish_types::EvaluationStatus::NeedsReview
+                };
+                Ok(EvaluationRecord {
+                    id: Uuid::new_v4().to_string(),
+                    action_id: action.id.clone(),
+                    evaluator: hook.to_string(),
+                    status,
+                    score: Some(if findings.is_empty() { 1.0 } else { 0.6 }),
+                    summary: "Deterministic scorecard for incident.enrich".to_string(),
+                    findings,
+                    feedback_note_id: None,
+                    created_at: now_timestamp(),
+                })
+            }
+            _ => Err(anyhow::anyhow!(
+                "deterministic evaluation is not implemented for {}",
+                action.capability
+            )),
+        }
+    }
+
+    async fn maybe_enqueue_review_item(
+        &self,
+        action: &Action,
+        evaluation: Option<&EvaluationRecord>,
+    ) -> anyhow::Result<Option<ReviewQueueItem>> {
+        let Some(evaluation) = evaluation else {
+            return Ok(None);
+        };
+        let Some(hook) = effective_evaluation_hook(action) else {
+            return Ok(None);
+        };
+        let should_queue = hook == "operator_review_queue"
+            || matches!(
+                evaluation.status,
+                crawfish_types::EvaluationStatus::NeedsReview
+                    | crawfish_types::EvaluationStatus::Failed
+            );
+        if !should_queue {
+            return Ok(None);
+        }
+        Ok(Some(ReviewQueueItem {
+            id: Uuid::new_v4().to_string(),
+            action_id: action.id.clone(),
+            source: hook,
+            status: ReviewQueueStatus::Open,
+            summary: evaluation.summary.clone(),
+            evaluation_ref: Some(evaluation.id.clone()),
+            created_at: now_timestamp(),
+            resolved_at: None,
+            resolution: None,
+        }))
+    }
+
+    fn policy_incidents_for_action(
+        &self,
+        action: &Action,
+        evaluation: Option<&EvaluationRecord>,
+    ) -> Vec<PolicyIncident> {
+        let doctrine = default_doctrine_pack(action);
+        let mut incidents = Vec::new();
+        if action.capability == "workspace.patch.apply" {
+            incidents.push(PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: doctrine.id.clone(),
+                jurisdiction: doctrine.jurisdiction.clone(),
+                code: "frontier_gap_mutation_post_result_review".to_string(),
+                summary:
+                    "Mutation completed without evaluation-spine review; doctrine is ahead of enforcement."
+                        .to_string(),
+                severity: crawfish_types::PolicyIncidentSeverity::Warning,
+                checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                created_at: now_timestamp(),
+            });
+        }
+        if let Some(hook) = action.contract.quality.evaluation_hook.as_deref() {
+            if !matches!(hook, "deterministic_scorecard" | "operator_review_queue") {
+                incidents.push(PolicyIncident {
+                    id: Uuid::new_v4().to_string(),
+                    action_id: action.id.clone(),
+                    doctrine_pack_id: doctrine.id.clone(),
+                    jurisdiction: doctrine.jurisdiction.clone(),
+                    code: "unsupported_evaluation_hook".to_string(),
+                    summary: format!(
+                        "Required post-result evaluation hook `{hook}` is not supported by the runtime."
+                    ),
+                    severity: crawfish_types::PolicyIncidentSeverity::Critical,
+                    checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                    created_at: now_timestamp(),
+                });
+            }
+        }
+        if let Some(evaluation) = evaluation {
+            if matches!(evaluation.status, crawfish_types::EvaluationStatus::Failed) {
+                incidents.push(PolicyIncident {
+                    id: Uuid::new_v4().to_string(),
+                    action_id: action.id.clone(),
+                    doctrine_pack_id: doctrine.id.clone(),
+                    jurisdiction: doctrine.jurisdiction.clone(),
+                    code: "evaluation_failed".to_string(),
+                    summary: evaluation.summary.clone(),
+                    severity: crawfish_types::PolicyIncidentSeverity::Warning,
+                    checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                    created_at: now_timestamp(),
+                });
+            }
+        }
+        incidents
+    }
+
+    fn post_result_enforcement_gap_reason(
+        &self,
+        action: &Action,
+        evaluation: Option<&EvaluationRecord>,
+        incidents: &[PolicyIncident],
+    ) -> Option<String> {
+        if incidents
+            .iter()
+            .any(|incident| incident.code == "unsupported_evaluation_hook")
+        {
+            return Some(
+                "post-result doctrine requires an evaluation hook the runtime cannot enforce"
+                    .to_string(),
+            );
+        }
+        if action.capability == "workspace.patch.apply" && evaluation.is_none() {
+            return None;
+        }
+        None
+    }
+
+    fn alert_rules_for_action(
+        &self,
+        _action: &Action,
+        evaluation: Option<&EvaluationRecord>,
+        incidents: &[PolicyIncident],
+    ) -> Vec<crawfish_types::AlertRule> {
+        let mut rules = Vec::new();
+        if incidents.iter().any(|incident| {
+            matches!(
+                incident.severity,
+                crawfish_types::PolicyIncidentSeverity::Warning
+                    | crawfish_types::PolicyIncidentSeverity::Critical
+            )
+        }) {
+            rules.push(crawfish_types::AlertRule {
+                id: "frontier_gap_detected".to_string(),
+                name: "Frontier gap detected".to_string(),
+                trigger: "policy_incident".to_string(),
+                severity: "warning".to_string(),
+            });
+        }
+        if evaluation
+            .map(|evaluation| {
+                matches!(
+                    evaluation.status,
+                    crawfish_types::EvaluationStatus::Failed
+                        | crawfish_types::EvaluationStatus::NeedsReview
+                )
+            })
+            .unwrap_or(false)
+        {
+            rules.push(crawfish_types::AlertRule {
+                id: "evaluation_attention_required".to_string(),
+                name: "Evaluation attention required".to_string(),
+                trigger: "evaluation".to_string(),
+                severity: "info".to_string(),
+            });
+        }
+        rules
+    }
+
+    async fn record_verification_evaluation(
+        &self,
+        action: &Action,
+        iteration: u32,
+        summary: &VerificationSummary,
+        feedback: Option<&String>,
+    ) -> anyhow::Result<()> {
+        let evaluation = EvaluationRecord {
+            id: Uuid::new_v4().to_string(),
+            action_id: action.id.clone(),
+            evaluator: "verify_loop".to_string(),
+            status: match summary.status {
+                VerificationStatus::Passed => crawfish_types::EvaluationStatus::Passed,
+                VerificationStatus::Failed | VerificationStatus::BudgetExhausted => {
+                    crawfish_types::EvaluationStatus::Failed
+                }
+            },
+            score: None,
+            summary: format!(
+                "verify_loop iteration {iteration} {}",
+                runtime_enum_to_snake(&summary.status)
+            ),
+            findings: feedback.into_iter().cloned().collect(),
+            feedback_note_id: None,
+            created_at: now_timestamp(),
+        };
+        self.store.insert_evaluation(&evaluation).await?;
+        self.store
+            .append_action_event(
+                &action.id,
+                "evaluation_recorded",
+                serde_json::json!({
+                    "evaluation_id": evaluation.id,
+                    "evaluator": evaluation.evaluator,
+                    "status": format!("{:?}", evaluation.status).to_lowercase(),
+                    "iteration": iteration,
+                }),
+            )
+            .await?;
+        if !matches!(summary.status, VerificationStatus::Passed) {
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "alert_triggered",
+                    serde_json::json!({
+                        "rule_id": "verification_attention_required",
+                        "name": "Verification attention required",
+                        "trigger": "verify_loop",
+                        "severity": "info",
+                    }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn run_deterministic_executor<E>(
         &self,
         action: &mut Action,
@@ -971,6 +1514,13 @@ impl Supervisor {
                         .await?;
 
                     if verification.passed {
+                        self.record_verification_evaluation(
+                            action,
+                            iteration,
+                            &verification.summary,
+                            verification.feedback.as_ref(),
+                        )
+                        .await?;
                         self.store
                             .append_action_event(
                                 &action.id,
@@ -1021,6 +1571,13 @@ impl Supervisor {
                             }),
                         )
                         .await?;
+                    self.record_verification_evaluation(
+                        action,
+                        iteration,
+                        &verification.summary,
+                        verification.feedback.as_ref(),
+                    )
+                    .await?;
 
                     previous_artifact_refs =
                         merge_artifact_refs(previous_artifact_refs, outputs.artifacts.clone());
@@ -1131,6 +1688,13 @@ impl Supervisor {
                 }),
             )
             .await?;
+        self.record_verification_evaluation(
+            action,
+            max_iterations,
+            &summary,
+            carried_feedback.as_ref(),
+        )
+        .await?;
         let mut outputs = ActionOutputs {
             summary: Some("task.plan exhausted its verification budget".to_string()),
             artifacts: previous_artifact_refs.clone(),
@@ -1808,6 +2372,7 @@ impl Supervisor {
                         }),
                     )
                     .await?;
+                self.postprocess_terminal_action(&mut action).await?;
             }
             Ok(ExecutionOutcome::Blocked {
                 reason,
@@ -1838,6 +2403,7 @@ impl Supervisor {
                         }),
                     )
                     .await?;
+                self.postprocess_terminal_action(&mut action).await?;
             }
             Ok(ExecutionOutcome::Failed {
                 reason,
@@ -1873,6 +2439,7 @@ impl Supervisor {
                         }),
                     )
                     .await?;
+                self.postprocess_terminal_action(&mut action).await?;
             }
             Err(error) => {
                 let reason = error.to_string();
@@ -1889,6 +2456,7 @@ impl Supervisor {
                         }),
                     )
                     .await?;
+                self.postprocess_terminal_action(&mut action).await?;
             }
         }
 
@@ -3178,6 +3746,48 @@ fn failure_code_verification_spec_invalid() -> &'static str {
     "verification_spec_invalid"
 }
 
+fn failure_code_policy_enforcement_gap() -> &'static str {
+    "policy_enforcement_gap"
+}
+
+fn effective_evaluation_hook(action: &Action) -> Option<String> {
+    action
+        .contract
+        .quality
+        .evaluation_hook
+        .clone()
+        .or_else(|| match action.capability.as_str() {
+            "task.plan" | "coding.patch.plan" => Some("operator_review_queue".to_string()),
+            "repo.review" | "incident.enrich" => Some("deterministic_scorecard".to_string()),
+            _ => None,
+        })
+}
+
+fn runtime_enum_to_snake<T: std::fmt::Debug>(value: &T) -> String {
+    format!("{value:?}")
+        .chars()
+        .enumerate()
+        .fold(String::new(), |mut acc, (index, ch)| {
+            if ch.is_ascii_uppercase() {
+                if index != 0 {
+                    acc.push('_');
+                }
+                acc.extend(ch.to_lowercase());
+            } else {
+                acc.push(ch);
+            }
+            acc
+        })
+}
+
+fn objective_tokens(objective: &str) -> Vec<String> {
+    objective
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| token.len() >= 4)
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
 fn lease_failure_code(reason: &str) -> &'static str {
     if reason.contains("revoked") {
         failure_code_lease_revoked()
@@ -3256,6 +3866,164 @@ struct WorkspaceLockAcquisition {
 enum WorkspaceLockAttempt {
     Acquired(WorkspaceLockAcquisition),
     Conflict(crawfish_types::WorkspaceLockDetail),
+}
+
+fn jurisdiction_class_for_action(
+    action: &Action,
+    encounter: Option<&EncounterRecord>,
+) -> JurisdictionClass {
+    if action
+        .selected_executor
+        .as_deref()
+        .map(|executor| executor.starts_with("openclaw."))
+        .unwrap_or(false)
+    {
+        return JurisdictionClass::RemoteHarness;
+    }
+
+    match encounter.map(|encounter| &encounter.trust_domain) {
+        Some(TrustDomain::SameOwnerLocal) => JurisdictionClass::SameOwnerLocal,
+        Some(TrustDomain::SameDeviceForeignOwner) => JurisdictionClass::SameDeviceForeignOwner,
+        Some(_) => JurisdictionClass::ExternalUnknown,
+        None => JurisdictionClass::ExternalUnknown,
+    }
+}
+
+fn default_doctrine_pack(action: &Action) -> DoctrinePack {
+    let jurisdiction = jurisdiction_class_for_action(action, None);
+    let mut rules = vec![
+        crawfish_types::DoctrineRule {
+            id: "explicit_jurisdiction".to_string(),
+            title: "Explicit jurisdiction before action".to_string(),
+            summary: "Authority must be classified before execution begins.".to_string(),
+            required_checkpoints: vec![crawfish_types::OversightCheckpoint::Admission],
+        },
+        crawfish_types::DoctrineRule {
+            id: "dispatch_under_control".to_string(),
+            title: "Dispatch under control".to_string(),
+            summary: "Execution surfaces are selected by the control plane, not by ambient trust."
+                .to_string(),
+            required_checkpoints: vec![crawfish_types::OversightCheckpoint::PreDispatch],
+        },
+        crawfish_types::DoctrineRule {
+            id: "results_need_evidence".to_string(),
+            title: "Results need evidence".to_string(),
+            summary:
+                "Terminal outputs require traceable evidence and, when configured, evaluation."
+                    .to_string(),
+            required_checkpoints: vec![crawfish_types::OversightCheckpoint::PostResult],
+        },
+    ];
+    if action.capability == "workspace.patch.apply" {
+        rules.push(crawfish_types::DoctrineRule {
+            id: "mutations_need_gate".to_string(),
+            title: "Mutations need an enforceable gate".to_string(),
+            summary: "Mutation must pass an explicit pre-mutation gate before write commit."
+                .to_string(),
+            required_checkpoints: vec![crawfish_types::OversightCheckpoint::PreMutation],
+        });
+    }
+    DoctrinePack {
+        id: "swarm_frontier_v1".to_string(),
+        title: "Swarm frontier doctrine".to_string(),
+        summary: "Constitutions do not enforce themselves; runtime checkpoints and evidence do."
+            .to_string(),
+        jurisdiction,
+        rules,
+    }
+}
+
+fn checkpoint_status_for_action(
+    action: &Action,
+    doctrine: &DoctrinePack,
+    trace: Option<&TraceBundle>,
+    latest_evaluation: Option<&EvaluationRecord>,
+) -> Vec<CheckpointStatus> {
+    use crawfish_types::{CheckpointOutcome, OversightCheckpoint};
+
+    let requires = |checkpoint: OversightCheckpoint| {
+        doctrine
+            .rules
+            .iter()
+            .any(|rule| rule.required_checkpoints.contains(&checkpoint))
+    };
+
+    vec![
+        CheckpointStatus {
+            checkpoint: OversightCheckpoint::Admission,
+            required: requires(OversightCheckpoint::Admission),
+            outcome: CheckpointOutcome::Passed,
+            reason: Some("action entered the control plane through admission".to_string()),
+        },
+        CheckpointStatus {
+            checkpoint: OversightCheckpoint::PreDispatch,
+            required: requires(OversightCheckpoint::PreDispatch),
+            outcome: if action.selected_executor.is_some()
+                || matches!(
+                    action.phase,
+                    ActionPhase::Completed | ActionPhase::Failed | ActionPhase::Blocked
+                ) {
+                CheckpointOutcome::Passed
+            } else {
+                CheckpointOutcome::Pending
+            },
+            reason: action
+                .selected_executor
+                .as_ref()
+                .map(|executor| format!("executor selected: {executor}")),
+        },
+        CheckpointStatus {
+            checkpoint: OversightCheckpoint::PreMutation,
+            required: requires(OversightCheckpoint::PreMutation),
+            outcome: if action.capability != "workspace.patch.apply" {
+                CheckpointOutcome::Skipped
+            } else if action.lock_detail.is_some() || action.phase == ActionPhase::Completed {
+                CheckpointOutcome::Passed
+            } else if action.phase == ActionPhase::AwaitingApproval {
+                CheckpointOutcome::Pending
+            } else {
+                CheckpointOutcome::Failed
+            },
+            reason: if action.capability != "workspace.patch.apply" {
+                Some("capability is proposal-only".to_string())
+            } else {
+                action.failure_reason.clone()
+            },
+        },
+        CheckpointStatus {
+            checkpoint: OversightCheckpoint::PostResult,
+            required: requires(OversightCheckpoint::PostResult),
+            outcome: if !matches!(
+                action.phase,
+                ActionPhase::Completed
+                    | ActionPhase::Failed
+                    | ActionPhase::Blocked
+                    | ActionPhase::Expired
+            ) {
+                CheckpointOutcome::Pending
+            } else if trace.is_some()
+                && (!evaluation_required_for_action(action) || latest_evaluation.is_some())
+            {
+                CheckpointOutcome::Passed
+            } else {
+                CheckpointOutcome::Failed
+            },
+            reason: if trace.is_none() {
+                Some("trace bundle not available".to_string())
+            } else if evaluation_required_for_action(action) && latest_evaluation.is_none() {
+                Some("evaluation required but missing".to_string())
+            } else {
+                Some("terminal evidence present".to_string())
+            },
+        },
+    ]
+}
+
+fn evaluation_required_for_action(action: &Action) -> bool {
+    matches!(
+        action.capability.as_str(),
+        "task.plan" | "coding.patch.plan" | "repo.review" | "incident.enrich"
+    ) || action.contract.quality.evaluation_hook.is_some()
 }
 
 fn action_phase_name(phase: &ActionPhase) -> &'static str {
@@ -3347,6 +4115,73 @@ impl SupervisorControl for Supervisor {
         })
     }
 
+    async fn get_action_trace(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Option<ActionTraceResponse>> {
+        Ok(self
+            .store
+            .get_trace_bundle(action_id)
+            .await?
+            .map(|trace| ActionTraceResponse { trace }))
+    }
+
+    async fn list_action_evaluations(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<ActionEvaluationsResponse> {
+        Ok(ActionEvaluationsResponse {
+            evaluations: self.store.list_evaluations(action_id).await?,
+        })
+    }
+
+    async fn list_review_queue(&self) -> anyhow::Result<ReviewQueueResponse> {
+        Ok(ReviewQueueResponse {
+            items: self.store.list_review_queue_items().await?,
+        })
+    }
+
+    async fn resolve_review_queue_item(
+        &self,
+        review_id: &str,
+        request: ResolveReviewQueueItemRequest,
+    ) -> anyhow::Result<ResolveReviewQueueItemResponse> {
+        let mut item = self
+            .store
+            .list_review_queue_items()
+            .await?
+            .into_iter()
+            .find(|item| item.id == review_id)
+            .ok_or_else(|| anyhow::anyhow!("review item not found: {review_id}"))?;
+        item.status = ReviewQueueStatus::Resolved;
+        item.resolved_at = Some(now_timestamp());
+        item.resolution = Some(request.resolution.clone());
+        self.store.resolve_review_queue_item(&item).await?;
+        if let Some(note) = request.note {
+            let feedback = FeedbackNote {
+                id: Uuid::new_v4().to_string(),
+                action_id: item.action_id.clone(),
+                source: request.resolver_ref,
+                body: note,
+                created_at: now_timestamp(),
+            };
+            self.store.insert_feedback_note(&feedback).await?;
+            if let Some(evaluation_id) = &item.evaluation_ref {
+                if let Some(mut evaluation) = self
+                    .store
+                    .list_evaluations(&item.action_id)
+                    .await?
+                    .into_iter()
+                    .find(|evaluation| &evaluation.id == evaluation_id)
+                {
+                    evaluation.feedback_note_id = Some(feedback.id.clone());
+                    self.store.insert_evaluation(&evaluation).await?;
+                }
+            }
+        }
+        Ok(ResolveReviewQueueItemResponse { item })
+    }
+
     async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<AgentDetail>> {
         let manifest = self.store.get_agent_manifest(agent_id).await?;
         let lifecycle = self.store.get_lifecycle_record(agent_id).await?;
@@ -3400,6 +4235,22 @@ impl SupervisorControl for Supervisor {
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok())
             });
+        let policy_incidents = self.store.list_policy_incidents(action_id).await?;
+        let latest_evaluation = self
+            .store
+            .list_evaluations(action_id)
+            .await?
+            .into_iter()
+            .last();
+        let doctrine_summary = Some(default_doctrine_pack(&action));
+        let jurisdiction_class = Some(jurisdiction_class_for_action(&action, encounter.as_ref()));
+        let trace_bundle = self.store.get_trace_bundle(action_id).await?;
+        let checkpoint_status = checkpoint_status_for_action(
+            &action,
+            doctrine_summary.as_ref().expect("doctrine summary"),
+            trace_bundle.as_ref(),
+            latest_evaluation.as_ref(),
+        );
         Ok(Some(ActionDetail {
             artifact_refs: action.outputs.artifacts.clone(),
             selected_executor: action.selected_executor.clone(),
@@ -3417,6 +4268,11 @@ impl SupervisorControl for Supervisor {
             },
             terminal_code: action.failure_code.clone(),
             lock_detail: action.lock_detail.clone(),
+            jurisdiction_class,
+            doctrine_summary,
+            checkpoint_status,
+            policy_incidents,
+            latest_evaluation,
             action,
             encounter,
             latest_audit_receipt: audit_receipt,
@@ -4034,9 +4890,19 @@ fn api_router(supervisor: Arc<Supervisor>) -> Router {
         )
         .route("/v1/actions/{id}", get(action_detail_handler))
         .route("/v1/actions/{id}/events", get(action_events_handler))
+        .route("/v1/actions/{id}/trace", get(action_trace_handler))
+        .route(
+            "/v1/actions/{id}/evaluations",
+            get(action_evaluations_handler),
+        )
         .route("/v1/actions/{id}/approve", post(approve_action_handler))
         .route("/v1/actions/{id}/reject", post(reject_action_handler))
         .route("/v1/leases/{id}/revoke", post(revoke_lease_handler))
+        .route("/v1/review-queue", get(review_queue_handler))
+        .route(
+            "/v1/review-queue/{id}/resolve",
+            post(resolve_review_queue_item_handler),
+        )
         .route(
             "/v1/inbound/openclaw/actions",
             post(openclaw_submit_action_handler),
@@ -4124,6 +4990,40 @@ async fn action_events_handler(
     Ok(Json(
         supervisor
             .list_action_events(&id)
+            .await
+            .map_err(RuntimeError::Internal)?,
+    ))
+}
+
+async fn action_trace_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ActionTraceResponse>, RuntimeError> {
+    supervisor
+        .get_action_trace(&id)
+        .await
+        .map_err(RuntimeError::Internal)?
+        .map(Json)
+        .ok_or_else(|| RuntimeError::NotFound(format!("action not found: {id}")))
+}
+
+async fn action_evaluations_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ActionEvaluationsResponse>, RuntimeError> {
+    if supervisor
+        .store()
+        .get_action(&id)
+        .await
+        .map_err(RuntimeError::Internal)?
+        .is_none()
+    {
+        return Err(RuntimeError::NotFound(format!("action not found: {id}")));
+    }
+
+    Ok(Json(
+        supervisor
+            .list_action_evaluations(&id)
             .await
             .map_err(RuntimeError::Internal)?,
     ))
@@ -4237,6 +5137,35 @@ async fn revoke_lease_handler(
         Err(error) => {
             let message = error.to_string();
             if message.starts_with("capability lease not found:") {
+                Err(RuntimeError::NotFound(message))
+            } else {
+                Err(RuntimeError::BadRequest(message))
+            }
+        }
+    }
+}
+
+async fn review_queue_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+) -> Result<Json<ReviewQueueResponse>, RuntimeError> {
+    Ok(Json(
+        supervisor
+            .list_review_queue()
+            .await
+            .map_err(RuntimeError::Internal)?,
+    ))
+}
+
+async fn resolve_review_queue_item_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ResolveReviewQueueItemRequest>,
+) -> Result<Json<ResolveReviewQueueItemResponse>, RuntimeError> {
+    match supervisor.resolve_review_queue_item(&id, request).await {
+        Ok(response) => Ok(Json(response)),
+        Err(error) => {
+            let message = error.to_string();
+            if message.starts_with("review queue item not found:") {
                 Err(RuntimeError::NotFound(message))
             } else {
                 Err(RuntimeError::BadRequest(message))
@@ -4525,6 +5454,41 @@ mod tests {
         }
     }
 
+    fn task_plan_request(dir: &Path, objective: &str) -> SubmitActionRequest {
+        SubmitActionRequest {
+            target_agent_id: "task_planner".to_string(),
+            requester: RequesterRef {
+                kind: RequesterKind::User,
+                id: "operator".to_string(),
+            },
+            initiator_owner: local_owner("local-dev"),
+            capability: "task.plan".to_string(),
+            goal: crawfish_types::GoalSpec {
+                summary: objective.to_string(),
+                details: None,
+            },
+            inputs: std::collections::BTreeMap::from([
+                ("objective".to_string(), serde_json::json!(objective)),
+                (
+                    "workspace_root".to_string(),
+                    serde_json::json!(dir.display().to_string()),
+                ),
+                (
+                    "desired_outputs".to_string(),
+                    serde_json::json!(["plan", "risks"]),
+                ),
+            ]),
+            contract_overrides: None,
+            execution_strategy: None,
+            schedule: None,
+            counterparty_refs: Vec::new(),
+            data_boundary: None,
+            workspace_write: false,
+            secret_access: false,
+            mutating: false,
+        }
+    }
+
     async fn write_executable_script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         tokio::fs::write(&path, body).await.unwrap();
@@ -4641,6 +5605,21 @@ workspace_policy = "crawfish_managed"
             .uri(uri)
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(serde_json::to_vec(payload).unwrap())))
+            .unwrap();
+        let response = client.request(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&body).unwrap();
+        (status, json)
+    }
+
+    async fn get_uds_json(socket_path: &Path, endpoint: &str) -> (StatusCode, Value) {
+        let client: Client<hyperlocal::UnixConnector, Full<Bytes>> = Client::unix();
+        let uri: Uri = hyperlocal::Uri::new(socket_path, endpoint).into();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
             .unwrap();
         let response = client.request(request).await.unwrap();
         let status = response.status();
@@ -6869,6 +7848,236 @@ depends_on = []
         assert!(body["error"].as_str().unwrap().contains("cannot inspect"));
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn task_plan_emits_trace_evaluations_and_review_queue_items() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Plan a rollout investigation for the local swarm runtime",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(
+            detail.jurisdiction_class,
+            Some(JurisdictionClass::SameOwnerLocal)
+        );
+        assert!(detail.doctrine_summary.is_some());
+        assert!(detail
+            .checkpoint_status
+            .iter()
+            .any(|status| status.checkpoint == crawfish_types::OversightCheckpoint::PostResult));
+        assert!(detail.latest_evaluation.is_some());
+
+        let (handle, socket_path) = spawn_api_server(Arc::clone(&supervisor)).await;
+
+        let (status, trace_payload) = get_uds_json(
+            &socket_path,
+            &format!("/v1/actions/{}/trace", submitted.action_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(trace_payload["trace"]["action_id"], submitted.action_id);
+        assert!(trace_payload["trace"]["enforcement_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["checkpoint"] == "post_result"));
+
+        let (status, eval_payload) = get_uds_json(
+            &socket_path,
+            &format!("/v1/actions/{}/evaluations", submitted.action_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!eval_payload["evaluations"].as_array().unwrap().is_empty());
+
+        let (status, review_payload) = get_uds_json(&socket_path, "/v1/review-queue").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(review_payload["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["action_id"] == submitted.action_id));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn review_queue_resolution_creates_feedback_note() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Plan a deterministic incident response drill",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let review_item = supervisor
+            .list_review_queue()
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.action_id == submitted.action_id)
+            .expect("review queue item");
+
+        let resolved = supervisor
+            .resolve_review_queue_item(
+                &review_item.id,
+                ResolveReviewQueueItemRequest {
+                    resolver_ref: "operator-1".to_string(),
+                    resolution: "approved_for_followup".to_string(),
+                    note: Some("Keep this plan as the baseline for the next run.".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.item.status, ReviewQueueStatus::Resolved);
+
+        let evaluations = supervisor
+            .list_action_evaluations(&submitted.action_id)
+            .await
+            .unwrap();
+        let feedback_id = evaluations
+            .evaluations
+            .iter()
+            .find_map(|evaluation| evaluation.feedback_note_id.clone())
+            .expect("feedback note id");
+        let feedback = supervisor
+            .store()
+            .get_feedback_note(&feedback_id)
+            .await
+            .unwrap()
+            .expect("feedback note");
+        assert_eq!(feedback.action_id, submitted.action_id);
+        assert!(feedback.body.contains("baseline"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_evaluation_hook_creates_frontier_gap_and_blocks_result() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "repo_reviewer".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: local_owner("local-dev"),
+                capability: "repo.review".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "Review this repo change".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "changed_files".to_string(),
+                        serde_json::json!(["src/lib.rs"]),
+                    ),
+                ]),
+                contract_overrides: Some(ExecutionContractPatch {
+                    quality: crawfish_core::QualityPolicyPatch {
+                        evaluation_hook: Some(Some("rubric_scorecard".to_string())),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Blocked);
+        assert_eq!(
+            detail.terminal_code.as_deref(),
+            Some("policy_enforcement_gap")
+        );
+        assert!(detail
+            .policy_incidents
+            .iter()
+            .any(|incident| incident.code == "unsupported_evaluation_hook"));
+    }
+
+    #[tokio::test]
+    async fn workspace_mutation_surfaces_frontier_gap_incident() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(workspace_patch_request(
+                dir.path(),
+                serde_json::json!([
+                    {
+                        "path": "frontier.txt",
+                        "op": "create",
+                        "contents": "frontier\n"
+                    }
+                ]),
+                None,
+            ))
+            .await
+            .unwrap();
+        supervisor
+            .approve_action(
+                &submitted.action_id,
+                ApproveActionRequest {
+                    approver_ref: "local-dev".to_string(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert!(detail
+            .policy_incidents
+            .iter()
+            .any(|incident| incident.code == "frontier_gap_mutation_post_result_review"));
+        assert!(detail
+            .checkpoint_status
+            .iter()
+            .any(|status| status.checkpoint == crawfish_types::OversightCheckpoint::PreMutation));
     }
 
     #[tokio::test]
