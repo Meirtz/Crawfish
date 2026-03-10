@@ -15,6 +15,7 @@ DOCX_OUT = ROOT / "docs" / "exports" / "Crawfish-PRD.docx"
 
 DOC_ORDER = [
     ROOT / "README.md",
+    ROOT / "docs" / "spec" / "philosophy.md",
     ROOT / "docs" / "spec" / "vision.md",
     ROOT / "docs" / "spec" / "architecture.md",
     ROOT / "docs" / "spec" / "v0.1-plan.md",

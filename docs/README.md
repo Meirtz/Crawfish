@@ -17,10 +17,17 @@ The source of truth for product definition and architecture is the Markdown set 
 
 Current spec entry points:
 
+- [`spec/philosophy.md`](spec/philosophy.md)
 - [`spec/vision.md`](spec/vision.md)
 - [`spec/architecture.md`](spec/architecture.md)
 - [`spec/v0.1-plan.md`](spec/v0.1-plan.md)
 - [`spec/glossary.md`](spec/glossary.md)
+
+The implementation boundary is **Rust-first, not Rust-only**:
+
+- the runtime, control plane, storage, and native outbound adapters live in the Cargo workspace
+- isolated edge bridges may live under [`../integrations/`](../integrations/)
+- the current example is the thin OpenClaw inbound bridge at [`../integrations/openclaw-inbound/`](../integrations/openclaw-inbound/)
 
 ## Project Governance
 
@@ -44,7 +51,7 @@ The live alpha example swarm is tracked under:
 - [`../examples/hero-swarm/agents/workspace_editor.toml`](../examples/hero-swarm/agents/workspace_editor.toml)
 - [`../integrations/openclaw-inbound/`](../integrations/openclaw-inbound/)
 
-That example is the current implementation reference for Hero P0 plus `P1a` inbound interop: deterministic `repo.index`, deterministic-first `repo.review`, `ci_triage` with either direct log input or SSE MCP-backed log fetch, approval-gated local mutation through `workspace_editor`, and OpenClaw Gateway RPC ingress through the isolated bridge package.
+That example is the current implementation reference for Hero P0 plus the first OpenClaw interop slices: deterministic `repo.index`, deterministic-first `repo.review`, `ci_triage` with either direct log input or SSE MCP-backed log fetch, approval-gated local mutation through `workspace_editor`, proposal-oriented `task.plan` with `verify_loop`, and OpenClaw Gateway ingress through the isolated bridge package.
 
 ## Export Policy
 

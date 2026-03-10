@@ -1,6 +1,7 @@
 # Crawfish Vision
 
 Canonical terminology is defined in [`glossary.md`](glossary.md).
+Forward-looking design principles are defined in [`philosophy.md`](philosophy.md).
 
 ## Product Thesis
 
@@ -21,10 +22,12 @@ Crawfish is built around eight philosophical commitments:
 - **Agency must be bounded.** Useful agents are allowed to act, but only through explicit capability, contract, and policy boundaries.
 - **Specialization beats monolithic omniscience.** A general runtime should compose many specialized tools and harnesses rather than pretending one universal agent is always best.
 - **Harnesses are plentiful; operability is scarce.** The strategic gap is not one more reasoning surface. It is the runtime layer that can govern many reasoning surfaces together.
+- **Reasoning is volatile; verification must survive model churn.** The runtime should trust deterministic checks and contracts more than any temporary model quality spike.
 - **Governance is not optional.** When agents can roam, persist, and encounter each other across owners and contexts, the runtime must supply law-like boundaries, not only scheduling logic.
 - **Interoperability should be layered.** Tool interoperability, harness interoperability, and remote-agent interoperability are different problems and should not be collapsed into one transport abstraction.
 - **Graceful degradation is better than brittle autonomy.** A production system should shrink safely under pressure before it fails hard.
 - **Continuity matters more than peak cleverness.** The product is judged by the safest useful work it can keep doing when the reasoning layer is impaired, not only by the best-case intelligence of a healthy model route.
+- **Institutions lag capability growth.** Runtime guardrails, encounter policy, and revocation semantics should arrive before the ecosystem feels fully comfortable with them.
 
 ## Agent Philosophy
 
@@ -337,7 +340,7 @@ This hero demo is better than a generic chatbot because it makes the product's d
 P1 extends the story in two concrete ways:
 
 - an OpenClaw session or plugin can submit work into Crawfish for durable execution
-- proposal-only actions such as `task.plan` can route out to OpenClaw or another harness and later run under a Ralph-style verify loop when verification is required
+- proposal-only actions such as `task.plan` can already route out to OpenClaw or another harness and run under a verified execution strategy when deterministic proof is required
 - a same-device foreign-owner agent encounter must pass encounter policy, explicit consent, and revocable leasing before it can cross local boundaries
 
 ## Product Principles
@@ -434,7 +437,7 @@ This boundary keeps Crawfish useful beyond autonomous coding while still letting
 | repair loop success rate | measures whether automatic repair meaningfully restores service | tracked after self-repair baseline ships |
 | encounter audit coverage | measures whether cross-owner interactions leave formal governance evidence | required for every same-device foreign-owner path before beta |
 | lease revocation effectiveness | measures whether withdrawn capability actually stops future work | tracked once encounter enforcement ships |
-| verified execution completion rate | measures whether verify-loop actions can finish under deterministic checks rather than self-reported success | tracked once OpenClaw and Ralph-style strategies ship |
+| verified execution completion rate | measures whether verify-loop actions can finish under deterministic checks rather than self-reported success | tracked now for `task.plan`, then expanded to later strategy classes |
 | harness routing recovery rate | measures whether specialized harnesses can fail without collapsing the swarm | tracked after ACP-compatible adapters are introduced |
 | time to inspect failure cause | measures operator ergonomics | under 2 minutes through CLI and telemetry |
 | local hello-world time | measures onboarding friction | under 10 minutes |

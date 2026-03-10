@@ -1,6 +1,7 @@
 # Crawfish Architecture Spec
 
 Canonical terminology is defined in [`glossary.md`](glossary.md).
+Forward-looking design principles are defined in [`philosophy.md`](philosophy.md).
 
 ## Scope
 
@@ -8,7 +9,7 @@ This document defines the runtime architecture for Crawfish v0.1 and the stable 
 
 ## Design Constraints
 
-- Rust-first runtime with Rust 1.88+ compatibility.
+- Rust-first, not Rust-only, with Rust 1.88+ compatibility for the runtime spine.
 - External protocol adapters may be implemented out of process in other languages, but the core runtime, CLI, state machine logic, and persistence layer are Rust-owned.
 - Single-host mode must be easy to run locally.
 - Same-device foreign-owner encounters must be a first-class design case, not deferred as a future federation-only concern.
@@ -25,6 +26,7 @@ The architecture follows seven product-level commitments:
 - **control is a feature**: runtime supervision, policy compilation, and inspection are core behavior, not operational afterthoughts
 - **specialization is a strength**: the runtime should coordinate specialized harnesses when they are better than a monolithic local loop
 - **harnesses are plentiful; operability is scarce**: the runtime wins by governing many execution surfaces coherently, not by replacing them with one more surface
+- **reasoning is volatile; verification must survive model churn**: contracts and deterministic checks should outlive any single provider or harness release cycle
 - **governance is not optional**: agent interaction must be governed through explicit encounter, consent, lease, and audit semantics
 - **bounded autonomy is healthier than unconstrained autonomy**: agents act through contracts and capabilities, not by implicit permission
 - **safe contraction beats silent drift**: when the system is under pressure, it should enter a declared degraded profile rather than behave unpredictably
@@ -653,7 +655,7 @@ Inbound rules:
 
 ### Outbound: Crawfish -> OpenClaw
 
-When an action requires an interactive coding loop or a gateway-native agent surface, Crawfish may select an `openclaw` binding and call the [Gateway protocol](https://docs.openclaw.ai/gateway/protocol) over WebSocket.
+When an action requires a gateway-native or harness-specialized execution surface, Crawfish may select an `openclaw` binding and call the [Gateway protocol](https://docs.openclaw.ai/gateway/protocol) over WebSocket.
 
 Outbound rules:
 
@@ -665,7 +667,7 @@ Outbound rules:
 - the current `P1b` implementation supports `session_mode = ephemeral` only
 - the current `P1b` implementation supports `workspace_policy = inherit | crawfish_managed`; `openclaw_managed` is parsed but rejected at runtime
 - `auth_ref` currently resolves to an environment variable name containing the Gateway bearer token
-- `task.plan` is the first outbound capability and remains proposal-only; mutation and verify-loop semantics are deferred
+- `task.plan` is the first outbound capability, remains proposal-only, and now defaults to `verify_loop` under deterministic verification
 
 ### Shared Governance Kernel
 
@@ -684,9 +686,9 @@ Execution strategy is orthogonal to adapter choice. A task might run through Ope
 | Strategy | Use when | Completion rule |
 | --- | --- | --- |
 | `single_pass` | straightforward analysis, enrichment, classification, or low-risk proposal work | normal terminal success and contract satisfaction |
-| `verify_loop` | patch planning, patch application, migration, or spec-to-code work that must be proven rather than asserted | deterministic verification passes or stop budget is exhausted |
+| `verify_loop` | proposal, planning, investigation, migration, or mutation-sensitive work that must be proven rather than asserted | deterministic verification passes, handoff occurs, or stop budget is exhausted |
 
-Ralph-style loops are modeled as `verify_loop`, not as a separate runtime category. See the [Ralph prototype](https://github.com/iannuttall/ralph) and [ralph-loop-agent](https://github.com/vercel-labs/ralph-loop-agent) for the inspiration this strategy absorbs.
+Ralph-style loops are modeled as `verify_loop`, not as a separate runtime category. See the [Ralph prototype](https://github.com/iannuttall/ralph) and [ralph-loop-agent](https://github.com/vercel-labs/ralph-loop-agent) for the inspiration this strategy absorbs. In Crawfish, coding is only one early use case for verified execution, not the category anchor.
 
 ### Verify-Loop Capability Classes
 
@@ -704,7 +706,7 @@ Other actions remain `single_pass` unless a manifest explicitly opts in.
 - verify loops must use deterministic checks, not self-reported model confidence
 - each iteration should start from fresh runtime context plus explicit feedback from the previous verification round
 - verification failure feeds structured evidence back into the next attempt
-- if `stop_budget` is exhausted without a passing verification result, the action moves to `human_handoff` or `failed`
+- if `stop_budget` is exhausted without a passing verification result, the action moves to `human_handoff`, `store_and_forward`, or `failed` according to the compiled contract and current strategy behavior
 
 ### Example
 
@@ -888,7 +890,7 @@ The scheduler is deadline-aware and policy-aware.
 | team and production state | Postgres control state |
 | durable bus upgrade path | external durable bus, introduced after P0 |
 | required protocol | MCP |
-| deferred protocols | OpenClaw bidirectional interop, ACP-compatible harness adapters, and A2A in P1 |
+| protocol status | MCP in P0, OpenClaw inbound and outbound in P1, ACP-compatible harness adapters and A2A deferred |
 | external adapter boundary | JSON-RPC 2.0 over stdio |
 | telemetry | structured logs plus OpenTelemetry-compatible traces and metrics |
 

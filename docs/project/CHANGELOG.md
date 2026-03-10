@@ -24,6 +24,9 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - deterministic fallback planning for `task.plan` when the preferred OpenClaw route is unavailable
 - deprecated compatibility aliases for `[fleet]`, `coding.patch.plan`, and legacy task-planning input keys during `0.1.x alpha`
 - explicit abandoned-run lineage for restarted OpenClaw-backed actions
+- `verify_loop` as a real runtime execution strategy for `task.plan`
+- deterministic verification feedback, iteration lineage, and strategy-aware checkpoint recovery
+- a new `docs/spec/philosophy.md` manifesto and a rebuilt public README with repo-tracked hero art
 
 ### Changed
 
@@ -35,6 +38,9 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - workspace mutation now enforces workspace-scoped file locking and stable failure codes for lock, lease, approval, route, executor, and restart states
 - denied action admission now fails before encounter persistence when governance rejects the request at preflight
 - `ExecutionSurface` now returns structured outputs plus external refs and surface event batches, so harness adapters can attach run lineage without bypassing runtime inspection
+- the public project language now explicitly treats OpenClaw, Codex, Claude Code, Gemini CLI, and future adapters as specialized general-purpose harnesses rather than coding-only surfaces
+- `task_planner` now defaults `task.plan` to `verify_loop` with deterministic proof rather than plain single-pass completion
+- the public implementation boundary is now documented as Rust-first, not Rust-only
 
 ### Security
 

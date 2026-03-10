@@ -76,7 +76,7 @@ PY
     --capability task.plan \
     --goal "plan a safe task" \
     --caller-owner local-dev \
-    --inputs-json "{\"workspace_root\":\"${WORKDIR}\",\"objective\":\"Add validation checks around the repo indexing path\",\"files_of_interest\":[\"src/lib.rs\"]}" \
+    --inputs-json "{\"workspace_root\":\"${WORKDIR}\",\"objective\":\"Add validation checks around the repo indexing path\",\"files_of_interest\":[\"src/lib.rs\"],\"desired_outputs\":[\"rollout checklist\"]}" \
     --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["action_id"])')"
   cargo run -p crawfish-cli --bin crawfish -- inspect "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
   cargo run -p crawfish-cli --bin crawfish -- action events "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
