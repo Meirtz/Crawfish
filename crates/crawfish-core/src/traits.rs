@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use crawfish_types::{Action, ActionOutputs, AgentManifest, CapabilityDescriptor};
+use crawfish_types::{Action, ActionOutputs, AgentManifest, CapabilityDescriptor, ExternalRef};
+use serde_json::Value;
 
 #[async_trait]
 pub trait ActionStore: Send + Sync {
@@ -47,7 +48,20 @@ pub trait GovernanceEngine: Send + Sync {
 pub trait ExecutionSurface: Send + Sync {
     fn name(&self) -> &str;
     fn supports(&self, capability: &CapabilityDescriptor) -> bool;
-    async fn run(&self, action: &Action) -> anyhow::Result<ActionOutputs>;
+    async fn run(&self, action: &Action) -> anyhow::Result<SurfaceExecutionResult>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SurfaceExecutionResult {
+    pub outputs: ActionOutputs,
+    pub external_refs: Vec<ExternalRef>,
+    pub events: Vec<SurfaceActionEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceActionEvent {
+    pub event_type: String,
+    pub payload: Value,
 }
 
 #[async_trait]

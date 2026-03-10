@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use crawfish_core::ExecutionSurface;
+use crawfish_core::{ExecutionSurface, SurfaceExecutionResult};
 use crawfish_types::{
     Action, ActionOutputs, CapabilityDescriptor, CostClass, ExecutorClass, LatencyClass,
     McpServerConfig, McpToolBinding, Mutability, RiskClass,
@@ -82,7 +82,7 @@ impl McpAdapter {
         }
     }
 
-    async fn invoke_remote(&self, action: &Action) -> Result<ActionOutputs, McpError> {
+    async fn invoke_remote(&self, action: &Action) -> Result<SurfaceExecutionResult, McpError> {
         let binding = self
             .binding
             .clone()
@@ -136,17 +136,21 @@ impl McpAdapter {
             )
             .await?;
 
-        Ok(ActionOutputs {
-            summary: Some(extract_call_summary(&result)),
-            artifacts: Vec::new(),
-            metadata: std::collections::BTreeMap::from([
-                (
-                    "execution_surface".to_string(),
-                    serde_json::json!(self.server_name),
-                ),
-                ("mcp_tool".to_string(), serde_json::json!(binding.tool)),
-                ("mcp_result".to_string(), result),
-            ]),
+        Ok(SurfaceExecutionResult {
+            outputs: ActionOutputs {
+                summary: Some(extract_call_summary(&result)),
+                artifacts: Vec::new(),
+                metadata: std::collections::BTreeMap::from([
+                    (
+                        "execution_surface".to_string(),
+                        serde_json::json!(self.server_name),
+                    ),
+                    ("mcp_tool".to_string(), serde_json::json!(binding.tool)),
+                    ("mcp_result".to_string(), result),
+                ]),
+            },
+            external_refs: Vec::new(),
+            events: Vec::new(),
         })
     }
 }
@@ -161,21 +165,25 @@ impl ExecutionSurface for McpAdapter {
         capability.namespace.starts_with("mcp.")
     }
 
-    async fn run(&self, action: &Action) -> anyhow::Result<ActionOutputs> {
+    async fn run(&self, action: &Action) -> anyhow::Result<SurfaceExecutionResult> {
         if self.binding.is_some() && self.server_config.is_some() {
             return self.invoke_remote(action).await.map_err(Into::into);
         }
 
-        Ok(ActionOutputs {
-            summary: Some(format!(
-                "MCP execution stub for action {} on {}",
-                action.id, self.server_name
-            )),
-            artifacts: Vec::new(),
-            metadata: std::collections::BTreeMap::from([(
-                "execution_surface".to_string(),
-                serde_json::json!(self.server_name),
-            )]),
+        Ok(SurfaceExecutionResult {
+            outputs: ActionOutputs {
+                summary: Some(format!(
+                    "MCP execution stub for action {} on {}",
+                    action.id, self.server_name
+                )),
+                artifacts: Vec::new(),
+                metadata: std::collections::BTreeMap::from([(
+                    "execution_surface".to_string(),
+                    serde_json::json!(self.server_name),
+                )]),
+            },
+            external_refs: Vec::new(),
+            events: Vec::new(),
         })
     }
 }
@@ -542,6 +550,7 @@ mod tests {
             .unwrap();
 
         assert!(outputs
+            .outputs
             .summary
             .as_deref()
             .unwrap_or_default()

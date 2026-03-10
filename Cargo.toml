@@ -6,6 +6,7 @@ members = [
   "crates/crawfish-runtime",
   "crates/crawfish-cli",
   "crates/crawfish-mcp",
+  "crates/crawfish-openclaw",
   "crates/crawfish-adapter-api",
 ]
 resolver = "2"
@@ -42,6 +43,7 @@ sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "migra
 tempfile = "3.20.0"
 thiserror = "2.0.16"
 tokio = { version = "1.45.1", features = ["full"] }
+tokio-tungstenite = { version = "0.27.0", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8.23"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "json"] }

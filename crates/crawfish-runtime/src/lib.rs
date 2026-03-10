@@ -107,6 +107,7 @@ enum ExecutionOutcome {
         selected_executor: String,
         checkpoint: Option<DeterministicCheckpoint>,
         external_refs: Vec<ExternalRef>,
+        surface_events: Vec<crawfish_core::SurfaceActionEvent>,
     },
     Blocked {
         reason: String,
@@ -114,6 +115,7 @@ enum ExecutionOutcome {
         continuity_mode: Option<ContinuityModeName>,
         outputs: ActionOutputs,
         external_refs: Vec<ExternalRef>,
+        surface_events: Vec<crawfish_core::SurfaceActionEvent>,
     },
 }
 
@@ -584,6 +586,7 @@ impl Supervisor {
                     selected_executor: executor_kind.to_string(),
                     checkpoint: Some(checkpoint),
                     external_refs,
+                    surface_events: Vec::new(),
                 });
             }
         }
@@ -616,6 +619,7 @@ impl Supervisor {
             selected_executor: executor_kind.to_string(),
             checkpoint: Some(completed_checkpoint),
             external_refs,
+            surface_events: Vec::new(),
         })
     }
 
@@ -700,6 +704,7 @@ impl Supervisor {
             continuity_mode: Some(continuity_mode),
             outputs,
             external_refs,
+            surface_events: Vec::new(),
         }
     }
 
@@ -958,6 +963,7 @@ impl Supervisor {
                 selected_executor,
                 checkpoint,
                 external_refs,
+                surface_events,
             }) => {
                 action.phase = ActionPhase::Completed;
                 action.outputs = outputs;
@@ -971,6 +977,11 @@ impl Supervisor {
                         .await?;
                 }
                 self.store.upsert_action(&action).await?;
+                for event in surface_events {
+                    self.store
+                        .append_action_event(&action.id, &event.event_type, event.payload)
+                        .await?;
+                }
                 self.store
                     .append_action_event(
                         &action.id,
@@ -989,12 +1000,18 @@ impl Supervisor {
                 continuity_mode,
                 outputs,
                 external_refs,
+                surface_events,
             }) => {
                 set_action_blocked(&mut action, &failure_code, reason.clone());
                 action.continuity_mode = continuity_mode;
                 action.outputs = outputs;
                 action.external_refs = external_refs;
                 self.store.upsert_action(&action).await?;
+                for event in surface_events {
+                    self.store
+                        .append_action_event(&action.id, &event.event_type, event.payload)
+                        .await?;
+                }
                 self.store
                     .append_action_event(
                         &action.id,
@@ -1090,9 +1107,10 @@ impl Supervisor {
                 };
 
                 match adapter.run(action).await {
-                    Ok(remote_outputs) => {
+                    Ok(remote_result) => {
                         let mut derived_action = action.clone();
-                        let log_text = extract_mcp_log_text(&remote_outputs).ok_or_else(|| {
+                        let log_text =
+                            extract_mcp_log_text(&remote_result.outputs).ok_or_else(|| {
                             anyhow::anyhow!(
                                 "mcp result did not contain log_text, log_excerpt, or textual content"
                             )
@@ -1106,7 +1124,10 @@ impl Supervisor {
                                 &mut derived_action,
                                 "deterministic.ci_triage",
                                 "classifying",
-                                external_refs.clone(),
+                                merge_external_refs(
+                                    external_refs.clone(),
+                                    remote_result.external_refs.clone(),
+                                ),
                                 &executor,
                             )
                             .await?;
@@ -1114,22 +1135,28 @@ impl Supervisor {
                             outputs,
                             checkpoint,
                             external_refs: refs,
+                            surface_events,
                             ..
                         } = &mut outcome
                         {
                             outputs.metadata.insert(
                                 "mcp_summary".to_string(),
-                                serde_json::json!(remote_outputs.summary.clone()),
+                                serde_json::json!(remote_result.outputs.summary.clone()),
                             );
                             outputs.metadata.insert(
                                 "mcp_result".to_string(),
-                                remote_outputs
+                                remote_result
+                                    .outputs
                                     .metadata
                                     .get("mcp_result")
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Null),
                             );
-                            *refs = external_refs;
+                            *refs = merge_external_refs(
+                                external_refs.clone(),
+                                remote_result.external_refs.clone(),
+                            );
+                            surface_events.extend(remote_result.events.clone());
                             if let Some(checkpoint) = checkpoint {
                                 checkpoint.last_updated_at = now_timestamp();
                             }
@@ -1196,6 +1223,7 @@ impl Supervisor {
                             )]),
                         },
                         external_refs: Vec::new(),
+                        surface_events: Vec::new(),
                     });
                 }
                 None => None,
@@ -1272,12 +1300,13 @@ impl Supervisor {
 
         if let Some((adapter, external_refs)) = self.resolve_mcp_adapter(manifest, action)? {
             match adapter.run(action).await {
-                Ok(outputs) => {
+                Ok(result) => {
                     return Ok(ExecutionOutcome::Completed {
-                        outputs,
+                        outputs: result.outputs,
                         selected_executor: format!("mcp.{}", adapter.name()),
                         checkpoint: None,
-                        external_refs,
+                        external_refs: merge_external_refs(external_refs, result.external_refs),
+                        surface_events: result.events,
                     });
                 }
                 Err(error) => {
@@ -2829,6 +2858,20 @@ pub fn summarize_capabilities(manifest: &AgentManifest) -> Vec<CapabilityDescrip
             approval_requirements: Vec::new(),
         })
         .collect()
+}
+
+fn merge_external_refs(mut lhs: Vec<ExternalRef>, rhs: Vec<ExternalRef>) -> Vec<ExternalRef> {
+    for reference in rhs {
+        let exists = lhs.iter().any(|candidate| {
+            candidate.kind == reference.kind
+                && candidate.value == reference.value
+                && candidate.endpoint == reference.endpoint
+        });
+        if !exists {
+            lhs.push(reference);
+        }
+    }
+    lhs
 }
 
 fn api_router(supervisor: Arc<Supervisor>) -> Router {
