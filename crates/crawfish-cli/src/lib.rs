@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crawfish_core::{
-    ActionDetail, AdminActionResponse, AgentDetail, CrawfishConfig, ExecutionContractPatch,
-    FleetStatusResponse, PolicyValidationRequest, PolicyValidationResponse, SubmitActionRequest,
+    ActionDetail, ActionListResponse, AdminActionResponse, AgentDetail, ApproveActionRequest,
+    CrawfishConfig, ExecutionContractPatch, FleetStatusResponse, PolicyValidationRequest,
+    PolicyValidationResponse, RejectActionRequest, RevokeLeaseRequest, SubmitActionRequest,
     SubmittedAction,
 };
 use crawfish_runtime::Supervisor;
@@ -35,17 +36,32 @@ pub enum Commands {
     Resume(ConfigCommand),
     Policy(PolicyCommand),
     Action(ActionCommand),
+    Lease(LeaseCommand),
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ActionSubcommands {
+    List(ListActionsCommand),
     Submit(SubmitActionCommand),
+    Approve(ApproveActionCommand),
+    Reject(RejectActionCommand),
 }
 
 #[derive(Debug, Args)]
 pub struct ActionCommand {
     #[command(subcommand)]
     pub command: ActionSubcommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LeaseSubcommands {
+    Revoke(RevokeLeaseCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct LeaseCommand {
+    #[command(subcommand)]
+    pub command: LeaseSubcommands,
 }
 
 #[derive(Debug, Args)]
@@ -171,6 +187,55 @@ pub struct SubmitActionCommand {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct ListActionsCommand {
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub phase: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ApproveActionCommand {
+    pub action_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub approver: String,
+    #[arg(long)]
+    pub note: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RejectActionCommand {
+    pub action_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub approver: String,
+    #[arg(long)]
+    pub reason: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RevokeLeaseCommand {
+    pub lease_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub revoker: String,
+    #[arg(long)]
+    pub reason: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
 impl From<OwnerKindArg> for OwnerKind {
     fn from(value: OwnerKindArg) -> Self {
         match value {
@@ -209,7 +274,13 @@ pub async fn run_cli() -> anyhow::Result<()> {
             PolicySubcommands::Validate(command) => validate_policy_command(command).await,
         },
         Commands::Action(action) => match action.command {
+            ActionSubcommands::List(command) => list_actions_command(command).await,
             ActionSubcommands::Submit(command) => submit_action_command(command).await,
+            ActionSubcommands::Approve(command) => approve_action_command(command).await,
+            ActionSubcommands::Reject(command) => reject_action_command(command).await,
+        },
+        Commands::Lease(lease) => match lease.command {
+            LeaseSubcommands::Revoke(command) => revoke_lease_command(command).await,
         },
     }
 }
@@ -382,6 +453,63 @@ async fn submit_action_command(command: SubmitActionCommand) -> anyhow::Result<(
     };
     let submitted: SubmittedAction = client.post_json("/v1/actions", &request).await?;
     print_output(serde_json::to_value(submitted)?, command.json)?;
+    Ok(())
+}
+
+async fn list_actions_command(command: ListActionsCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let mut path = "/v1/actions".to_string();
+    if let Some(phase) = &command.phase {
+        path.push_str("?phase=");
+        path.push_str(phase);
+    }
+    let actions: ActionListResponse = client.get_json(&path).await?;
+    print_output(serde_json::to_value(actions)?, command.json)?;
+    Ok(())
+}
+
+async fn approve_action_command(command: ApproveActionCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: SubmittedAction = client
+        .post_json(
+            &format!("/v1/actions/{}/approve", command.action_id),
+            &ApproveActionRequest {
+                approver_ref: command.approver,
+                note: command.note,
+            },
+        )
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn reject_action_command(command: RejectActionCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: SubmittedAction = client
+        .post_json(
+            &format!("/v1/actions/{}/reject", command.action_id),
+            &RejectActionRequest {
+                approver_ref: command.approver,
+                reason: command.reason,
+            },
+        )
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn revoke_lease_command(command: RevokeLeaseCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: AdminActionResponse = client
+        .post_json(
+            &format!("/v1/leases/{}/revoke", command.lease_id),
+            &RevokeLeaseRequest {
+                revoker_ref: command.revoker,
+                reason: command.reason,
+            },
+        )
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
     Ok(())
 }
 

@@ -494,7 +494,7 @@ impl ActionStore for SqliteStore {
         .bind(&action.id)
         .bind(&action.target_agent_id)
         .bind(&action.capability)
-        .bind(format!("{:?}", action.phase).to_lowercase())
+        .bind(enum_to_snake(&action.phase))
         .bind(&action.encounter_ref)
         .bind(&action.audit_receipt_ref)
         .bind(&action.checkpoint_ref)
