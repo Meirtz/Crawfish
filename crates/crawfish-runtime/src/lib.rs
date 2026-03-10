@@ -18,17 +18,18 @@ use crawfish_core::{
     PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest, RevokeLeaseRequest,
     SubmitActionRequest, SubmittedAction, SupervisorControl, SwarmStatusResponse,
 };
+use crawfish_harness_local::{LocalHarnessAdapter, LocalHarnessError};
 use crawfish_mcp::McpAdapter;
-use crawfish_openclaw::OpenClawAdapter;
+use crawfish_openclaw::{OpenClawAdapter, OpenClawError};
 use crawfish_store_sqlite::SqliteStore;
 use crawfish_types::{
     Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, ApprovalPolicy,
     AuditOutcome, AuditReceipt, CallerOwnerMapping, CapabilityDescriptor, CapabilityLease,
     CapabilityVisibility, ConsentGrant, ContinuityModeName, CounterpartyRef, DegradedProfileName,
     DeterministicCheckpoint, EncounterRecord, EncounterState, ExecutionStrategy,
-    ExecutionStrategyMode, ExternalRef, FeedbackPolicy, HealthStatus, LifecycleRecord, Mutability,
-    OwnerKind, OwnerRef, StrategyCheckpointState, TrustDomain, VerificationStatus,
-    VerificationSummary, VerifyLoopFailureMode, WorkspaceEdit, WorkspaceEditOp,
+    ExecutionStrategyMode, ExternalRef, FeedbackPolicy, HealthStatus, LifecycleRecord,
+    LocalHarnessKind, Mutability, OwnerKind, OwnerRef, StrategyCheckpointState, TrustDomain,
+    VerificationStatus, VerificationSummary, VerifyLoopFailureMode, WorkspaceEdit, WorkspaceEditOp,
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
@@ -84,29 +85,43 @@ fn is_task_plan_capability(capability: &str) -> bool {
 }
 
 fn normalize_task_plan_inputs(inputs: &mut BTreeMap<String, Value>) -> bool {
-    if inputs
+    let mut normalized = false;
+
+    let has_objective = inputs
         .get("objective")
         .and_then(Value::as_str)
         .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return false;
-    }
-
-    for legacy_key in ["task", "spec_text", "problem_statement"] {
-        if let Some(value) = inputs.get(legacy_key).cloned() {
-            if value
-                .as_str()
-                .map(|text| !text.trim().is_empty())
-                .unwrap_or(false)
-            {
-                inputs.insert("objective".to_string(), value);
-                return true;
+        .unwrap_or(false);
+    if !has_objective {
+        for legacy_key in ["task", "spec_text", "problem_statement"] {
+            if let Some(value) = inputs.get(legacy_key).cloned() {
+                if value
+                    .as_str()
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    inputs.insert("objective".to_string(), value);
+                    normalized = true;
+                    break;
+                }
             }
         }
     }
 
-    false
+    if !inputs.contains_key("context_files") {
+        if let Some(value) = inputs.get("files_of_interest").cloned() {
+            if value
+                .as_array()
+                .map(|entries| !entries.is_empty())
+                .unwrap_or(false)
+            {
+                inputs.insert("context_files".to_string(), value);
+                normalized = true;
+            }
+        }
+    }
+
+    normalized
 }
 
 fn normalize_submit_request(mut request: SubmitActionRequest) -> SubmitActionRequest {
@@ -518,26 +533,7 @@ impl Supervisor {
                     .and_then(Value::as_str)
                     .map(|value| !value.trim().is_empty())
                     .unwrap_or(false);
-                let has_task = request
-                    .inputs
-                    .get("task")
-                    .and_then(Value::as_str)
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false);
-                let has_spec_text = request
-                    .inputs
-                    .get("spec_text")
-                    .and_then(Value::as_str)
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false);
-                let has_problem_statement = request
-                    .inputs
-                    .get("problem_statement")
-                    .and_then(Value::as_str)
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false);
-
-                if !(has_objective || has_task || has_spec_text || has_problem_statement) {
+                if !has_objective {
                     anyhow::bail!(
                         "invalid action request: task.plan requires objective, task, spec_text, or problem_statement"
                     );
@@ -1190,105 +1186,168 @@ impl Supervisor {
             .fallback_chain
             .iter()
             .any(|route| route == "deterministic");
-        let prefers_openclaw = action
-            .contract
-            .execution
-            .preferred_harnesses
-            .iter()
-            .any(|route| route == "openclaw");
+        let mut attempted_agentic_route = false;
+        let mut last_reason: Option<String> = None;
+        let mut last_external_refs = Vec::new();
 
-        if prefers_openclaw {
-            match self.resolve_openclaw_adapter(manifest)? {
-                Some((adapter, base_refs)) => match adapter.run(action).await {
-                    Ok(result) => {
-                        return Ok(ExecutionOutcome::Completed {
-                            outputs: result.outputs,
-                            selected_executor: format!("openclaw.{}", adapter.name()),
-                            checkpoint: None,
-                            external_refs: merge_external_refs(base_refs, result.external_refs),
-                            surface_events: result.events,
-                        });
-                    }
-                    Err(error) => {
-                        self.store
-                            .append_action_event(
-                                &action.id,
-                                "route_degraded",
-                                serde_json::json!({
-                                    "selected_surface": "openclaw",
-                                    "reason": error.to_string(),
-                                    "code": failure_code_route_unavailable(),
-                                    "fallback": if deterministic_fallback { "deterministic" } else { "continuity" },
-                                }),
-                            )
-                            .await?;
-                        if deterministic_fallback {
-                            let executor = TaskPlannerDeterministicExecutor::new(self.state_dir());
-                            let mut outcome = self
-                                .run_deterministic_executor(
-                                    action,
-                                    "deterministic.task_plan",
-                                    "planning",
-                                    base_refs,
-                                    &executor,
+        for route in action.contract.execution.preferred_harnesses.clone() {
+            match route.as_str() {
+                "claude_code" | "codex" => {
+                    attempted_agentic_route = true;
+                    let harness = if route == "claude_code" {
+                        LocalHarnessKind::ClaudeCode
+                    } else {
+                        LocalHarnessKind::Codex
+                    };
+                    match self.resolve_local_harness_adapter(manifest, harness)? {
+                        Some((adapter, base_refs)) => {
+                            if adapter.binding().lease_required {
+                                self.ensure_required_lease_valid(action, &base_refs).await?;
+                            }
+                            match adapter.run(action).await {
+                                Ok(result) => {
+                                    return Ok(ExecutionOutcome::Completed {
+                                        outputs: result.outputs,
+                                        selected_executor: format!(
+                                            "local_harness.{}",
+                                            adapter.name()
+                                        ),
+                                        checkpoint: None,
+                                        external_refs: merge_external_refs(
+                                            base_refs,
+                                            result.external_refs,
+                                        ),
+                                        surface_events: result.events,
+                                    });
+                                }
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": route,
+                                                "reason": reason,
+                                                "code": local_harness_failure_code(&error),
+                                                "fallback": next_fallback_label(deterministic_fallback, "deterministic"),
+                                            }),
+                                        )
+                                        .await?;
+                                    last_reason = Some(error.to_string());
+                                    last_external_refs = base_refs;
+                                }
+                            }
+                        }
+                        None => {
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": route,
+                                        "reason": format!("no local harness binding is configured for {route}"),
+                                        "code": failure_code_route_unavailable(),
+                                        "fallback": next_fallback_label(deterministic_fallback, "deterministic"),
+                                    }),
                                 )
                                 .await?;
-                            if let ExecutionOutcome::Completed { surface_events, .. } = &mut outcome
-                            {
-                                surface_events.push(crawfish_core::SurfaceActionEvent {
-                                    event_type: "continuity_selected".to_string(),
-                                    payload: serde_json::json!({
-                                        "selected_surface": "deterministic",
-                                        "reason": error.to_string(),
-                                        "continuity_mode": "deterministic_only",
-                                    }),
-                                });
-                            }
-                            return Ok(outcome);
                         }
-                        return Ok(self.continuity_blocked_outcome(
-                            action,
-                            error.to_string(),
-                            false,
-                            base_refs,
-                        ));
-                    }
-                },
-                None => {
-                    if deterministic_fallback {
-                        self.store
-                            .append_action_event(
-                                &action.id,
-                                "route_degraded",
-                                serde_json::json!({
-                                    "selected_surface": "openclaw",
-                                    "reason": "no OpenClaw binding is configured for task.plan",
-                                    "code": failure_code_route_unavailable(),
-                                    "fallback": "deterministic",
-                                }),
-                            )
-                            .await?;
-                    } else {
-                        return Ok(self.continuity_blocked_outcome(
-                            action,
-                            "no OpenClaw binding is configured for task.plan",
-                            false,
-                            Vec::new(),
-                        ));
                     }
                 }
+                "openclaw" => {
+                    attempted_agentic_route = true;
+                    match self.resolve_openclaw_adapter(manifest)? {
+                        Some((adapter, base_refs)) => {
+                            if adapter.binding().lease_required {
+                                self.ensure_required_lease_valid(action, &base_refs).await?;
+                            }
+                            match adapter.run(action).await {
+                                Ok(result) => {
+                                    return Ok(ExecutionOutcome::Completed {
+                                        outputs: result.outputs,
+                                        selected_executor: format!("openclaw.{}", adapter.name()),
+                                        checkpoint: None,
+                                        external_refs: merge_external_refs(
+                                            base_refs,
+                                            result.external_refs,
+                                        ),
+                                        surface_events: result.events,
+                                    });
+                                }
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "openclaw",
+                                                "reason": reason,
+                                                "code": openclaw_failure_code(&error),
+                                                "fallback": next_fallback_label(deterministic_fallback, "deterministic"),
+                                            }),
+                                        )
+                                        .await?;
+                                    last_reason = Some(error.to_string());
+                                    last_external_refs = base_refs;
+                                }
+                            }
+                        }
+                        None => {
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": "openclaw",
+                                        "reason": "no OpenClaw binding is configured for task.plan",
+                                        "code": failure_code_route_unavailable(),
+                                        "fallback": next_fallback_label(deterministic_fallback, "deterministic"),
+                                    }),
+                                )
+                                .await?;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
-        let executor = TaskPlannerDeterministicExecutor::new(self.state_dir());
-        self.run_deterministic_executor(
+        if deterministic_fallback {
+            let executor = TaskPlannerDeterministicExecutor::new(self.state_dir());
+            let mut outcome = self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.task_plan",
+                    "planning",
+                    last_external_refs.clone(),
+                    &executor,
+                )
+                .await?;
+            if attempted_agentic_route {
+                if let ExecutionOutcome::Completed { surface_events, .. } = &mut outcome {
+                    surface_events.push(crawfish_core::SurfaceActionEvent {
+                        event_type: "continuity_selected".to_string(),
+                        payload: serde_json::json!({
+                            "selected_surface": "deterministic",
+                            "reason": last_reason.unwrap_or_else(|| "agentic route unavailable".to_string()),
+                            "continuity_mode": "deterministic_only",
+                        }),
+                    });
+                }
+            }
+            return Ok(outcome);
+        }
+
+        Ok(self.continuity_blocked_outcome(
             action,
-            "deterministic.task_plan",
-            "planning",
-            Vec::new(),
-            &executor,
-        )
-        .await
+            last_reason.unwrap_or_else(|| {
+                "no supported task.plan execution route is configured".to_string()
+            }),
+            false,
+            last_external_refs,
+        ))
     }
 
     fn resolve_mcp_adapter(
@@ -1367,6 +1426,64 @@ impl Supervisor {
             OpenClawAdapter::new(binding, self.state_dir()),
             external_refs,
         )))
+    }
+
+    fn resolve_local_harness_adapter(
+        &self,
+        manifest: &AgentManifest,
+        harness: LocalHarnessKind,
+    ) -> anyhow::Result<Option<(LocalHarnessAdapter, Vec<ExternalRef>)>> {
+        let binding = manifest.adapters.iter().find_map(|binding| match binding {
+            AdapterBinding::LocalHarness(binding)
+                if binding.capability == "task.plan" && binding.harness == harness =>
+            {
+                Some(binding.clone())
+            }
+            _ => None,
+        });
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+
+        let harness_name = match binding.harness {
+            LocalHarnessKind::ClaudeCode => "claude_code",
+            LocalHarnessKind::Codex => "codex",
+        };
+        let external_refs = vec![
+            ExternalRef {
+                kind: "local_harness.harness".to_string(),
+                value: harness_name.to_string(),
+                endpoint: None,
+            },
+            ExternalRef {
+                kind: "local_harness.command".to_string(),
+                value: binding.command.clone(),
+                endpoint: None,
+            },
+        ];
+        Ok(Some((
+            LocalHarnessAdapter::new(binding, self.state_dir()),
+            external_refs,
+        )))
+    }
+
+    async fn ensure_required_lease_valid(
+        &self,
+        action: &Action,
+        external_refs: &[ExternalRef],
+    ) -> anyhow::Result<()> {
+        let Some(_) = action.lease_ref else {
+            let route = external_refs
+                .iter()
+                .find(|reference| {
+                    reference.kind == "local_harness.harness"
+                        || reference.kind == "openclaw.target_agent"
+                })
+                .map(|reference| reference.value.clone())
+                .unwrap_or_else(|| "requested surface".to_string());
+            anyhow::bail!("dispatch route requires an active capability lease: {route}");
+        };
+        self.ensure_pre_execution_lease_valid(action).await
     }
 
     fn continuity_blocked_outcome(
@@ -2989,8 +3106,52 @@ fn failure_code_lease_expired() -> &'static str {
     "lease_expired"
 }
 
+fn failure_code_local_harness_missing_binary() -> &'static str {
+    "local_harness_missing_binary"
+}
+
+fn failure_code_local_harness_spawn_error() -> &'static str {
+    "local_harness_spawn_error"
+}
+
+fn failure_code_local_harness_timeout() -> &'static str {
+    "local_harness_timeout"
+}
+
+fn failure_code_local_harness_exit_nonzero() -> &'static str {
+    "local_harness_exit_nonzero"
+}
+
+fn failure_code_local_harness_protocol_error() -> &'static str {
+    "local_harness_protocol_error"
+}
+
 fn failure_code_lock_conflict() -> &'static str {
     "lock_conflict"
+}
+
+fn failure_code_openclaw_auth_error() -> &'static str {
+    "openclaw_auth_error"
+}
+
+fn failure_code_openclaw_connect_error() -> &'static str {
+    "openclaw_connect_error"
+}
+
+fn failure_code_openclaw_protocol_error() -> &'static str {
+    "openclaw_protocol_error"
+}
+
+fn failure_code_openclaw_run_failed() -> &'static str {
+    "openclaw_run_failed"
+}
+
+fn failure_code_openclaw_unsupported_workspace_mode() -> &'static str {
+    "openclaw_unsupported_workspace_mode"
+}
+
+fn failure_code_openclaw_unsupported_session_mode() -> &'static str {
+    "openclaw_unsupported_session_mode"
 }
 
 fn failure_code_route_unavailable() -> &'static str {
@@ -3024,6 +3185,45 @@ fn lease_failure_code(reason: &str) -> &'static str {
         failure_code_lease_expired()
     } else {
         failure_code_approval_required()
+    }
+}
+
+fn local_harness_failure_code(error: &anyhow::Error) -> &'static str {
+    if let Some(error) = error.downcast_ref::<LocalHarnessError>() {
+        return match error {
+            LocalHarnessError::MissingBinary(_) => failure_code_local_harness_missing_binary(),
+            LocalHarnessError::Spawn(_) => failure_code_local_harness_spawn_error(),
+            LocalHarnessError::Timeout(_) => failure_code_local_harness_timeout(),
+            LocalHarnessError::ExitNonZero { .. } => failure_code_local_harness_exit_nonzero(),
+            LocalHarnessError::Protocol(_) => failure_code_local_harness_protocol_error(),
+        };
+    }
+    failure_code_route_unavailable()
+}
+
+fn openclaw_failure_code(error: &anyhow::Error) -> &'static str {
+    if let Some(error) = error.downcast_ref::<OpenClawError>() {
+        return match error {
+            OpenClawError::MissingAuthEnv(_) => failure_code_openclaw_auth_error(),
+            OpenClawError::UnsupportedSessionMode => {
+                failure_code_openclaw_unsupported_session_mode()
+            }
+            OpenClawError::UnsupportedWorkspaceMode => {
+                failure_code_openclaw_unsupported_workspace_mode()
+            }
+            OpenClawError::Connect(_) => failure_code_openclaw_connect_error(),
+            OpenClawError::Protocol(_) => failure_code_openclaw_protocol_error(),
+            OpenClawError::RunFailed(_) => failure_code_openclaw_run_failed(),
+        };
+    }
+    failure_code_route_unavailable()
+}
+
+fn next_fallback_label(deterministic_fallback: bool, fallback: &'static str) -> &'static str {
+    if deterministic_fallback {
+        fallback
+    } else {
+        "continuity"
     }
 }
 
@@ -4111,6 +4311,7 @@ mod tests {
     use hyperlocal::UnixClientExt;
     use std::collections::HashMap;
     use std::convert::Infallible;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
@@ -4160,12 +4361,65 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR")
             ))?;
             if agent == "task_planner" {
+                manifest = manifest.replace(
+                    "command = \"claude\"",
+                    "command = \"__test_missing_claude__\"",
+                );
+                manifest = manifest.replace(
+                    "command = \"codex\"",
+                    "command = \"__test_missing_codex__\"",
+                );
                 if let Some(gateway_url) = openclaw_gateway_url {
                     manifest = manifest.replace("ws://127.0.0.1:9988/gateway", gateway_url);
                 }
             }
             tokio::fs::write(dir.join(format!("agents/{agent}.toml")), manifest).await?;
         }
+        let supervisor = Arc::new(Supervisor::from_config_path(&dir.join("Crawfish.toml")).await?);
+        supervisor.run_once().await?;
+        Ok(supervisor)
+    }
+
+    async fn build_supervisor_with_task_planner_manifest(
+        dir: &Path,
+        task_planner_manifest: String,
+        openclaw_gateway_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Supervisor>> {
+        tokio::fs::create_dir_all(dir.join("agents")).await?;
+        tokio::fs::create_dir_all(dir.join(".crawfish/state")).await?;
+        tokio::fs::create_dir_all(dir.join(".crawfish/run")).await?;
+        tokio::fs::create_dir_all(dir.join("src")).await?;
+        tokio::fs::create_dir_all(dir.join("tests")).await?;
+        tokio::fs::write(
+            dir.join("Crawfish.toml"),
+            include_str!("../../../examples/hero-swarm/Crawfish.toml"),
+        )
+        .await?;
+        tokio::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn value() -> u32 { 42 } // TODO follow up\n",
+        )
+        .await?;
+        tokio::fs::write(dir.join("tests/lib_test.rs"), "#[test] fn smoke() {}\n").await?;
+        for agent in [
+            "repo_indexer",
+            "repo_reviewer",
+            "ci_triage",
+            "incident_enricher",
+            "workspace_editor",
+        ] {
+            let manifest = std::fs::read_to_string(format!(
+                "{}/../../examples/hero-swarm/agents/{agent}.toml",
+                env!("CARGO_MANIFEST_DIR")
+            ))?;
+            tokio::fs::write(dir.join(format!("agents/{agent}.toml")), manifest).await?;
+        }
+        let manifest = if let Some(gateway_url) = openclaw_gateway_url {
+            task_planner_manifest.replace("ws://127.0.0.1:9988/gateway", gateway_url)
+        } else {
+            task_planner_manifest
+        };
+        tokio::fs::write(dir.join("agents/task_planner.toml"), manifest).await?;
         let supervisor = Arc::new(Supervisor::from_config_path(&dir.join("Crawfish.toml")).await?);
         supervisor.run_once().await?;
         Ok(supervisor)
@@ -4269,6 +4523,92 @@ mod tests {
             display_name: None,
             trace_ids: crawfish_types::Metadata::default(),
         }
+    }
+
+    async fn write_executable_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        tokio::fs::write(&path, body).await.unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    fn local_task_planner_manifest(
+        claude_command: &str,
+        codex_command: &str,
+        openclaw_gateway_url: &str,
+    ) -> String {
+        format!(
+            r#"id = "task_planner"
+role = "task_planner"
+trust_domain = "same_owner_local"
+capabilities = ["task.plan"]
+exposed_capabilities = ["task.plan"]
+default_data_boundaries = ["owner_local"]
+
+[owner]
+kind = "human"
+id = "local-dev"
+display_name = "Local Developer"
+
+[contract_defaults.execution]
+preferred_harnesses = ["claude_code", "codex", "openclaw"]
+fallback_chain = ["deterministic"]
+
+[contract_defaults.safety]
+approval_policy = "on_mutation"
+mutation_mode = "proposal_only"
+
+[strategy_defaults."task.plan"]
+mode = "verify_loop"
+feedback_policy = "inject_reason"
+
+[strategy_defaults."task.plan".verification_spec]
+require_all = true
+on_failure = "retry_with_feedback"
+checks = []
+
+[strategy_defaults."task.plan".stop_budget]
+max_iterations = 3
+
+[[adapters]]
+adapter = "local_harness"
+capability = "task.plan"
+harness = "claude_code"
+command = "{claude_command}"
+args = []
+required_scopes = ["planning:read", "planning:propose"]
+lease_required = false
+workspace_policy = "crawfish_managed"
+env_allowlist = ["PATH", "HOME", "CODEX_HOME", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+timeout_seconds = 5
+
+[[adapters]]
+adapter = "local_harness"
+capability = "task.plan"
+harness = "codex"
+command = "{codex_command}"
+args = ["exec", "--skip-git-repo-check"]
+required_scopes = ["planning:read", "planning:propose"]
+lease_required = false
+workspace_policy = "crawfish_managed"
+env_allowlist = ["PATH", "HOME", "CODEX_HOME", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+timeout_seconds = 5
+
+[[adapters]]
+adapter = "openclaw"
+gateway_url = "{openclaw_gateway_url}"
+auth_ref = "OPENCLAW_GATEWAY_TOKEN"
+target_agent = "task-planner"
+session_mode = "ephemeral"
+caller_owner_mapping = "required"
+default_trust_domain = "same_device_foreign_owner"
+required_scopes = ["planning:read", "planning:propose"]
+lease_required = false
+workspace_policy = "crawfish_managed"
+"#
+        )
     }
 
     async fn spawn_api_server(
@@ -4727,6 +5067,298 @@ mod tests {
             .events
             .iter()
             .any(|event| event.event_type == "openclaw_run_completed"));
+    }
+
+    #[tokio::test]
+    async fn task_plan_prefers_local_claude_harness_before_openclaw() {
+        let dir = tempdir().unwrap();
+        let gateway_url = spawn_mock_openclaw_gateway().await;
+        let claude_script = write_executable_script(
+            dir.path(),
+            "claude-plan.sh",
+            r#"#!/bin/sh
+PROMPT="$1"
+if printf '%s' "$PROMPT" | grep -q "Verification feedback"; then
+  cat <<'EOF'
+- Review the objective against the current context files.
+- Produce the rollout checklist and operator handoff.
+Risk: Verification coverage may still miss an environment-specific edge case.
+Assumption: The task planner can prepare a rollout checklist from the local workspace.
+Test: Validate the rollout checklist against the desired outputs.
+Confidence: high confidence after verification feedback
+EOF
+else
+  cat <<'EOF'
+- Draft an initial task outline.
+Risk: Initial pass may omit desired outputs.
+Confidence: low confidence on the first pass
+EOF
+fi
+"#,
+        )
+        .await;
+        std::env::set_var("OPENCLAW_GATEWAY_TOKEN", "test-token");
+        let manifest = local_task_planner_manifest(
+            &claude_script.display().to_string(),
+            "__missing_codex__",
+            &gateway_url,
+        );
+        let supervisor =
+            build_supervisor_with_task_planner_manifest(dir.path(), manifest, Some(&gateway_url))
+                .await
+                .unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "task_planner".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: local_owner("local-dev"),
+                capability: "task.plan".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "plan a task".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "objective".to_string(),
+                        serde_json::json!("Prepare a rollout checklist for the task planner"),
+                    ),
+                    (
+                        "desired_outputs".to_string(),
+                        serde_json::json!(["rollout checklist"]),
+                    ),
+                ]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(
+            detail.selected_executor.as_deref(),
+            Some("local_harness.claude_code")
+        );
+        assert_eq!(detail.strategy_iteration, Some(2));
+        assert!(detail
+            .external_refs
+            .iter()
+            .any(|reference| reference.kind == "local_harness.harness"
+                && reference.value == "claude_code"));
+        let events = supervisor
+            .list_action_events(&submitted.action_id)
+            .await
+            .unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "local_harness_process_started"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "verification_failed"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "verification_passed"));
+        assert!(!events
+            .events
+            .iter()
+            .any(|event| event.event_type == "openclaw_run_started"));
+    }
+
+    #[tokio::test]
+    async fn task_plan_falls_back_from_missing_claude_to_local_codex() {
+        let dir = tempdir().unwrap();
+        let gateway_url = spawn_mock_openclaw_gateway().await;
+        let codex_script = write_executable_script(
+            dir.path(),
+            "codex-plan.sh",
+            r#"#!/bin/sh
+cat <<'EOF'
+- Review the objective and gather relevant context.
+- Produce the requested rollout checklist and summary.
+Risk: The proposal may still need operator review before follow-on work.
+Assumption: The current workspace is representative of the intended task.
+Test: Validate the rollout checklist against the desired outputs.
+Confidence: medium confidence after local codex planning
+EOF
+"#,
+        )
+        .await;
+        std::env::set_var("OPENCLAW_GATEWAY_TOKEN", "test-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            &codex_script.display().to_string(),
+            &gateway_url,
+        );
+        let supervisor =
+            build_supervisor_with_task_planner_manifest(dir.path(), manifest, Some(&gateway_url))
+                .await
+                .unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "task_planner".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: local_owner("local-dev"),
+                capability: "task.plan".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "plan a task".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "objective".to_string(),
+                        serde_json::json!("Produce a rollout checklist for the local harness path"),
+                    ),
+                    (
+                        "desired_outputs".to_string(),
+                        serde_json::json!(["rollout checklist"]),
+                    ),
+                ]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(
+            detail.selected_executor.as_deref(),
+            Some("local_harness.codex")
+        );
+        let events = supervisor
+            .list_action_events(&submitted.action_id)
+            .await
+            .unwrap();
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "route_degraded"
+                && event.payload.get("code").and_then(Value::as_str)
+                    == Some("local_harness_missing_binary")
+        }));
+    }
+
+    #[tokio::test]
+    async fn task_plan_falls_back_to_openclaw_after_local_harness_failures() {
+        let dir = tempdir().unwrap();
+        let gateway_url = spawn_mock_openclaw_gateway().await;
+        std::env::set_var("OPENCLAW_GATEWAY_TOKEN", "test-token");
+        let manifest =
+            local_task_planner_manifest("__missing_claude__", "__missing_codex__", &gateway_url);
+        let supervisor =
+            build_supervisor_with_task_planner_manifest(dir.path(), manifest, Some(&gateway_url))
+                .await
+                .unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "task_planner".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: local_owner("local-dev"),
+                capability: "task.plan".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "plan a task".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "objective".to_string(),
+                        serde_json::json!("Add validation checks around the repo indexing path"),
+                    ),
+                    (
+                        "desired_outputs".to_string(),
+                        serde_json::json!(["rollout checklist"]),
+                    ),
+                ]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(
+            detail.selected_executor.as_deref(),
+            Some("openclaw.task-planner")
+        );
+        let events = supervisor
+            .list_action_events(&submitted.action_id)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "route_degraded"
+                        && event.payload.get("code").and_then(Value::as_str)
+                            == Some("local_harness_missing_binary")
+                })
+                .count()
+                >= 2
+        );
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "openclaw_run_started"));
     }
 
     #[tokio::test]

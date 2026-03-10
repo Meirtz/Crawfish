@@ -392,16 +392,12 @@ impl DeterministicExecutor for TaskPlannerDeterministicExecutor {
         };
 
         let objective = task_plan_objective_from_action(action)?;
-        let files_of_interest = input_string_array(action, "files_of_interest");
+        let context_files = task_plan_context_files_from_action(action);
         let constraints = input_string_array(action, "constraints");
         let desired_outputs = input_string_array(action, "desired_outputs");
         let verification_feedback = optional_input_string(action, "verification_feedback");
-        let target_files = select_task_plan_target_files(
-            &repo_files,
-            &objective,
-            &files_of_interest,
-            &constraints,
-        );
+        let target_files =
+            select_task_plan_target_files(&repo_files, &objective, &context_files, &constraints);
         let risks = task_plan_risks(&target_files, &constraints);
         let assumptions = task_plan_assumptions(
             action,
@@ -909,6 +905,15 @@ fn task_plan_objective_from_action(action: &Action) -> anyhow::Result<String> {
     .flatten()
     .find(|value| !value.trim().is_empty())
     .ok_or_else(|| anyhow!("task.plan requires objective, task, spec_text, or problem_statement"))
+}
+
+fn task_plan_context_files_from_action(action: &Action) -> Vec<String> {
+    let context_files = input_string_array(action, "context_files");
+    if context_files.is_empty() {
+        input_string_array(action, "files_of_interest")
+    } else {
+        context_files
+    }
 }
 
 fn select_task_plan_target_files(

@@ -43,6 +43,10 @@ impl OpenClawAdapter {
         Self { binding, state_dir }
     }
 
+    pub fn binding(&self) -> &OpenClawBinding {
+        &self.binding
+    }
+
     pub fn describe_binding(&self) -> CapabilityDescriptor {
         CapabilityDescriptor {
             namespace: format!("openclaw.{}", self.binding.target_agent),
@@ -439,7 +443,25 @@ fn build_agent_prompt(action: &Action) -> String {
         .unwrap_or(&action.goal.summary);
     let files = action
         .inputs
-        .get("files_of_interest")
+        .get("context_files")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            action
+                .inputs
+                .get("files_of_interest")
+                .and_then(Value::as_array)
+        })
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let constraints = action
+        .inputs
+        .get("constraints")
         .and_then(Value::as_array)
         .map(|values| {
             values
@@ -466,6 +488,11 @@ fn build_agent_prompt(action: &Action) -> String {
         .get("verification_feedback")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let background = action
+        .inputs
+        .get("background")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
 
     let mut lines = vec![
         "Produce a proposal-only task plan.".to_string(),
@@ -474,13 +501,19 @@ fn build_agent_prompt(action: &Action) -> String {
         format!("Objective: {objective}"),
     ];
     if !files.is_empty() {
-        lines.push(format!("Files of interest: {files}"));
+        lines.push(format!("Context files: {files}"));
+    }
+    if !constraints.is_empty() {
+        lines.push(format!("Constraints: {constraints}"));
     }
     if !desired_outputs.is_empty() {
         lines.push(format!("Desired outputs: {desired_outputs}"));
     }
     if let Some(workspace_root) = action.inputs.get("workspace_root").and_then(Value::as_str) {
         lines.push(format!("Workspace root: {workspace_root}"));
+    }
+    if !background.trim().is_empty() {
+        lines.push(format!("Background: {background}"));
     }
     if !verification_feedback.trim().is_empty() {
         lines.push(format!(
@@ -496,8 +529,14 @@ fn build_agent_prompt(action: &Action) -> String {
 fn task_plan_artifact_from_result(action: &Action, text: &str, result: &Value) -> TaskPlanArtifact {
     let target_files = action
         .inputs
-        .get("files_of_interest")
+        .get("context_files")
         .and_then(Value::as_array)
+        .or_else(|| {
+            action
+                .inputs
+                .get("files_of_interest")
+                .and_then(Value::as_array)
+        })
         .map(|values| {
             values
                 .iter()

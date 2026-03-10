@@ -521,3 +521,224 @@ fn infer_artifact_kind(file_name: &str) -> String {
         .unwrap_or(file_name)
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crawfish_types::{
+        ActionPhase, ExecutionContract, GoalSpec, OwnerKind, OwnerRef, RequesterKind, RequesterRef,
+        ScheduleSpec,
+    };
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    fn planning_action(workspace_root: &Path) -> Action {
+        Action {
+            id: "action-1".to_string(),
+            target_agent_id: "task_planner".to_string(),
+            requester: RequesterRef {
+                kind: RequesterKind::User,
+                id: "cli".to_string(),
+            },
+            initiator_owner: OwnerRef {
+                kind: OwnerKind::Human,
+                id: "local-dev".to_string(),
+                display_name: None,
+            },
+            counterparty_refs: Vec::new(),
+            goal: GoalSpec {
+                summary: "plan a task".to_string(),
+                details: None,
+            },
+            capability: "task.plan".to_string(),
+            inputs: BTreeMap::from([
+                (
+                    "workspace_root".to_string(),
+                    json!(workspace_root.display().to_string()),
+                ),
+                (
+                    "objective".to_string(),
+                    json!("Produce an operator-ready task plan"),
+                ),
+                (
+                    "desired_outputs".to_string(),
+                    json!(["operator-ready summary"]),
+                ),
+            ]),
+            contract: ExecutionContract::default(),
+            execution_strategy: None,
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            encounter_ref: None,
+            audit_receipt_ref: None,
+            data_boundary: "owner_local".to_string(),
+            schedule: ScheduleSpec::default(),
+            phase: ActionPhase::Accepted,
+            created_at: "0".to_string(),
+            started_at: None,
+            finished_at: None,
+            checkpoint_ref: None,
+            continuity_mode: None,
+            degradation_profile: None,
+            failure_reason: None,
+            failure_code: None,
+            selected_executor: None,
+            recovery_stage: None,
+            lock_detail: None,
+            external_refs: Vec::new(),
+            outputs: ActionOutputs::default(),
+        }
+    }
+
+    async fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, body).await.unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn adapter_passes_allowlisted_env_and_emits_artifacts() {
+        let dir = tempdir().unwrap();
+        let script = write_script(
+            dir.path(),
+            "claude-plan.sh",
+            r#"#!/bin/sh
+cat <<EOF
+- Review the objective against local context.
+- Produce the operator-ready summary.
+Risk: Environment assumptions may drift.
+Assumption: allowed=$ALLOWED_VAR blocked=$BLOCKED_VAR
+Test: Validate the operator-ready summary.
+Confidence: high confidence after local harness execution
+EOF
+"#,
+        )
+        .await;
+        env::set_var("ALLOWED_VAR", "safe");
+        env::set_var("BLOCKED_VAR", "hidden");
+
+        let adapter = LocalHarnessAdapter::new(
+            LocalHarnessBinding {
+                capability: "task.plan".to_string(),
+                harness: LocalHarnessKind::ClaudeCode,
+                command: script.display().to_string(),
+                args: Vec::new(),
+                required_scopes: Vec::new(),
+                lease_required: false,
+                workspace_policy: LocalHarnessWorkspacePolicy::CrawfishManaged,
+                env_allowlist: vec!["ALLOWED_VAR".to_string()],
+                timeout_seconds: 5,
+            },
+            dir.path().to_path_buf(),
+        );
+
+        let result = adapter.run(&planning_action(dir.path())).await.unwrap();
+        let json_artifact = result
+            .outputs
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("task_plan.json"))
+            .unwrap();
+        let artifact: TaskPlanArtifact =
+            serde_json::from_slice(&fs::read(&json_artifact.path).await.unwrap()).unwrap();
+        assert!(artifact
+            .assumptions
+            .iter()
+            .any(|assumption| assumption.contains("allowed=safe")));
+        assert!(artifact
+            .assumptions
+            .iter()
+            .all(|assumption| !assumption.contains("blocked=hidden")));
+    }
+
+    #[tokio::test]
+    async fn adapter_reports_missing_binary() {
+        let dir = tempdir().unwrap();
+        let adapter = LocalHarnessAdapter::new(
+            LocalHarnessBinding {
+                capability: "task.plan".to_string(),
+                harness: LocalHarnessKind::Codex,
+                command: "__missing_local_harness__".to_string(),
+                args: vec!["exec".to_string()],
+                required_scopes: Vec::new(),
+                lease_required: false,
+                workspace_policy: LocalHarnessWorkspacePolicy::Inherit,
+                env_allowlist: Vec::new(),
+                timeout_seconds: 5,
+            },
+            dir.path().to_path_buf(),
+        );
+
+        let error = adapter.run(&planning_action(dir.path())).await.unwrap_err();
+        assert!(error
+            .downcast_ref::<LocalHarnessError>()
+            .is_some_and(|error| matches!(error, LocalHarnessError::MissingBinary(_))));
+    }
+
+    #[tokio::test]
+    async fn adapter_reports_timeout() {
+        let dir = tempdir().unwrap();
+        let script = write_script(
+            dir.path(),
+            "sleepy-plan.sh",
+            "#!/bin/sh\nsleep 2\nprintf '%s\n' '- step one'\n",
+        )
+        .await;
+        let adapter = LocalHarnessAdapter::new(
+            LocalHarnessBinding {
+                capability: "task.plan".to_string(),
+                harness: LocalHarnessKind::ClaudeCode,
+                command: script.display().to_string(),
+                args: Vec::new(),
+                required_scopes: Vec::new(),
+                lease_required: false,
+                workspace_policy: LocalHarnessWorkspacePolicy::Inherit,
+                env_allowlist: Vec::new(),
+                timeout_seconds: 1,
+            },
+            dir.path().to_path_buf(),
+        );
+
+        let error = adapter.run(&planning_action(dir.path())).await.unwrap_err();
+        assert!(error
+            .downcast_ref::<LocalHarnessError>()
+            .is_some_and(|error| matches!(error, LocalHarnessError::Timeout(1))));
+    }
+
+    #[tokio::test]
+    async fn adapter_reports_nonzero_exit() {
+        let dir = tempdir().unwrap();
+        let script = write_script(
+            dir.path(),
+            "failing-plan.sh",
+            "#!/bin/sh\necho 'boom' >&2\nexit 7\n",
+        )
+        .await;
+        let adapter = LocalHarnessAdapter::new(
+            LocalHarnessBinding {
+                capability: "task.plan".to_string(),
+                harness: LocalHarnessKind::Codex,
+                command: script.display().to_string(),
+                args: vec!["exec".to_string()],
+                required_scopes: Vec::new(),
+                lease_required: false,
+                workspace_policy: LocalHarnessWorkspacePolicy::Inherit,
+                env_allowlist: Vec::new(),
+                timeout_seconds: 5,
+            },
+            dir.path().to_path_buf(),
+        );
+
+        let error = adapter.run(&planning_action(dir.path())).await.unwrap_err();
+        assert!(error
+            .downcast_ref::<LocalHarnessError>()
+            .is_some_and(|error| matches!(
+                error,
+                LocalHarnessError::ExitNonZero { status: 7, .. }
+            )));
+    }
+}
