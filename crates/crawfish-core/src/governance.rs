@@ -79,21 +79,49 @@ pub fn authorize_encounter(
         }
     };
 
+    let reason = explain_decision(
+        &disposition,
+        &request.caller.trust_domain,
+        approvals_required,
+    );
+
     EncounterDecision {
         disposition,
         effective_policy: effective,
         required_grant,
         lease_required,
-        reason: explain_decision(&request.caller.trust_domain, approvals_required),
+        reason,
     }
 }
 
 pub fn owner_policy_for_manifest(manifest: &AgentManifest) -> EncounterPolicy {
-    manifest.encounter_policy.clone()
+    if manifest.encounter_policy == EncounterPolicy::default() {
+        neutral_policy()
+    } else {
+        manifest.encounter_policy.clone()
+    }
 }
 
-fn explain_decision(trust_domain: &TrustDomain, approvals_required: bool) -> String {
-    if matches!(trust_domain, TrustDomain::SameDeviceForeignOwner) && approvals_required {
+pub fn neutral_policy() -> EncounterPolicy {
+    EncounterPolicy {
+        default_disposition: DefaultDisposition::AllowWithLease,
+        capability_visibility: CapabilityVisibility::Discoverable,
+        data_boundary: DataBoundaryPolicy::Redacted,
+        tool_boundary: ToolBoundaryPolicy::LeaseScoped,
+        workspace_boundary: WorkspaceBoundaryPolicy::ReadShared,
+        network_boundary: NetworkBoundaryPolicy::Allowlisted,
+        human_approval_requirements: Vec::new(),
+    }
+}
+
+fn explain_decision(
+    disposition: &EncounterDisposition,
+    trust_domain: &TrustDomain,
+    approvals_required: bool,
+) -> String {
+    if matches!(disposition, EncounterDisposition::Deny) {
+        "encounter denied by the effective policy".to_string()
+    } else if matches!(trust_domain, TrustDomain::SameDeviceForeignOwner) && approvals_required {
         "foreign-owner encounter requires explicit consent before any lease can be issued"
             .to_string()
     } else if approvals_required {
@@ -268,6 +296,34 @@ mod tests {
 
         let decision = authorize_encounter(&context, &request);
         assert_eq!(decision.disposition, EncounterDisposition::Deny);
+    }
+
+    #[test]
+    fn same_owner_local_encounter_can_be_leased_under_permissive_defaults() {
+        let context = GovernanceContext {
+            system_defaults: EncounterPolicy {
+                default_disposition: DefaultDisposition::AllowWithLease,
+                ..EncounterPolicy::default()
+            },
+            owner_policy: neutral_policy(),
+            trust_domain_defaults: EncounterPolicy {
+                default_disposition: DefaultDisposition::AllowWithLease,
+                ..EncounterPolicy::default()
+            },
+            manifest_policy: neutral_policy(),
+        };
+        let request = EncounterRequest {
+            caller: caller("alice", TrustDomain::SameOwnerLocal),
+            target_agent_id: "repo_reviewer".to_string(),
+            target_owner: owner("alice"),
+            requested_capabilities: vec!["repo.review".to_string()],
+            requests_workspace_write: false,
+            requests_secret_access: false,
+            requests_mutating_capability: false,
+        };
+
+        let decision = authorize_encounter(&context, &request);
+        assert_eq!(decision.disposition, EncounterDisposition::IssueLease);
     }
 
     #[test]

@@ -11,14 +11,14 @@ import markdown
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = ROOT / ".build"
 HTML_OUT = BUILD_DIR / "Crawfish-PRD.export.html"
-DOCX_OUT = ROOT / "Crawfish-PRD.docx"
+DOCX_OUT = ROOT / "docs" / "exports" / "Crawfish-PRD.docx"
 
 DOC_ORDER = [
     ROOT / "README.md",
-    ROOT / "docs" / "vision.md",
-    ROOT / "docs" / "architecture.md",
-    ROOT / "docs" / "v0.1-plan.md",
-    ROOT / "docs" / "glossary.md",
+    ROOT / "docs" / "spec" / "vision.md",
+    ROOT / "docs" / "spec" / "architecture.md",
+    ROOT / "docs" / "spec" / "v0.1-plan.md",
+    ROOT / "docs" / "spec" / "glossary.md",
 ]
 
 HTML_TEMPLATE = """<!doctype html>
@@ -118,6 +118,7 @@ def render_markdown(path: Path) -> str:
 
 def main() -> None:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    DOCX_OUT.parent.mkdir(parents=True, exist_ok=True)
     sections = []
     for path in DOC_ORDER:
         sections.append(render_markdown(path))

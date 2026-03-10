@@ -10,7 +10,7 @@ In a world where specialized harnesses and agent gateways such as [OpenClaw](htt
 
 When agents roam across owners, laptops, and networks, governance is not optional. The same machine is already a frontier: different agents may belong to different humans, teams, or contexts and should not silently share workspace, memory, secrets, or mutating authority just because they happen to run side by side.
 
-This repository is now **Rust-first for implementation** and **Markdown-first for product and architecture specs**. The Markdown files in [`docs/`](docs/) remain the design source of truth. The Cargo workspace under [`crates/`](crates/) is the implementation source of truth. The existing DOCX and HTML files are retained as legacy exports and reference material.
+This repository is now **Rust-first for implementation** and **Markdown-first for product and architecture specs**. The Markdown files in [`docs/spec/`](docs/spec/) remain the design source of truth. The Cargo workspace under [`crates/`](crates/) is the implementation source of truth. Generated exports live in [`docs/exports/`](docs/exports/), and historical materials live in [`docs/archive/`](docs/archive/).
 
 To regenerate the consolidated DOCX export from Markdown, run `python3 scripts/export_docset.py`.
 
@@ -173,10 +173,11 @@ OpenClaw interoperability, `ACP`, and `A2A` remain important parts of the produc
 
 Start with the design docs:
 
-1. [`docs/vision.md`](docs/vision.md) for category, positioning, and competitive wedge.
-2. [`docs/architecture.md`](docs/architecture.md) for public primitives, state machines, and runtime model.
-3. [`docs/v0.1-plan.md`](docs/v0.1-plan.md) for alpha scope, milestones, and acceptance criteria.
-4. [`docs/glossary.md`](docs/glossary.md) for canonical terminology.
+1. [`docs/spec/vision.md`](docs/spec/vision.md) for category, positioning, and competitive wedge.
+2. [`docs/spec/architecture.md`](docs/spec/architecture.md) for public primitives, state machines, and runtime model.
+3. [`docs/spec/v0.1-plan.md`](docs/spec/v0.1-plan.md) for alpha scope, milestones, and acceptance criteria.
+4. [`docs/spec/glossary.md`](docs/spec/glossary.md) for canonical terminology.
+5. [`docs/README.md`](docs/README.md) for repository documentation policy and export locations.
 
 Then use the Rust workspace:
 
@@ -184,6 +185,13 @@ Then use the Rust workspace:
 cargo test --workspace
 cargo run -p crawfish-cli --bin crawfish -- init ./sandbox
 cd sandbox
-cargo run -p crawfish-cli --bin crawfish -- run --once
+cargo run -p crawfish-cli --bin crawfish -- run &
+CRAWFISH_PID=$!
+sleep 1
 cargo run -p crawfish-cli --bin crawfish -- status --json
+cargo run -p crawfish-cli --bin crawfish -- action submit \
+  --target-agent repo_reviewer \
+  --capability repo.review \
+  --goal "review pull request"
+kill $CRAWFISH_PID
 ```

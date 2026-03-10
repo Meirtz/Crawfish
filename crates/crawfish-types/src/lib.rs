@@ -1035,6 +1035,7 @@ pub struct AgentManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Action {
     pub id: String,
+    pub target_agent_id: String,
     pub requester: RequesterRef,
     pub initiator_owner: OwnerRef,
     #[serde(default)]
@@ -1051,13 +1052,28 @@ pub struct Action {
     pub grant_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encounter_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_receipt_ref: Option<String>,
     #[serde(default)]
     pub data_boundary: String,
     #[serde(default)]
     pub schedule: ScheduleSpec,
     pub phase: ActionPhase,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_mode: Option<ContinuityModeName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_profile: Option<DegradedProfileName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     #[serde(default)]
     pub outputs: ActionOutputs,
 }

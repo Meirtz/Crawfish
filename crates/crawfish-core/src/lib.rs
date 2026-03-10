@@ -1,4 +1,5 @@
 pub mod action;
+pub mod api;
 pub mod config;
 pub mod contract;
 pub mod governance;
@@ -6,6 +7,7 @@ pub mod lifecycle;
 pub mod traits;
 
 pub use action::*;
+pub use api::*;
 pub use config::*;
 pub use contract::*;
 pub use governance::*;

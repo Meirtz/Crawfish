@@ -1,4 +1,7 @@
-use crawfish_types::{EncounterPolicy, ExecutionContract};
+use crawfish_types::{
+    CapabilityVisibility, DataBoundaryPolicy, DefaultDisposition, EncounterPolicy,
+    ExecutionContract, NetworkBoundaryPolicy, ToolBoundaryPolicy, WorkspaceBoundaryPolicy,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,15 +12,21 @@ pub struct StorageConfig {
     pub state_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiConfig {
+    #[serde(default = "default_socket_path")]
+    pub socket_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ContractDefaultsConfig {
     #[serde(default)]
     pub org_defaults: ExecutionContract,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GovernanceConfig {
-    #[serde(default)]
+    #[serde(default = "default_system_encounter_policy")]
     pub system_defaults: EncounterPolicy,
 }
 
@@ -37,11 +46,21 @@ pub struct CrawfishConfig {
     pub storage: StorageConfig,
     pub fleet: FleetConfig,
     #[serde(default)]
+    pub api: ApiConfig,
+    #[serde(default)]
     pub contracts: ContractDefaultsConfig,
     #[serde(default)]
     pub governance: GovernanceConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: default_socket_path(),
+        }
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -52,8 +71,32 @@ impl Default for RuntimeConfig {
     }
 }
 
+impl Default for GovernanceConfig {
+    fn default() -> Self {
+        Self {
+            system_defaults: default_system_encounter_policy(),
+        }
+    }
+}
+
 fn default_reconcile_interval_ms() -> u64 {
     5_000
+}
+
+fn default_socket_path() -> PathBuf {
+    PathBuf::from(".crawfish/run/crawfishd.sock")
+}
+
+fn default_system_encounter_policy() -> EncounterPolicy {
+    EncounterPolicy {
+        default_disposition: DefaultDisposition::AllowWithLease,
+        capability_visibility: CapabilityVisibility::OwnerOnly,
+        data_boundary: DataBoundaryPolicy::OwnerOnly,
+        tool_boundary: ToolBoundaryPolicy::NoCrossOwnerMutation,
+        workspace_boundary: WorkspaceBoundaryPolicy::Isolated,
+        network_boundary: NetworkBoundaryPolicy::LocalOnly,
+        human_approval_requirements: Vec::new(),
+    }
 }
 
 impl CrawfishConfig {
@@ -73,6 +116,10 @@ impl CrawfishConfig {
     pub fn state_dir(&self, root: &Path) -> PathBuf {
         root.join(&self.storage.state_dir)
     }
+
+    pub fn socket_path(&self, root: &Path) -> PathBuf {
+        root.join(&self.api.socket_path)
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +136,9 @@ mod tests {
             fleet: FleetConfig {
                 manifests_dir: PathBuf::from("agents"),
             },
+            api: ApiConfig {
+                socket_path: PathBuf::from(".crawfish/run/crawfishd.sock"),
+            },
             contracts: ContractDefaultsConfig::default(),
             governance: GovernanceConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -102,6 +152,10 @@ mod tests {
         assert_eq!(
             config.sqlite_path(&root),
             PathBuf::from("/tmp/example/.crawfish/state/control.db")
+        );
+        assert_eq!(
+            config.socket_path(&root),
+            PathBuf::from("/tmp/example/.crawfish/run/crawfishd.sock")
         );
     }
 }
