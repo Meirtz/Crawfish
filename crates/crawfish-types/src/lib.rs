@@ -844,6 +844,7 @@ pub struct ExternalRef {
 #[serde(tag = "adapter", rename_all = "snake_case")]
 pub enum AdapterBinding {
     Mcp(McpToolBinding),
+    LocalHarness(LocalHarnessBinding),
     Openclaw(OpenClawBinding),
     Acp(AcpHarnessBinding),
     A2a(A2ARemoteAgentBinding),
@@ -891,6 +892,49 @@ fn default_mcp_connect_timeout_ms() -> u64 {
 
 fn default_mcp_request_timeout_ms() -> u64 {
     15_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHarnessKind {
+    ClaudeCode,
+    Codex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHarnessWorkspacePolicy {
+    Inherit,
+    CrawfishManaged,
+}
+
+impl Default for LocalHarnessWorkspacePolicy {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalHarnessBinding {
+    pub capability: String,
+    pub harness: LocalHarnessKind,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+    #[serde(default)]
+    pub lease_required: bool,
+    #[serde(default)]
+    pub workspace_policy: LocalHarnessWorkspacePolicy,
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+    #[serde(default = "default_local_harness_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+fn default_local_harness_timeout_seconds() -> u64 {
+    90
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

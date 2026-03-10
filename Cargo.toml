@@ -6,6 +6,7 @@ members = [
   "crates/crawfish-runtime",
   "crates/crawfish-cli",
   "crates/crawfish-mcp",
+  "crates/crawfish-harness-local",
   "crates/crawfish-openclaw",
   "crates/crawfish-adapter-api",
 ]
