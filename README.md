@@ -76,7 +76,8 @@ flowchart LR
         W1["Agent worker: repo_indexer"]
         W2["Agent worker: repo_reviewer"]
         W3["Agent worker: ci_triage"]
-        W4["Agent worker: incident_enricher"]
+        W4["Agent worker: workspace_editor"]
+        W5["Agent worker: incident_enricher"]
     end
 
     subgraph PM["Protocol mesh"]
@@ -103,10 +104,11 @@ flowchart LR
     SCH --> W2
     SCH --> W3
     SCH --> W4
+    SCH --> W5
     W1 --> MCP
     W2 --> MCP
     W3 --> MCP
-    W4 --> MCP
+    W5 --> MCP
     SD -. future .-> OCI
     W2 -. future .-> OCO
     W2 -. future .-> ACP
@@ -118,11 +120,13 @@ flowchart LR
     W2 --> CKPT
     W3 --> CKPT
     W4 --> CKPT
+    W5 --> CKPT
     SD --> OBS
     W1 --> OBS
     W2 --> OBS
     W3 --> OBS
     W4 --> OBS
+    W5 --> OBS
 ```
 
 ## Lifecycle
@@ -169,13 +173,14 @@ The first public story is a small engineering and operations fleet running under
 - `repo_indexer` keeps repository structure and ownership context warm.
 - `repo_reviewer` reviews pull requests and produces structured findings.
 - `ci_triage` classifies failed CI runs and suggests next actions.
+- `workspace_editor` performs approval-gated local workspace mutation through a deterministic path.
 - `incident_enricher` gathers logs, traces, and likely blast radius for production alerts.
 
 The demo shows five things at once:
 
 1. Dependency-aware activation and drain order.
 2. Degraded behavior when `repo_indexer` or an MCP dependency is impaired.
-3. Approval-gated mutating actions for workspace or ticket updates.
+3. Approval-gated local workspace mutation with explicit grant, lease, and revoke control.
 4. Restart recovery from the last durable checkpoint.
 5. Continuity behavior when every external model route is unavailable.
 
@@ -209,8 +214,11 @@ The current Rust alpha already covers one runnable Hero P0 slice:
 - `repo.index` scans a local workspace and emits `repo_index.json`.
 - `repo.review` runs deterministic review checks and reuses or bootstraps the latest repo index.
 - `ci.triage` classifies CI failures from direct logs or from an SSE MCP tool route.
+- `workspace.patch.apply` performs deterministic local file edits under explicit approval, grant, and lease control.
 - `inspect` surfaces artifact refs, checkpoint refs, recovery stage, continuity mode, encounter metadata, and external refs.
+- `action list`, `action approve`, `action reject`, and `lease revoke` expose the operator control path over the local UDS API.
 - restart recovery requeues `running` actions and resumes deterministic work from checkpoint metadata.
+- same-owner local read-only actions can be leased automatically, while same-device foreign-owner mutation remains denied by default.
 
 The first external tool transport implemented in code is `MCP over SSE`. `repo_reviewer` remains deterministic-first, while `ci_triage` can fetch remote log material through MCP and then complete the actual classification locally.
 
@@ -238,15 +246,28 @@ cargo run -p crawfish-cli --bin crawfish -- action submit \
   --target-agent repo_reviewer \
   --capability repo.review \
   --goal "review pull request" \
+  --caller-owner local-dev \
   --inputs-json "{\"workspace_root\":\"$(pwd)\",\"changed_files\":[\"src/lib.rs\"]}" \
   --json
 cargo run -p crawfish-cli --bin crawfish -- action submit \
   --target-agent ci_triage \
   --capability ci.triage \
   --goal "triage local logs" \
+  --caller-owner local-dev \
   --inputs-json "{\"log_text\":\"error: test failed, to rerun pass \`cargo test\`\"}" \
   --json
-cargo run -p crawfish-cli --bin crawfish -- inspect <action-id> --json
+MUTATION_ID=$(cargo run -p crawfish-cli --bin crawfish -- action submit \
+  --target-agent workspace_editor \
+  --capability workspace.patch.apply \
+  --goal "apply local patch" \
+  --caller-owner local-dev \
+  --workspace-write \
+  --mutating \
+  --inputs-json "{\"workspace_root\":\"$(pwd)\",\"edits\":[{\"path\":\"notes.txt\",\"op\":\"create\",\"contents\":\"hello from crawfish\\n\"}]}" \
+  --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["action_id"])')
+cargo run -p crawfish-cli --bin crawfish -- action list --phase awaiting_approval --json
+cargo run -p crawfish-cli --bin crawfish -- action approve "$MUTATION_ID" --approver local-dev --json
+cargo run -p crawfish-cli --bin crawfish -- inspect "$MUTATION_ID" --json
 kill $CRAWFISH_PID
 ```
 

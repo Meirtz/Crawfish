@@ -40,8 +40,9 @@ The live alpha example fleet is tracked under:
 - [`../examples/hero-fleet/agents/repo_indexer.toml`](../examples/hero-fleet/agents/repo_indexer.toml)
 - [`../examples/hero-fleet/agents/repo_reviewer.toml`](../examples/hero-fleet/agents/repo_reviewer.toml)
 - [`../examples/hero-fleet/agents/ci_triage.toml`](../examples/hero-fleet/agents/ci_triage.toml)
+- [`../examples/hero-fleet/agents/workspace_editor.toml`](../examples/hero-fleet/agents/workspace_editor.toml)
 
-That example is the current implementation reference for Hero P0: deterministic `repo.index`, deterministic-first `repo.review`, and `ci.triage` with either direct log input or SSE MCP-backed log fetch.
+That example is the current implementation reference for Hero P0: deterministic `repo.index`, deterministic-first `repo.review`, `ci_triage` with either direct log input or SSE MCP-backed log fetch, and approval-gated local mutation through `workspace_editor`.
 
 ## Export Policy
 
