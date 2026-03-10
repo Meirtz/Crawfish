@@ -1241,6 +1241,24 @@ pub struct CiTriageArtifact {
     pub next_steps: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IncidentEnrichmentArtifact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_url: Option<String>,
+    #[serde(default)]
+    pub probable_blast_radius: Vec<String>,
+    #[serde(default)]
+    pub error_signatures: Vec<String>,
+    #[serde(default)]
+    pub repeated_symptoms: Vec<String>,
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncounterRecord {
     pub id: String,

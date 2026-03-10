@@ -28,8 +28,8 @@ use crawfish_types::{
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
-    RepoIndexerDeterministicExecutor, RepoReviewerDeterministicExecutor,
-    WorkspacePatchApplyDeterministicExecutor,
+    IncidentEnricherDeterministicExecutor, RepoIndexerDeterministicExecutor,
+    RepoReviewerDeterministicExecutor, WorkspacePatchApplyDeterministicExecutor,
 };
 use serde_json::Value;
 use std::fs;
@@ -368,6 +368,32 @@ impl Supervisor {
                 if !(has_log_text || has_log_file || has_mcp_resource_ref) {
                     anyhow::bail!(
                         "invalid action request: ci.triage requires log_text, log_file, or mcp_resource_ref"
+                    );
+                }
+            }
+            "incident.enrich" => {
+                let has_log_text = request
+                    .inputs
+                    .get("log_text")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                let has_log_file = request
+                    .inputs
+                    .get("log_file")
+                    .and_then(Value::as_str)
+                    .map(|path| Path::new(path).is_file())
+                    .unwrap_or(false);
+                let has_service_manifest = request
+                    .inputs
+                    .get("service_manifest_file")
+                    .and_then(Value::as_str)
+                    .map(|path| Path::new(path).is_file())
+                    .unwrap_or(false);
+
+                if !(has_log_text || has_log_file || has_service_manifest) {
+                    anyhow::bail!(
+                        "invalid action request: incident.enrich requires log_text, log_file, or service_manifest_file"
                     );
                 }
             }
@@ -1068,6 +1094,19 @@ impl Supervisor {
                     action,
                     "deterministic.workspace_patch_apply",
                     "applying",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
+        }
+
+        if action.capability == "incident.enrich" {
+            let executor = IncidentEnricherDeterministicExecutor::new(self.state_dir());
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.incident_enrich",
+                    "enriching",
                     Vec::new(),
                     &executor,
                 )
@@ -2548,6 +2587,88 @@ mod tests {
             .unwrap();
         let triage: CiTriageArtifact = serde_json::from_str(&artifact).unwrap();
         assert_eq!(triage.family, crawfish_types::CiFailureFamily::Test);
+    }
+
+    #[tokio::test]
+    async fn incident_enrich_completes_with_local_inputs() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+        let manifest_path = dir.path().join("services.toml");
+        tokio::fs::write(
+            &manifest_path,
+            r#"[services.api]
+depends_on = ["db"]
+
+[services.web]
+depends_on = ["api"]
+
+[services.db]
+depends_on = []
+"#,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "incident_enricher".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: crawfish_types::OwnerRef {
+                    kind: crawfish_types::OwnerKind::Human,
+                    id: "local-dev".to_string(),
+                    display_name: None,
+                },
+                capability: "incident.enrich".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "enrich incident".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    ("service_name".to_string(), serde_json::json!("api")),
+                    (
+                        "log_text".to_string(),
+                        serde_json::json!(
+                            "ERROR timeout contacting db\n503 service unavailable from api\n"
+                        ),
+                    ),
+                    (
+                        "service_manifest_file".to_string(),
+                        serde_json::json!(manifest_path.display().to_string()),
+                    ),
+                ]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+
+        supervisor.process_action_queue_once().await.unwrap();
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        let artifact = tokio::fs::read_to_string(&detail.artifact_refs[0].path)
+            .await
+            .unwrap();
+        let enrichment: crawfish_types::IncidentEnrichmentArtifact =
+            serde_json::from_str(&artifact).unwrap();
+        assert!(enrichment
+            .probable_blast_radius
+            .contains(&"api".to_string()));
+        assert!(enrichment
+            .probable_blast_radius
+            .contains(&"web".to_string()));
     }
 
     #[tokio::test]

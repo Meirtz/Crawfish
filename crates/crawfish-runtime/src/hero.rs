@@ -2,9 +2,9 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use crawfish_core::DeterministicExecutor;
 use crawfish_types::{
-    Action, ActionOutputs, ArtifactRef, CiFailureFamily, CiTriageArtifact, RepoIndexArtifact,
-    ReviewFinding, ReviewFindingsArtifact, ReviewRiskLevel, WorkspaceApplyResult, WorkspaceEdit,
-    WorkspaceEditOp, WorkspaceRejectedEdit,
+    Action, ActionOutputs, ArtifactRef, CiFailureFamily, CiTriageArtifact,
+    IncidentEnrichmentArtifact, RepoIndexArtifact, ReviewFinding, ReviewFindingsArtifact,
+    ReviewRiskLevel, WorkspaceApplyResult, WorkspaceEdit, WorkspaceEditOp, WorkspaceRejectedEdit,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -23,6 +23,10 @@ pub struct RepoReviewerDeterministicExecutor {
 }
 
 pub struct CiTriageDeterministicExecutor {
+    state_dir: PathBuf,
+}
+
+pub struct IncidentEnricherDeterministicExecutor {
     state_dir: PathBuf,
 }
 
@@ -51,6 +55,12 @@ impl RepoReviewerDeterministicExecutor {
 }
 
 impl CiTriageDeterministicExecutor {
+    pub fn new(state_dir: PathBuf) -> Self {
+        Self { state_dir }
+    }
+}
+
+impl IncidentEnricherDeterministicExecutor {
     pub fn new(state_dir: PathBuf) -> Self {
         Self { state_dir }
     }
@@ -279,6 +289,75 @@ impl DeterministicExecutor for CiTriageDeterministicExecutor {
                 (
                     "failure_family".to_string(),
                     serde_json::json!(format!("{:?}", artifact.family).to_lowercase()),
+                ),
+            ]),
+        })
+    }
+}
+
+#[async_trait]
+impl DeterministicExecutor for IncidentEnricherDeterministicExecutor {
+    async fn execute(&self, action: &Action) -> anyhow::Result<ActionOutputs> {
+        let log_text = incident_log_text_from_action(action).await?;
+        let service_manifest = incident_service_manifest_from_action(action).await?;
+        let service_name = optional_input_string(action, "service_name");
+        let alert_name = optional_input_string(action, "alert_name");
+        let run_url = optional_input_string(action, "run_url");
+
+        let probable_blast_radius = probable_blast_radius(
+            service_name.clone(),
+            alert_name.clone(),
+            &log_text,
+            service_manifest.as_ref(),
+        );
+        let error_signatures = extract_error_signatures(&log_text);
+        let repeated_symptoms = extract_repeated_symptoms(&log_text);
+        let next_steps = incident_next_steps(
+            &probable_blast_radius,
+            &error_signatures,
+            &repeated_symptoms,
+        );
+
+        let artifact = IncidentEnrichmentArtifact {
+            service_name,
+            alert_name,
+            run_url,
+            probable_blast_radius,
+            error_signatures,
+            repeated_symptoms,
+            next_steps,
+        };
+
+        let json_ref = write_json_artifact(
+            &self.state_dir,
+            &action.id,
+            "incident_enrichment.json",
+            &artifact,
+        )
+        .await?;
+        let markdown_ref = write_text_artifact(
+            &self.state_dir,
+            &action.id,
+            "incident_summary.md",
+            &build_incident_summary_markdown(&artifact, action),
+        )
+        .await?;
+
+        Ok(ActionOutputs {
+            summary: Some(format!(
+                "Incident enrichment found {} likely impacted services and {} error signatures",
+                artifact.probable_blast_radius.len(),
+                artifact.error_signatures.len()
+            )),
+            artifacts: vec![json_ref, markdown_ref],
+            metadata: BTreeMap::from([
+                (
+                    "executor_class".to_string(),
+                    serde_json::json!("deterministic"),
+                ),
+                (
+                    "blast_radius_count".to_string(),
+                    serde_json::json!(artifact.probable_blast_radius.len()),
                 ),
             ]),
         })
@@ -654,6 +733,57 @@ async fn triage_log_text_from_action(action: &Action) -> anyhow::Result<String> 
     ))
 }
 
+async fn incident_log_text_from_action(action: &Action) -> anyhow::Result<String> {
+    if let Some(log_text) = action
+        .inputs
+        .get("log_text")
+        .and_then(|value| value.as_str())
+    {
+        return Ok(log_text.to_string());
+    }
+
+    if let Some(log_file) = action
+        .inputs
+        .get("log_file")
+        .and_then(|value| value.as_str())
+    {
+        return Ok(fs::read_to_string(log_file).await?);
+    }
+
+    Ok(String::new())
+}
+
+async fn incident_service_manifest_from_action(
+    action: &Action,
+) -> anyhow::Result<Option<IncidentServiceManifest>> {
+    let Some(path) = action
+        .inputs
+        .get("service_manifest_file")
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(None);
+    };
+
+    let contents = fs::read_to_string(path).await?;
+    if path.ends_with(".toml") {
+        return Ok(Some(toml::from_str(&contents)?));
+    }
+
+    if let Ok(doc) = serde_json::from_str(&contents) {
+        return Ok(Some(doc));
+    }
+
+    Ok(Some(toml::from_str(&contents)?))
+}
+
+fn optional_input_string(action: &Action, key: &str) -> Option<String> {
+    action
+        .inputs
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
 fn parse_changed_files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
     for line in diff.lines() {
@@ -911,6 +1041,254 @@ fn build_ci_triage_summary_markdown(artifact: &CiTriageArtifact, action: &Action
     lines.join("\n")
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct IncidentServiceManifest {
+    #[serde(default)]
+    services: BTreeMap<String, IncidentServiceNode>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct IncidentServiceNode {
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+fn probable_blast_radius(
+    service_name: Option<String>,
+    alert_name: Option<String>,
+    log_text: &str,
+    service_manifest: Option<&IncidentServiceManifest>,
+) -> Vec<String> {
+    let mut seeds = Vec::new();
+    if let Some(service_name) = service_name {
+        seeds.push(service_name);
+    }
+
+    let searchable = format!(
+        "{}\n{}",
+        log_text.to_lowercase(),
+        alert_name.unwrap_or_default().to_lowercase()
+    );
+    if let Some(manifest) = service_manifest {
+        for service in manifest.services.keys() {
+            if searchable.contains(&service.to_lowercase()) {
+                seeds.push(service.clone());
+            }
+        }
+    }
+
+    seeds.sort();
+    seeds.dedup();
+
+    if let Some(manifest) = service_manifest {
+        let reverse = build_reverse_dependencies(manifest);
+        let mut impacted = seeds.clone();
+        let mut queue = seeds;
+        while let Some(current) = queue.pop() {
+            if let Some(dependents) = reverse.get(&current) {
+                for dependent in dependents {
+                    if !impacted.contains(dependent) {
+                        impacted.push(dependent.clone());
+                        queue.push(dependent.clone());
+                    }
+                }
+            }
+        }
+        impacted.sort();
+        impacted.dedup();
+        return impacted;
+    }
+
+    seeds
+}
+
+fn build_reverse_dependencies(manifest: &IncidentServiceManifest) -> BTreeMap<String, Vec<String>> {
+    let mut reverse = BTreeMap::new();
+    for (service, node) in &manifest.services {
+        reverse.entry(service.clone()).or_insert_with(Vec::new);
+        for dependency in &node.depends_on {
+            reverse
+                .entry(dependency.clone())
+                .or_insert_with(Vec::new)
+                .push(service.clone());
+        }
+    }
+    for dependents in reverse.values_mut() {
+        dependents.sort();
+        dependents.dedup();
+    }
+    reverse
+}
+
+fn extract_error_signatures(log_text: &str) -> Vec<String> {
+    let mut signatures = log_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            [
+                "error",
+                "exception",
+                "panic",
+                "timeout",
+                "failed",
+                "unavailable",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle))
+        })
+        .map(|line| line.chars().take(160).collect::<String>())
+        .collect::<Vec<_>>();
+    signatures.sort();
+    signatures.dedup();
+    signatures.truncate(5);
+    signatures
+}
+
+fn extract_repeated_symptoms(log_text: &str) -> Vec<String> {
+    let lower = log_text.to_lowercase();
+    let mut symptoms = Vec::new();
+    if lower.contains("timeout") || lower.contains("deadline exceeded") {
+        symptoms.push("timeouts or deadline pressure".to_string());
+    }
+    if lower.contains("503")
+        || lower.contains("service unavailable")
+        || lower.contains("reset by peer")
+    {
+        symptoms.push("downstream service instability".to_string());
+    }
+    if lower.contains("panic") || lower.contains("segmentation fault") {
+        symptoms.push("process crash symptoms".to_string());
+    }
+    if lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("access denied")
+    {
+        symptoms.push("authorization failures".to_string());
+    }
+    if lower.contains("out of memory") || lower.contains("disk full") {
+        symptoms.push("resource exhaustion".to_string());
+    }
+    if lower.contains("connection refused") || lower.contains("dns") {
+        symptoms.push("network or name resolution issues".to_string());
+    }
+    symptoms
+}
+
+fn incident_next_steps(
+    probable_blast_radius: &[String],
+    error_signatures: &[String],
+    repeated_symptoms: &[String],
+) -> Vec<String> {
+    let mut steps = Vec::new();
+    if !probable_blast_radius.is_empty() {
+        steps.push(format!(
+            "Inspect the owners and dashboards for likely impacted services: {}.",
+            probable_blast_radius.join(", ")
+        ));
+    }
+    if repeated_symptoms
+        .iter()
+        .any(|symptom| symptom.contains("network") || symptom.contains("service instability"))
+    {
+        steps.push(
+            "Check network paths, upstream availability, and recent deploys on dependent services."
+                .to_string(),
+        );
+    }
+    if repeated_symptoms
+        .iter()
+        .any(|symptom| symptom.contains("authorization"))
+    {
+        steps.push(
+            "Verify recent credential, policy, and token changes for the failing path.".to_string(),
+        );
+    }
+    if repeated_symptoms
+        .iter()
+        .any(|symptom| symptom.contains("resource exhaustion"))
+    {
+        steps.push(
+            "Inspect CPU, memory, and disk pressure on the affected worker or service.".to_string(),
+        );
+    }
+    if !error_signatures.is_empty() {
+        steps.push(
+            "Attach the top error signatures to the operator handoff or incident ticket."
+                .to_string(),
+        );
+    }
+    if steps.is_empty() {
+        steps.push(
+            "Review the full logs and service topology to refine the blast radius.".to_string(),
+        );
+    }
+    steps
+}
+
+fn build_incident_summary_markdown(
+    artifact: &IncidentEnrichmentArtifact,
+    action: &Action,
+) -> String {
+    let mut lines = vec![
+        "# Incident Enrichment Summary".to_string(),
+        String::new(),
+        format!("- Capability: `{}`", action.capability),
+    ];
+    if let Some(service_name) = &artifact.service_name {
+        lines.push(format!("- Service: `{service_name}`"));
+    }
+    if let Some(alert_name) = &artifact.alert_name {
+        lines.push(format!("- Alert: `{alert_name}`"));
+    }
+    if let Some(run_url) = &artifact.run_url {
+        lines.push(format!("- Run URL: {run_url}"));
+    }
+
+    lines.push(String::new());
+    lines.push("## Probable Blast Radius".to_string());
+    lines.push(String::new());
+    if artifact.probable_blast_radius.is_empty() {
+        lines.push("- No impacted services could be inferred deterministically.".to_string());
+    } else {
+        for service in &artifact.probable_blast_radius {
+            lines.push(format!("- {service}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Error Signatures".to_string());
+    lines.push(String::new());
+    if artifact.error_signatures.is_empty() {
+        lines.push("- No high-confidence error signatures found.".to_string());
+    } else {
+        for signature in &artifact.error_signatures {
+            lines.push(format!("- {signature}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Repeated Symptoms".to_string());
+    lines.push(String::new());
+    if artifact.repeated_symptoms.is_empty() {
+        lines.push("- No repeated symptom families detected.".to_string());
+    } else {
+        for symptom in &artifact.repeated_symptoms {
+            lines.push(format!("- {symptom}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Suggested Next Steps".to_string());
+    lines.push(String::new());
+    for step in &artifact.next_steps {
+        lines.push(format!("- {step}"));
+    }
+
+    lines.join("\n")
+}
+
 async fn resolve_owners(
     workspace_root: &Path,
     files: &[String],
@@ -1017,8 +1395,8 @@ mod tests {
     use super::*;
     use crawfish_core::now_timestamp;
     use crawfish_types::{
-        Action, ActionPhase, ExecutionContract, GoalSpec, OwnerKind, OwnerRef, RequesterKind,
-        RequesterRef, ScheduleSpec, WorkspaceApplyResult,
+        Action, ActionPhase, ExecutionContract, GoalSpec, IncidentEnrichmentArtifact, OwnerKind,
+        OwnerRef, RequesterKind, RequesterRef, ScheduleSpec, WorkspaceApplyResult,
     };
     use tempfile::tempdir;
 
@@ -1200,6 +1578,68 @@ mod tests {
             .unwrap();
         let triage: CiTriageArtifact = serde_json::from_str(&artifact).unwrap();
         assert_eq!(triage.family, CiFailureFamily::Test);
+    }
+
+    #[tokio::test]
+    async fn incident_enricher_emits_blast_radius_summary() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join(".crawfish/state");
+        let manifest_path = dir.path().join("services.toml");
+        fs::write(
+            &manifest_path,
+            r#"[services.api]
+depends_on = ["db"]
+
+[services.web]
+depends_on = ["api"]
+
+[services.worker]
+depends_on = ["api"]
+
+[services.db]
+depends_on = []
+"#,
+        )
+        .await
+        .unwrap();
+        let action = action_with_capability(
+            "incident.enrich",
+            BTreeMap::from([
+                ("service_name".to_string(), serde_json::json!("api")),
+                (
+                    "alert_name".to_string(),
+                    serde_json::json!("api latency high"),
+                ),
+                (
+                    "log_text".to_string(),
+                    serde_json::json!(
+                        "ERROR timeout contacting db\n503 service unavailable from api\n"
+                    ),
+                ),
+                (
+                    "service_manifest_file".to_string(),
+                    serde_json::json!(manifest_path.display().to_string()),
+                ),
+            ]),
+        );
+        let executor = IncidentEnricherDeterministicExecutor::new(state_dir);
+        let outputs = executor.execute(&action).await.unwrap();
+
+        assert_eq!(outputs.artifacts.len(), 2);
+        let artifact = fs::read_to_string(&outputs.artifacts[0].path)
+            .await
+            .unwrap();
+        let enrichment: IncidentEnrichmentArtifact = serde_json::from_str(&artifact).unwrap();
+        assert!(enrichment
+            .probable_blast_radius
+            .contains(&"api".to_string()));
+        assert!(enrichment
+            .probable_blast_radius
+            .contains(&"web".to_string()));
+        assert!(enrichment
+            .probable_blast_radius
+            .contains(&"worker".to_string()));
+        assert!(!enrichment.error_signatures.is_empty());
     }
 
     #[tokio::test]
