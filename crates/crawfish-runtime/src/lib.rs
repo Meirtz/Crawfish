@@ -20,6 +20,7 @@ use crawfish_core::{
     SupervisorControl,
 };
 use crawfish_mcp::McpAdapter;
+use crawfish_openclaw::OpenClawAdapter;
 use crawfish_store_sqlite::SqliteStore;
 use crawfish_types::{
     Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, ApprovalPolicy,
@@ -206,6 +207,11 @@ impl Supervisor {
 
     async fn recover_running_actions(&self) -> anyhow::Result<()> {
         for mut action in self.store.list_actions_by_phase(Some("running")).await? {
+            let abandoned_openclaw_run = action
+                .external_refs
+                .iter()
+                .find(|reference| reference.kind == "openclaw.run_id")
+                .map(|reference| reference.value.clone());
             let recovery_stage = match self.load_deterministic_checkpoint(&action).await? {
                 Some(checkpoint) => {
                     action.checkpoint_ref =
@@ -220,6 +226,18 @@ impl Supervisor {
             action.recovery_stage = recovery_stage.clone();
             action.failure_code = Some(failure_code_requeued_after_restart().to_string());
             self.store.upsert_action(&action).await?;
+            if let Some(run_id) = abandoned_openclaw_run {
+                self.store
+                    .append_action_event(
+                        &action.id,
+                        "openclaw_run_abandoned",
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "reason": "daemon restart requeued running action",
+                        }),
+                    )
+                    .await?;
+            }
             self.store
                 .append_action_event(
                     &action.id,
@@ -669,6 +687,36 @@ impl Supervisor {
             });
         }
         Ok(Some((adapter, external_refs)))
+    }
+
+    fn resolve_openclaw_adapter(
+        &self,
+        manifest: &AgentManifest,
+    ) -> anyhow::Result<Option<(OpenClawAdapter, Vec<ExternalRef>)>> {
+        let binding = manifest.adapters.iter().find_map(|binding| match binding {
+            AdapterBinding::Openclaw(binding) => Some(binding.clone()),
+            _ => None,
+        });
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+
+        let external_refs = vec![
+            ExternalRef {
+                kind: "openclaw.gateway_url".to_string(),
+                value: binding.gateway_url.clone(),
+                endpoint: Some(binding.gateway_url.clone()),
+            },
+            ExternalRef {
+                kind: "openclaw.target_agent".to_string(),
+                value: binding.target_agent.clone(),
+                endpoint: None,
+            },
+        ];
+        Ok(Some((
+            OpenClawAdapter::new(binding, self.state_dir()),
+            external_refs,
+        )))
     }
 
     fn continuity_blocked_outcome(
@@ -1286,6 +1334,104 @@ impl Supervisor {
         }
 
         if action.capability == "coding.patch.plan" {
+            let deterministic_fallback = action
+                .contract
+                .execution
+                .fallback_chain
+                .iter()
+                .any(|route| route == "deterministic");
+            let prefers_openclaw = action
+                .contract
+                .execution
+                .preferred_harnesses
+                .iter()
+                .any(|route| route == "openclaw");
+
+            if prefers_openclaw {
+                match self.resolve_openclaw_adapter(manifest)? {
+                    Some((adapter, base_refs)) => match adapter.run(action).await {
+                        Ok(result) => {
+                            return Ok(ExecutionOutcome::Completed {
+                                outputs: result.outputs,
+                                selected_executor: format!("openclaw.{}", adapter.name()),
+                                checkpoint: None,
+                                external_refs: merge_external_refs(base_refs, result.external_refs),
+                                surface_events: result.events,
+                            });
+                        }
+                        Err(error) => {
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": "openclaw",
+                                        "reason": error.to_string(),
+                                        "code": failure_code_route_unavailable(),
+                                        "fallback": if deterministic_fallback { "deterministic" } else { "continuity" },
+                                    }),
+                                )
+                                .await?;
+                            if deterministic_fallback {
+                                let executor =
+                                    CodingPatchPlannerDeterministicExecutor::new(self.state_dir());
+                                let mut outcome = self
+                                    .run_deterministic_executor(
+                                        action,
+                                        "deterministic.coding_patch_plan",
+                                        "planning",
+                                        base_refs,
+                                        &executor,
+                                    )
+                                    .await?;
+                                if let ExecutionOutcome::Completed { surface_events, .. } =
+                                    &mut outcome
+                                {
+                                    surface_events.push(crawfish_core::SurfaceActionEvent {
+                                        event_type: "continuity_selected".to_string(),
+                                        payload: serde_json::json!({
+                                            "selected_surface": "deterministic",
+                                            "reason": error.to_string(),
+                                            "continuity_mode": "deterministic_only",
+                                        }),
+                                    });
+                                }
+                                return Ok(outcome);
+                            }
+                            return Ok(self.continuity_blocked_outcome(
+                                action,
+                                error.to_string(),
+                                false,
+                                base_refs,
+                            ));
+                        }
+                    },
+                    None => {
+                        if deterministic_fallback {
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": "openclaw",
+                                        "reason": "no OpenClaw binding is configured for coding.patch.plan",
+                                        "code": failure_code_route_unavailable(),
+                                        "fallback": "deterministic",
+                                    }),
+                                )
+                                .await?;
+                        } else {
+                            return Ok(self.continuity_blocked_outcome(
+                                action,
+                                "no OpenClaw binding is configured for coding.patch.plan",
+                                false,
+                                Vec::new(),
+                            ));
+                        }
+                    }
+                }
+            }
+
             let executor = CodingPatchPlannerDeterministicExecutor::new(self.state_dir());
             return self
                 .run_deterministic_executor(
@@ -3155,7 +3301,7 @@ mod tests {
     use bytes::Bytes;
     use crawfish_core::CheckpointStore;
     use crawfish_types::{CiTriageArtifact, RequesterKind, RequesterRef};
-    use futures_util::{stream, StreamExt};
+    use futures_util::{stream, SinkExt, StreamExt};
     use http_body_util::{BodyExt, Full};
     use hyper::{Method, Request, Uri};
     use hyper_util::client::legacy::Client;
@@ -3166,10 +3312,25 @@ mod tests {
     use tempfile::tempdir;
     use tokio::net::TcpListener;
     use tokio::sync::{mpsc, Mutex};
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::{
+            handshake::server::{Request as WsRequest, Response as WsResponse},
+            Message as WsMessage,
+        },
+    };
 
     async fn build_supervisor_with_config(
         dir: &Path,
         config_contents: String,
+    ) -> anyhow::Result<Arc<Supervisor>> {
+        build_supervisor_with_config_and_openclaw_gateway(dir, config_contents, None).await
+    }
+
+    async fn build_supervisor_with_config_and_openclaw_gateway(
+        dir: &Path,
+        config_contents: String,
+        openclaw_gateway_url: Option<&str>,
     ) -> anyhow::Result<Arc<Supervisor>> {
         tokio::fs::create_dir_all(dir.join("agents")).await?;
         tokio::fs::create_dir_all(dir.join(".crawfish/state")).await?;
@@ -3191,14 +3352,16 @@ mod tests {
             "coding_planner",
             "workspace_editor",
         ] {
-            tokio::fs::write(
-                dir.join(format!("agents/{agent}.toml")),
-                std::fs::read_to_string(format!(
-                    "{}/../../examples/hero-fleet/agents/{agent}.toml",
-                    env!("CARGO_MANIFEST_DIR")
-                ))?,
-            )
-            .await?;
+            let mut manifest = std::fs::read_to_string(format!(
+                "{}/../../examples/hero-fleet/agents/{agent}.toml",
+                env!("CARGO_MANIFEST_DIR")
+            ))?;
+            if agent == "coding_planner" {
+                if let Some(gateway_url) = openclaw_gateway_url {
+                    manifest = manifest.replace("ws://127.0.0.1:9988/gateway", gateway_url);
+                }
+            }
+            tokio::fs::write(dir.join(format!("agents/{agent}.toml")), manifest).await?;
         }
         let supervisor = Arc::new(Supervisor::from_config_path(&dir.join("Crawfish.toml")).await?);
         supervisor.run_once().await?;
@@ -3226,6 +3389,18 @@ mod tests {
         build_supervisor_with_config(
             dir,
             include_str!("../../../examples/hero-fleet/Crawfish.toml").to_string(),
+        )
+        .await
+    }
+
+    async fn build_supervisor_with_openclaw_gateway(
+        dir: &Path,
+        gateway_url: &str,
+    ) -> anyhow::Result<Arc<Supervisor>> {
+        build_supervisor_with_config_and_openclaw_gateway(
+            dir,
+            include_str!("../../../examples/hero-fleet/Crawfish.toml").to_string(),
+            Some(gateway_url),
         )
         .await
     }
@@ -3435,6 +3610,102 @@ mod tests {
         Json(serde_json::json!({"accepted": true}))
     }
 
+    async fn spawn_mock_openclaw_gateway() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = accept_hdr_async(stream, |_request: &WsRequest, response: WsResponse| {
+                Ok(response)
+            })
+            .await
+            .unwrap();
+            let (mut sink, mut source) = ws.split();
+            while let Some(message) = source.next().await {
+                let WsMessage::Text(text) = message.unwrap() else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let method = frame.get("method").and_then(Value::as_str).unwrap();
+                let id = frame.get("id").and_then(Value::as_str).unwrap();
+                match method {
+                    "connect" => {
+                        sink.send(WsMessage::Text(
+                            serde_json::json!({
+                                "type":"res",
+                                "id": id,
+                                "ok": true,
+                                "result": {"sessionKey":"gateway-session"}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    "agent" => {
+                        sink.send(WsMessage::Text(
+                            serde_json::json!({
+                                "type":"event",
+                                "event":"assistant",
+                                "runId":"run-123",
+                                "payload":{"stream":"assistant","text":"Outline the patch plan"}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                        sink.send(WsMessage::Text(
+                            serde_json::json!({
+                                "type":"res",
+                                "id": id,
+                                "ok": true,
+                                "result": {"runId":"run-123"}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    "agent.wait" => {
+                        sink.send(WsMessage::Text(
+                            serde_json::json!({
+                                "type":"event",
+                                "event":"tool",
+                                "runId":"run-123",
+                                "payload":{"stream":"tool","message":"read target files"}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                        sink.send(WsMessage::Text(
+                            serde_json::json!({
+                                "type":"res",
+                                "id": id,
+                                "ok": true,
+                                "result": {
+                                    "status":"completed",
+                                    "text":"# Patch Plan\n1. Inspect `src/lib.rs`\n2. Add validation checks\n3. Update tests\nRisks: config drift\nTest: cargo test --workspace"
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                        break;
+                    }
+                    other => panic!("unexpected gateway method: {other}"),
+                }
+            }
+        });
+        format!("ws://{address}")
+    }
+
     #[tokio::test]
     async fn submit_action_completes_deterministically() {
         let dir = tempdir().unwrap();
@@ -3495,6 +3766,164 @@ mod tests {
             .iter()
             .any(|artifact| artifact.kind == "review_summary"));
         assert!(detail.action.checkpoint_ref.is_some());
+    }
+
+    #[tokio::test]
+    async fn coding_patch_plan_routes_to_openclaw_and_streams_events() {
+        let dir = tempdir().unwrap();
+        let gateway_url = spawn_mock_openclaw_gateway().await;
+        std::env::set_var("OPENCLAW_GATEWAY_TOKEN", "test-token");
+        let supervisor = build_supervisor_with_openclaw_gateway(dir.path(), &gateway_url)
+            .await
+            .unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "coding_planner".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: crawfish_types::OwnerRef {
+                    kind: crawfish_types::OwnerKind::Human,
+                    id: "local-dev".to_string(),
+                    display_name: None,
+                },
+                capability: "coding.patch.plan".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "plan a patch".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "task".to_string(),
+                        serde_json::json!("Add validation checks around the repo indexing path"),
+                    ),
+                    (
+                        "files_of_interest".to_string(),
+                        serde_json::json!(["src/lib.rs"]),
+                    ),
+                ]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(
+            detail.selected_executor.as_deref(),
+            Some("openclaw.coding-planner")
+        );
+        assert!(detail
+            .external_refs
+            .iter()
+            .any(|reference| reference.kind == "openclaw.run_id" && reference.value == "run-123"));
+        let events = supervisor
+            .list_action_events(&submitted.action_id)
+            .await
+            .unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "openclaw_run_started"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "openclaw_assistant_event"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "openclaw_run_completed"));
+    }
+
+    #[tokio::test]
+    async fn coding_patch_plan_falls_back_to_deterministic_when_gateway_is_unavailable() {
+        let dir = tempdir().unwrap();
+        std::env::set_var("OPENCLAW_GATEWAY_TOKEN", "test-token");
+        let supervisor =
+            build_supervisor_with_openclaw_gateway(dir.path(), "ws://127.0.0.1:9/unavailable")
+                .await
+                .unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "coding_planner".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: crawfish_types::OwnerRef {
+                    kind: crawfish_types::OwnerKind::Human,
+                    id: "local-dev".to_string(),
+                    display_name: None,
+                },
+                capability: "coding.patch.plan".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "plan a patch".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "task".to_string(),
+                        serde_json::json!("Plan a safe fallback-only patch flow"),
+                    ),
+                ]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(
+            detail.selected_executor.as_deref(),
+            Some("deterministic.coding_patch_plan")
+        );
+        let events = supervisor
+            .list_action_events(&submitted.action_id)
+            .await
+            .unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "route_degraded"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "continuity_selected"));
     }
 
     #[tokio::test]
@@ -3816,6 +4245,84 @@ depends_on = []
         assert_eq!(detail.action.phase, ActionPhase::Completed);
         assert_eq!(detail.recovery_stage.as_deref(), Some("completed"));
         assert!(detail.action.checkpoint_ref.is_some());
+    }
+
+    #[tokio::test]
+    async fn running_openclaw_action_records_abandoned_run_on_restart() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let action = Action {
+            id: "openclaw-running-action".to_string(),
+            target_agent_id: "coding_planner".to_string(),
+            requester: RequesterRef {
+                kind: RequesterKind::User,
+                id: "operator".to_string(),
+            },
+            initiator_owner: crawfish_types::OwnerRef {
+                kind: crawfish_types::OwnerKind::Human,
+                id: "local-dev".to_string(),
+                display_name: None,
+            },
+            counterparty_refs: Vec::new(),
+            goal: crawfish_types::GoalSpec {
+                summary: "plan patch".to_string(),
+                details: None,
+            },
+            capability: "coding.patch.plan".to_string(),
+            inputs: std::collections::BTreeMap::from([
+                (
+                    "workspace_root".to_string(),
+                    serde_json::json!(dir.path().display().to_string()),
+                ),
+                ("task".to_string(), serde_json::json!("Plan a patch")),
+            ]),
+            contract: supervisor.config().contracts.org_defaults.clone(),
+            execution_strategy: None,
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            encounter_ref: None,
+            audit_receipt_ref: None,
+            data_boundary: "owner_local".to_string(),
+            schedule: Default::default(),
+            phase: ActionPhase::Running,
+            created_at: now_timestamp(),
+            started_at: Some(now_timestamp()),
+            finished_at: None,
+            checkpoint_ref: None,
+            continuity_mode: None,
+            degradation_profile: None,
+            failure_reason: None,
+            failure_code: None,
+            selected_executor: Some("openclaw.coding-planner".to_string()),
+            recovery_stage: None,
+            lock_detail: None,
+            external_refs: vec![ExternalRef {
+                kind: "openclaw.run_id".to_string(),
+                value: "run-xyz".to_string(),
+                endpoint: None,
+            }],
+            outputs: ActionOutputs::default(),
+        };
+        supervisor.store().upsert_action(&action).await.unwrap();
+
+        let restarted = Supervisor::from_config_path(&dir.path().join("Crawfish.toml"))
+            .await
+            .unwrap();
+        restarted.run_once().await.unwrap();
+
+        let events = restarted
+            .list_action_events("openclaw-running-action")
+            .await
+            .unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "openclaw_run_abandoned"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "recovered"));
     }
 
     #[tokio::test]

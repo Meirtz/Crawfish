@@ -15,6 +15,7 @@ axum.workspace = true
 bytes.workspace = true
 crawfish-core = { path = "../crawfish-core" }
 crawfish-mcp = { path = "../crawfish-mcp" }
+crawfish-openclaw = { path = "../crawfish-openclaw" }
 crawfish-store-sqlite = { path = "../crawfish-store-sqlite" }
 crawfish-types = { path = "../crawfish-types" }
 http-body-util.workspace = true
@@ -35,3 +36,4 @@ hyper-util.workspace = true
 hyperlocal.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
+tokio-tungstenite.workspace = true
