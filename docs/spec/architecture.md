@@ -628,7 +628,7 @@ Rules:
 | `delivery` | `deadline_ms`, `freshness_ttl_ms`, `required_ack`, `liveliness_window_ms` | time and delivery semantics |
 | `execution` | `max_cost_usd`, `max_tokens`, `model_class`, `preferred_harnesses`, `fallback_chain`, `retry_budget` | model, harness, and compute constraints |
 | `safety` | `tool_scope`, `approval_policy`, `mutation_mode`, `data_zone`, `secret_policy` | what the action may touch |
-| `quality` | `quality_class`, `evaluation_hook`, `minimum_confidence`, `human_review_rule` | escalation and review behavior |
+| `quality` | `quality_class`, `evaluation_profile`, `evaluation_hook`, `minimum_confidence`, `human_review_rule` | doctrine-aware evaluation, escalation, and review behavior |
 | `recovery` | `checkpoint_interval`, `resumability`, `fallback_behavior`, `continuity_preference`, `deterministic_fallbacks`, `human_handoff_policy`, `dead_letter_policy` | restart, outage continuity, and terminal behavior |
 
 ### Contract Contraction Under Degradation
@@ -1022,20 +1022,51 @@ The current post-execution chain is:
 
 1. execute action
 2. assemble `TraceBundle`
-3. run deterministic evaluation hook
-4. persist `EvaluationRecord`
-5. create `ReviewQueueItem` when policy or evaluator requires human attention
-6. persist `FeedbackNote` and review resolution without rewriting action history
-7. emit alert events when doctrine or evaluation requires escalation
+3. resolve `EvaluationProfile`
+4. execute `ScorecardSpec`
+5. persist `EvaluationRecord`
+6. create `ReviewQueueItem` when policy or evaluator requires human attention
+7. emit `AlertEvent` when doctrine or evaluation requires escalation
+8. capture `DatasetCase` when the profile enables dataset freezing
+9. persist `FeedbackNote` and review resolution without rewriting action history
 
-### Initial Evaluation Hooks
+### Evaluation Profiles, Scorecards, And Datasets
 
-| Hook | Behavior |
-| --- | --- |
-| `deterministic_scorecard` | emit a durable evaluation record immediately after completion |
-| `operator_review_queue` | emit an evaluation record and open a review item for operator action |
+`evaluation_profile` is now the primary config selector. `evaluation_hook` remains an alpha-era compatibility alias and should only normalize into built-in profiles.
 
-The initial capability set is:
+The built-in defaults are:
+
+| Capability | Profile | Scorecard | Dataset |
+| --- | --- | --- | --- |
+| `task.plan` | `task_plan_default` | `task_plan_scorecard` | `task_plan_dataset` |
+| `repo.review` | `repo_review_default` | `repo_review_scorecard` | `repo_review_dataset` |
+| `incident.enrich` | `incident_enrich_default` | `incident_enrich_scorecard` | `incident_enrich_dataset` |
+
+Each profile defines:
+
+- one scorecard
+- whether a review queue item should be created
+- which alert rules apply
+- whether dataset capture is enabled
+- whether post-result evaluation is required
+
+The config surface for this layer is:
+
+- `[evaluation.profiles.<name>]`
+- `[evaluation.scorecards.<name>]`
+- `[evaluation.datasets.<name>]`
+- `[evaluation.alerts.<name>]`
+
+The first deterministic criterion kinds are:
+
+- `artifact_present`
+- `json_field_nonempty`
+- `list_min_len`
+- `token_coverage`
+- `checkpoint_passed`
+- `incident_absent`
+
+The initial capability set remains:
 
 - `task.plan`
 - `repo.review`
@@ -1043,7 +1074,19 @@ The initial capability set is:
 
 `verify_loop` is part of the same spine. Verification failures are recorded as evaluations, not only as action events.
 
-LangSmith's [observability](https://docs.langchain.com/langsmith/observability) and [evaluation](https://docs.langchain.com/langsmith/evaluation) are useful reference shapes here. Anthropic's [Claude's Constitution](https://www.anthropic.com/constitution) and [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) are useful reference shapes for rule-guided behavior. Crawfish lifts both ideas into runtime governance: checkpoints, evidence, incidents, review, and escalation.
+LangSmith's [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), and [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules) are useful reference shapes here. Anthropic's [Claude's Constitution](https://www.anthropic.com/constitution) and [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) are useful reference shapes for rule-guided behavior. Crawfish lifts both ideas into runtime governance: checkpoints, evidence, incidents, review, escalation, datasets, and replay experiments.
+
+### Dataset Capture And Replay
+
+The evaluation spine now extends beyond post-result scoring into reusable quality operations.
+
+- completed traces may be frozen as `DatasetCase`s
+- datasets are grouped by capability and carry doctrine, jurisdiction, checkpoint, and incident metadata
+- replay runs execute those cases against one explicit executor surface
+- replay results persist under `ExperimentRun` and `ExperimentCaseResult`
+- replay does not create normal production review queue noise or alert spam by default
+
+This is how Crawfish turns trace history into institutional memory rather than an archive of unread logs.
 
 ## Reference Stack For v0.1
 
@@ -1073,6 +1116,12 @@ The P0 CLI surface is:
 - `crawfish action evals`
 - `crawfish review list`
 - `crawfish review resolve`
+- `crawfish eval dataset list`
+- `crawfish eval dataset show`
+- `crawfish eval run`
+- `crawfish eval run-status`
+- `crawfish alert list`
+- `crawfish alert ack`
 - `crawfish drain`
 - `crawfish resume`
 - `crawfish policy validate`
@@ -1085,6 +1134,9 @@ The P0 CLI surface is:
 - `action evals` returns deterministic evaluations and verification-linked scorecards for one action
 - `review list` returns operator review queue items opened by doctrine or evaluation
 - `review resolve` records operator resolution and feedback without rewriting the action history
+- `eval dataset list` and `eval dataset show` expose captured evaluation datasets and frozen cases
+- `eval run` and `eval run-status` expose isolated replay experiments per executor surface
+- `alert list` and `alert ack` expose doctrine and evaluation escalation signals
 - `drain` prevents new work assignment and reports progress until agents are inactive or finalized
 - `resume` re-enables drained agents or reschedules resumable actions
 - `policy validate` reports whether a manifest, encounter policy, or action override violates hard policy before runtime execution

@@ -33,6 +33,9 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - doctrine-layer runtime types, checkpoint status, enforcement records, and policy incidents
 - evaluation spine primitives for trace bundles, evaluations, review queue items, feedback notes, and alert-oriented event lineage
 - operator commands and UDS endpoints for `action trace`, `action evals`, `review list`, and `review resolve`
+- named evaluation profiles, scorecards, datasets, experiment runs, experiment case results, and alert events
+- operator commands and UDS endpoints for `eval dataset list`, `eval dataset show`, `eval run`, `eval run-status`, `alert list`, and `alert ack`
+- automatic dataset capture and isolated replay runs for `task.plan`, `repo.review`, and `incident.enrich`
 
 ### Changed
 
@@ -50,6 +53,12 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - `task.plan` now normalizes `context_files` as the primary contextual file input while still accepting the alpha-era `files_of_interest` alias
 - the public implementation boundary is now documented as Rust-first, not Rust-only
 - the public philosophy and architecture now explicitly distinguish constitutions from runtime enforcement, and position evaluation as a swarm control-plane substrate rather than a future UI-only concern
+- `quality.evaluation_profile` is now the primary evaluation config surface; `evaluation_hook` remains alpha-compatible but deprecated
+
+### Migration Notes
+
+- prefer `quality.evaluation_profile` for new configs and manifests
+- `quality.evaluation_hook` still parses during `0.1.x alpha`, but only legacy built-ins are normalized automatically
 
 ### Security
 

@@ -91,6 +91,13 @@ PLAN_ID="$(cargo run -p crawfish-cli --bin crawfish -- action submit \
   --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["action_id"])')"
 cargo run -p crawfish-cli --bin crawfish -- inspect "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
 cargo run -p crawfish-cli --bin crawfish -- action events "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
+cargo run -p crawfish-cli --bin crawfish -- action trace "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
+cargo run -p crawfish-cli --bin crawfish -- action evals "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
+cargo run -p crawfish-cli --bin crawfish -- review list --config "${WORKDIR}/Crawfish.toml" --json
+cargo run -p crawfish-cli --bin crawfish -- eval dataset list --config "${WORKDIR}/Crawfish.toml" --json
+cargo run -p crawfish-cli --bin crawfish -- eval dataset show task_plan_dataset --config "${WORKDIR}/Crawfish.toml" --json
+cargo run -p crawfish-cli --bin crawfish -- eval run task_plan_dataset --executor deterministic --config "${WORKDIR}/Crawfish.toml" --json
+cargo run -p crawfish-cli --bin crawfish -- alert list --config "${WORKDIR}/Crawfish.toml" --json
 
 echo "== Submit approval-gated mutation action =="
 MUTATION_ID="$(cargo run -p crawfish-cli --bin crawfish -- action submit \

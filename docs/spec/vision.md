@@ -29,7 +29,7 @@ Crawfish is built around eight philosophical commitments:
 - **Continuity matters more than peak cleverness.** The product is judged by the safest useful work it can keep doing when the reasoning layer is impaired, not only by the best-case intelligence of a healthy model route.
 - **Institutions lag capability growth.** Runtime guardrails, encounter policy, and revocation semantics should arrive before the ecosystem feels fully comfortable with them.
 - **Constitutions are necessary but insufficient.** High-level rules matter, but runtime checkpoints and evidence are what turn them into governance.
-- **Evaluation is a control-plane primitive.** Traces, scorecards, review queues, and feedback loops should be runtime objects, not only analytics afterthoughts.
+- **Evaluation is a control-plane primitive.** Traces, scorecards, review queues, alerts, datasets, and replay loops should be runtime objects, not only analytics afterthoughts.
 
 ## Agent Philosophy
 
@@ -200,7 +200,7 @@ This is the product reason for a doctrine layer. Without it, systems can carry g
 
 The swarm also needs a quality memory, not just an event log.
 
-[LangSmith](https://docs.langchain.com/langsmith/observability) is a useful reference because it shows the right operational shape: observability, evaluation, review, and feedback should be connected. Crawfish should absorb that lesson at the control-plane layer rather than copying a hosted UI directly.
+[LangSmith](https://docs.langchain.com/langsmith/observability-concepts) is a useful reference because it shows the right operational shape: observability, evaluation, review, and automation should be connected. Its [annotation queues](https://docs.langchain.com/langsmith/annotation-queues) and [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules) are especially useful reference points. Crawfish should absorb that lesson at the control-plane layer rather than copying a hosted UI directly.
 
 That means:
 
@@ -208,8 +208,18 @@ That means:
 - deterministic scorecards should produce durable evaluation records
 - review queues should capture work that deserves operator attention
 - feedback should flow into future iterations without erasing the historical record
+- dataset capture should turn completed actions into replayable quality cases
+- replay experiments should compare execution surfaces without generating normal production noise
 
 In other words, evaluation is how a swarm learns without becoming opaque.
+
+This is also where the distinction between constitutional guidance and runtime governance becomes concrete:
+
+- Claude's Constitution can shape what a model prefers
+- it cannot by itself produce trace bundles, scorecards, annotation queues, or replayable datasets
+- it cannot tell an operator where doctrine failed to become enforcement
+
+Crawfish exists to turn those missing institutional layers into runtime behavior.
 
 ## What Crawfish Is And Is Not
 

@@ -140,11 +140,11 @@ Reasoning quality will keep changing. Verification and control have to outlive t
 
 Tracing alone is not enough. Evaluation alone is not enough. A control plane needs both.
 
-LangSmith provides a useful reference shape here through its [observability](https://docs.langchain.com/langsmith/observability) and [evaluation](https://docs.langchain.com/langsmith/evaluation) model: traces, datasets, evaluators, review, and alerts. Crawfish does not copy LangSmith's product. It lifts that shape into swarm runtime infrastructure.
+LangSmith provides a useful reference shape here through its [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), and [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules): traces, datasets, evaluators, review, and alerts belong to one operational loop. Crawfish does not copy LangSmith's product. It lifts that shape into swarm runtime infrastructure.
 
 The runtime now builds an **evaluation spine**:
 
-- `trace -> evaluation -> review queue -> feedback note -> alert`
+- `trace -> scorecard -> review queue -> alert -> dataset -> replay`
 
 That spine is attached to real action execution:
 
@@ -154,6 +154,8 @@ That spine is attached to real action execution:
 
 The point is not to build a hosted dashboard first. The point is to make swarms inspectable and corrigible before the UI arrives.
 
+Observability is the rear-view mirror. Evaluation is the learning loop.
+
 In Crawfish:
 
 - `TraceBundle` captures inputs, executor lineage, artifacts, events, external refs, and verification outputs
@@ -161,6 +163,8 @@ In Crawfish:
 - `ReviewQueueItem` escalates work that should not quietly auto-complete
 - `FeedbackNote` lets operator judgment flow back into future iterations without rewriting history
 - `AlertRule` turns governance or evaluation failures into visible operator signals
+- `DatasetCase` freezes completed actions into replayable evaluation datasets with doctrine and jurisdiction metadata
+- `ExperimentRun` replays those cases against one executor surface so the swarm can learn without polluting production review queues
 
 ## Philosophy
 
@@ -173,6 +177,7 @@ The short version:
 - reasoning is volatile; contracts and verification must survive model churn
 - institutions lag capability growth; runtime guardrails cannot
 - constitutions do not enforce themselves
+- constitutions guide models; institutions govern swarms
 - frontier enforcement gaps are runtime failures, not merely policy failures
 - evaluation is how a swarm learns without becoming opaque
 - design for future multi-owner encounters, not yesterday's app sandbox
@@ -215,6 +220,9 @@ cargo run -p crawfish-cli --bin crawfish -- action events <action-id> --json
 cargo run -p crawfish-cli --bin crawfish -- action trace <action-id> --json
 cargo run -p crawfish-cli --bin crawfish -- action evals <action-id> --json
 cargo run -p crawfish-cli --bin crawfish -- review list --json
+cargo run -p crawfish-cli --bin crawfish -- eval dataset list --json
+cargo run -p crawfish-cli --bin crawfish -- eval run task_plan_dataset --executor deterministic --json
+cargo run -p crawfish-cli --bin crawfish -- alert list --json
 ```
 
 For the full reference walkthrough, run [`examples/hero-swarm/demo.sh`](examples/hero-swarm/demo.sh).
@@ -244,6 +252,11 @@ Breaking alpha changes are allowed, but they must ship with:
 - a changelog entry in [`docs/project/CHANGELOG.md`](docs/project/CHANGELOG.md)
 - README or spec updates
 - a migration note when the break is user-visible
+
+Primary alpha config direction:
+
+- `quality.evaluation_profile` is the primary evaluation selector
+- `quality.evaluation_hook` still parses during alpha, but it is deprecated and only normalized for legacy built-ins
 
 Project maintenance policy lives in:
 

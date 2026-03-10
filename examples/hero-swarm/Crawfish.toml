@@ -35,6 +35,14 @@ allowed_scopes = ["crawfish.read", "crawfish.submit"]
 [runtime]
 reconcile_interval_ms = 5000
 
+[evaluation]
+# Built-in profiles auto-resolve for:
+# - task.plan -> task_plan_default
+# - repo.review -> repo_review_default
+# - incident.enrich -> incident_enrich_default
+# Override them under [evaluation.profiles.*], [evaluation.scorecards.*],
+# [evaluation.datasets.*], and [evaluation.alerts.*] as the swarm matures.
+
 [governance.system_defaults]
 default_disposition = "allow_with_lease"
 capability_visibility = "owner_only"

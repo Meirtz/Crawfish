@@ -114,7 +114,9 @@ That is why the runtime needs:
 
 The swarm will not become reliable by accumulating more raw traces alone.
 
-LangSmith provides a useful reference shape for this through its [observability](https://docs.langchain.com/langsmith/observability) and [evaluation](https://docs.langchain.com/langsmith/evaluation) model: traces, evaluation, review, and feedback loops. Crawfish should absorb that lesson at the runtime layer.
+Observability is the rear-view mirror. Evaluation is the learning loop.
+
+LangSmith provides a useful reference shape for this through its [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), and [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules): traces, evaluation, review, and operator automation belong to one system. Crawfish should absorb that lesson at the runtime layer.
 
 This means:
 
@@ -122,10 +124,27 @@ This means:
 - deterministic scorecards should produce durable evaluation records
 - review queues should capture “needs human eyes” cases without erasing history
 - feedback should be structured and reusable, not trapped in ad-hoc operator memory
+- dataset cases should turn production traces into replayable institutional memory
+- replay experiments should let the swarm learn from prior work without contaminating production operator queues
 
 Evaluation is not just reporting. It is how the swarm improves while staying inspectable.
 
-## Principle 8: Design For Future Multi-Owner Encounters, Not Yesterday's App Sandbox
+## Principle 8: Institutions Lag Capability Growth
+
+Capability growth outruns process. That is not a temporary bug in the market; it is the normal order of technological change.
+
+The relevant system question is therefore not whether constitutions, enterprise processes, and norms matter. They do. The question is whether the runtime can keep order while those institutions are still catching up.
+
+Crawfish should assume:
+
+- model behavior standards will remain partial and uneven
+- organizational review capacity will be limited
+- multi-owner swarm encounters will arrive before ecosystem-wide treaties do
+- evaluation and doctrine will need to serve as provisional institutional memory
+
+This is why review queues, alerts, dataset capture, replay, and checkpoint evidence belong in the runtime itself rather than in post hoc dashboards alone.
+
+## Principle 9: Design For Future Multi-Owner Encounters, Not Yesterday's App Sandbox
 
 The same laptop is already a frontier.
 
