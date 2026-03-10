@@ -401,6 +401,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "crawfish-harness-local"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "crawfish-core",
+ "crawfish-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "crawfish-mcp"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -446,6 +462,7 @@ dependencies = [
  "axum",
  "bytes",
  "crawfish-core",
+ "crawfish-harness-local",
  "crawfish-mcp",
  "crawfish-openclaw",
  "crawfish-store-sqlite",
