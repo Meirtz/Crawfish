@@ -2,7 +2,7 @@ use crate::ExecutionContractPatch;
 use crawfish_types::{
     Action, AgentManifest, ArtifactRef, AuditReceipt, CapabilityLease, ConsentGrant,
     CounterpartyRef, EncounterRecord, ExecutionStrategy, ExternalRef, GoalSpec, LifecycleRecord,
-    Metadata, OwnerRef, RequesterRef, ScheduleSpec, TrustDomain,
+    Metadata, OwnerRef, RequesterRef, ScheduleSpec, TrustDomain, WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,6 +55,12 @@ pub struct ActionDetail {
     pub grant_details: Vec<ConsentGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_detail: Option<CapabilityLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_detail: Option<WorkspaceLockDetail>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -821,6 +821,18 @@ pub struct WorkspaceApplyResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceLockDetail {
+    pub mode: WorkspaceLockMode,
+    pub scope: String,
+    pub lock_path: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_action_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquired_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalRef {
     pub kind: String,
     pub value: String,
@@ -1158,9 +1170,13 @@ pub struct Action {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_executor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_detail: Option<WorkspaceLockDetail>,
     #[serde(default)]
     pub external_refs: Vec<ExternalRef>,
     #[serde(default)]

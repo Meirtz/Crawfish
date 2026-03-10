@@ -531,8 +531,10 @@ mod tests {
                 continuity_mode: None,
                 degradation_profile: None,
                 failure_reason: None,
+                failure_code: None,
                 selected_executor: None,
                 recovery_stage: None,
+                lock_detail: None,
                 external_refs: Vec::new(),
                 outputs: ActionOutputs::default(),
             })
@@ -640,8 +642,10 @@ mod tests {
             continuity_mode: None,
             degradation_profile: None,
             failure_reason: None,
+            failure_code: None,
             selected_executor: None,
             recovery_stage: None,
+            lock_detail: None,
             external_refs: Vec::new(),
             outputs: ActionOutputs::default(),
         }

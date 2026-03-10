@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::time::{sleep, Duration};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -98,7 +99,8 @@ enum ExecutionOutcome {
     },
     Blocked {
         reason: String,
-        continuity_mode: ContinuityModeName,
+        failure_code: String,
+        continuity_mode: Option<ContinuityModeName>,
         outputs: ActionOutputs,
         external_refs: Vec<ExternalRef>,
     },
@@ -203,6 +205,7 @@ impl Supervisor {
             action.started_at = None;
             action.finished_at = None;
             action.recovery_stage = recovery_stage.clone();
+            action.failure_code = Some(failure_code_requeued_after_restart().to_string());
             self.store.upsert_action(&action).await?;
             self.store
                 .append_action_event(
@@ -210,6 +213,7 @@ impl Supervisor {
                     "recovered",
                     serde_json::json!({
                         "phase": "accepted",
+                        "code": failure_code_requeued_after_restart(),
                         "recovery_stage": recovery_stage,
                         "reason": "daemon restart requeued running action",
                     }),
@@ -237,6 +241,7 @@ impl Supervisor {
             action.phase = ActionPhase::Expired;
             action.finished_at = Some(now.to_string());
             action.failure_reason = Some("approval expired before deadline".to_string());
+            action.failure_code = Some(failure_code_approval_required().to_string());
             if let Some(encounter_ref) = &action.encounter_ref {
                 if let Some(mut encounter) = self.store.get_encounter(encounter_ref).await? {
                     encounter.state = EncounterState::Expired;
@@ -261,6 +266,7 @@ impl Supervisor {
                     "expired",
                     serde_json::json!({
                         "reason": action.failure_reason,
+                        "code": action.failure_code,
                         "finished_at": action.finished_at,
                     }),
                 )
@@ -638,7 +644,8 @@ impl Supervisor {
         );
         ExecutionOutcome::Blocked {
             reason,
-            continuity_mode,
+            failure_code: failure_code_route_unavailable().to_string(),
+            continuity_mode: Some(continuity_mode),
             outputs,
             external_refs,
         }
@@ -703,8 +710,10 @@ impl Supervisor {
             continuity_mode: None,
             degradation_profile: None,
             failure_reason: None,
+            failure_code: None,
             selected_executor: Some("deterministic.repo_index".to_string()),
             recovery_stage: None,
+            lock_detail: None,
             external_refs: Vec::new(),
             outputs: ActionOutputs::default(),
         };
@@ -834,18 +843,23 @@ impl Supervisor {
                 | AgentState::Failed
                 | AgentState::Finalized
         ) {
-            action.phase = ActionPhase::Blocked;
-            action.failure_reason = Some(format!(
-                "target agent {} is not executable in state {:?}",
-                manifest.id, lifecycle.observed_state
-            ));
-            action.finished_at = None;
+            set_action_blocked(
+                &mut action,
+                failure_code_route_unavailable(),
+                format!(
+                    "target agent {} is not executable in state {:?}",
+                    manifest.id, lifecycle.observed_state
+                ),
+            );
             self.store.upsert_action(&action).await?;
             self.store
                 .append_action_event(
                     &action.id,
                     "blocked",
-                    serde_json::json!({"reason": action.failure_reason}),
+                    serde_json::json!({
+                        "reason": action.failure_reason,
+                        "code": action.failure_code,
+                    }),
                 )
                 .await?;
             return Ok(());
@@ -853,9 +867,7 @@ impl Supervisor {
 
         if let Err(error) = self.ensure_pre_execution_lease_valid(&action).await {
             let reason = error.to_string();
-            action.phase = ActionPhase::Failed;
-            action.finished_at = Some(now_timestamp());
-            action.failure_reason = Some(reason.clone());
+            set_action_failed(&mut action, lease_failure_code(&reason), reason.clone());
             if let Some(encounter_ref) = &action.encounter_ref {
                 if let Some(mut encounter) = self.store.get_encounter(encounter_ref).await? {
                     encounter.state = EncounterState::Denied;
@@ -878,7 +890,11 @@ impl Supervisor {
                 .append_action_event(
                     &action.id,
                     "failed",
-                    serde_json::json!({"reason": reason, "finished_at": action.finished_at}),
+                    serde_json::json!({
+                        "reason": reason,
+                        "code": action.failure_code,
+                        "finished_at": action.finished_at
+                    }),
                 )
                 .await?;
             return Ok(());
@@ -895,6 +911,7 @@ impl Supervisor {
                 action.outputs = outputs;
                 action.finished_at = Some(now_timestamp());
                 action.failure_reason = None;
+                action.failure_code = None;
                 action.selected_executor = Some(selected_executor);
                 action.external_refs = external_refs;
                 if let Some(checkpoint) = checkpoint {
@@ -916,13 +933,13 @@ impl Supervisor {
             }
             Ok(ExecutionOutcome::Blocked {
                 reason,
+                failure_code,
                 continuity_mode,
                 outputs,
                 external_refs,
             }) => {
-                action.phase = ActionPhase::Blocked;
-                action.continuity_mode = Some(continuity_mode);
-                action.failure_reason = Some(reason.clone());
+                set_action_blocked(&mut action, &failure_code, reason.clone());
+                action.continuity_mode = continuity_mode;
                 action.outputs = outputs;
                 action.external_refs = external_refs;
                 self.store.upsert_action(&action).await?;
@@ -932,6 +949,7 @@ impl Supervisor {
                         "blocked",
                         serde_json::json!({
                             "reason": reason,
+                            "code": action.failure_code,
                             "continuity_mode": action.continuity_mode.as_ref().map(|mode| format!("{mode:?}").to_lowercase())
                         }),
                     )
@@ -939,15 +957,17 @@ impl Supervisor {
             }
             Err(error) => {
                 let reason = error.to_string();
-                action.phase = ActionPhase::Failed;
-                action.finished_at = Some(now_timestamp());
-                action.failure_reason = Some(reason.clone());
+                set_action_failed(&mut action, failure_code_executor_error(), reason.clone());
                 self.store.upsert_action(&action).await?;
                 self.store
                     .append_action_event(
                         &action.id,
                         "failed",
-                        serde_json::json!({"reason": reason, "finished_at": action.finished_at}),
+                        serde_json::json!({
+                            "reason": reason,
+                            "code": action.failure_code,
+                            "finished_at": action.finished_at
+                        }),
                     )
                     .await?;
             }
@@ -1088,8 +1108,61 @@ impl Supervisor {
         }
 
         if action.capability == "workspace.patch.apply" {
+            let acquired_lock = match self.try_acquire_workspace_lock(action, manifest).await? {
+                Some(WorkspaceLockAttempt::Acquired(acquisition)) => {
+                    action.lock_detail = Some(acquisition.detail.clone());
+                    self.store.upsert_action(action).await?;
+                    self.store
+                        .append_action_event(
+                            &action.id,
+                            "lock_acquired",
+                            serde_json::json!({
+                                "lock_detail": action.lock_detail.clone(),
+                            }),
+                        )
+                        .await?;
+                    Some(acquisition)
+                }
+                Some(WorkspaceLockAttempt::Conflict(detail)) => {
+                    action.lock_detail = Some(detail.clone());
+                    return Ok(ExecutionOutcome::Blocked {
+                        reason: format!(
+                            "workspace lock is held by {}",
+                            detail
+                                .owner_action_id
+                                .clone()
+                                .unwrap_or_else(|| "another action".to_string())
+                        ),
+                        failure_code: failure_code_lock_conflict().to_string(),
+                        continuity_mode: None,
+                        outputs: ActionOutputs {
+                            summary: Some("Mutation action blocked by workspace lock".to_string()),
+                            artifacts: Vec::new(),
+                            metadata: std::collections::BTreeMap::from([(
+                                "lock_path".to_string(),
+                                serde_json::json!(detail.lock_path),
+                            )]),
+                        },
+                        external_refs: Vec::new(),
+                    });
+                }
+                None => None,
+            };
+
+            if let Err(error) = self.ensure_pre_execution_lease_valid(action).await {
+                if let Some(acquisition) = &acquired_lock {
+                    self.release_workspace_lock(action, &acquisition.lock_path)
+                        .await?;
+                    action.lock_detail = Some(crawfish_types::WorkspaceLockDetail {
+                        status: "released".to_string(),
+                        ..acquisition.detail.clone()
+                    });
+                }
+                return Err(error);
+            }
+
             let executor = WorkspacePatchApplyDeterministicExecutor::new(self.state_dir());
-            return self
+            let outcome = self
                 .run_deterministic_executor(
                     action,
                     "deterministic.workspace_patch_apply",
@@ -1098,6 +1171,25 @@ impl Supervisor {
                     &executor,
                 )
                 .await;
+            if let Some(acquisition) = &acquired_lock {
+                self.release_workspace_lock(action, &acquisition.lock_path)
+                    .await?;
+                action.lock_detail = Some(crawfish_types::WorkspaceLockDetail {
+                    status: "released".to_string(),
+                    ..acquisition.detail.clone()
+                });
+                self.store.upsert_action(action).await?;
+                self.store
+                    .append_action_event(
+                        &action.id,
+                        "lock_released",
+                        serde_json::json!({
+                            "lock_detail": action.lock_detail.clone(),
+                        }),
+                    )
+                    .await?;
+            }
+            return outcome;
         }
 
         if action.capability == "incident.enrich" {
@@ -1339,6 +1431,170 @@ impl Supervisor {
         }
         Ok(())
     }
+
+    fn lock_file_path(&self, workspace_root: &str) -> PathBuf {
+        self.state_dir()
+            .join("locks")
+            .join(format!("workspace-{}.lock", stable_id(workspace_root)))
+    }
+
+    async fn try_acquire_workspace_lock(
+        &self,
+        action: &Action,
+        manifest: &AgentManifest,
+    ) -> anyhow::Result<Option<WorkspaceLockAttempt>> {
+        if action.capability != "workspace.patch.apply"
+            || !matches!(
+                manifest.workspace_policy.lock_mode,
+                crawfish_types::WorkspaceLockMode::File
+            )
+        {
+            return Ok(None);
+        }
+
+        let workspace_root = required_input_string(action, "workspace_root")?;
+        let lock_path = self.lock_file_path(&workspace_root);
+        if let Some(parent) = lock_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        self.try_acquire_workspace_lock_path(action, workspace_root, lock_path, true)
+            .await
+            .map(Some)
+    }
+
+    async fn try_acquire_workspace_lock_path(
+        &self,
+        action: &Action,
+        workspace_root: String,
+        lock_path: PathBuf,
+        retry_stale: bool,
+    ) -> anyhow::Result<WorkspaceLockAttempt> {
+        let record = WorkspaceLockRecord {
+            workspace_root: workspace_root.clone(),
+            owner_action_id: action.id.clone(),
+            acquired_at: now_timestamp(),
+        };
+        let serialized = serde_json::to_vec_pretty(&record)?;
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .await
+        {
+            Ok(mut file) => {
+                file.write_all(&serialized).await?;
+                file.flush().await?;
+                Ok(WorkspaceLockAttempt::Acquired(WorkspaceLockAcquisition {
+                    lock_path: lock_path.clone(),
+                    detail: crawfish_types::WorkspaceLockDetail {
+                        mode: crawfish_types::WorkspaceLockMode::File,
+                        scope: workspace_root,
+                        lock_path: lock_path.display().to_string(),
+                        status: "acquired".to_string(),
+                        owner_action_id: Some(action.id.clone()),
+                        acquired_at: Some(record.acquired_at),
+                    },
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let contents = tokio::fs::read_to_string(&lock_path).await.ok();
+                let existing = contents
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<WorkspaceLockRecord>(value).ok());
+
+                if let Some(existing) = existing {
+                    if existing.owner_action_id == action.id {
+                        return Ok(WorkspaceLockAttempt::Acquired(WorkspaceLockAcquisition {
+                            lock_path: lock_path.clone(),
+                            detail: crawfish_types::WorkspaceLockDetail {
+                                mode: crawfish_types::WorkspaceLockMode::File,
+                                scope: workspace_root,
+                                lock_path: lock_path.display().to_string(),
+                                status: "acquired".to_string(),
+                                owner_action_id: Some(action.id.clone()),
+                                acquired_at: Some(existing.acquired_at),
+                            },
+                        }));
+                    }
+
+                    if retry_stale && self.is_stale_lock_owner(&existing.owner_action_id).await? {
+                        let _ = tokio::fs::remove_file(&lock_path).await;
+                        return Box::pin(self.try_acquire_workspace_lock_path(
+                            action,
+                            workspace_root,
+                            lock_path,
+                            false,
+                        ))
+                        .await;
+                    }
+
+                    return Ok(WorkspaceLockAttempt::Conflict(
+                        crawfish_types::WorkspaceLockDetail {
+                            mode: crawfish_types::WorkspaceLockMode::File,
+                            scope: workspace_root,
+                            lock_path: lock_path.display().to_string(),
+                            status: "conflicted".to_string(),
+                            owner_action_id: Some(existing.owner_action_id),
+                            acquired_at: Some(existing.acquired_at),
+                        },
+                    ));
+                }
+
+                if retry_stale {
+                    let _ = tokio::fs::remove_file(&lock_path).await;
+                    return Box::pin(self.try_acquire_workspace_lock_path(
+                        action,
+                        workspace_root,
+                        lock_path,
+                        false,
+                    ))
+                    .await;
+                }
+
+                Ok(WorkspaceLockAttempt::Conflict(
+                    crawfish_types::WorkspaceLockDetail {
+                        mode: crawfish_types::WorkspaceLockMode::File,
+                        scope: workspace_root,
+                        lock_path: lock_path.display().to_string(),
+                        status: "conflicted".to_string(),
+                        owner_action_id: None,
+                        acquired_at: None,
+                    },
+                ))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn is_stale_lock_owner(&self, owner_action_id: &str) -> anyhow::Result<bool> {
+        let action = self.store.get_action(owner_action_id).await?;
+        Ok(match action {
+            Some(action) => matches!(
+                action.phase,
+                ActionPhase::Completed | ActionPhase::Failed | ActionPhase::Expired
+            ),
+            None => true,
+        })
+    }
+
+    async fn release_workspace_lock(
+        &self,
+        action: &Action,
+        lock_path: &Path,
+    ) -> anyhow::Result<()> {
+        let contents = match tokio::fs::read_to_string(lock_path).await {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let existing: WorkspaceLockRecord = serde_json::from_str(&contents)?;
+        if existing.owner_action_id == action.id {
+            tokio::fs::remove_file(lock_path).await?;
+        }
+        Ok(())
+    }
 }
 
 fn build_checkpoint(
@@ -1371,6 +1627,12 @@ fn input_digest(inputs: &crawfish_types::Metadata) -> anyhow::Result<String> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     serialized.hash(&mut hasher);
     Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn stable_id(value: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn artifact_refs_exist(artifact_refs: &[crawfish_types::ArtifactRef]) -> bool {
@@ -1492,6 +1754,79 @@ fn current_timestamp_seconds() -> u64 {
     now_timestamp().parse::<u64>().unwrap_or_default()
 }
 
+fn failure_code_approval_required() -> &'static str {
+    "approval_required"
+}
+
+fn failure_code_approval_rejected() -> &'static str {
+    "approval_rejected"
+}
+
+fn failure_code_lease_revoked() -> &'static str {
+    "lease_revoked"
+}
+
+fn failure_code_lease_expired() -> &'static str {
+    "lease_expired"
+}
+
+fn failure_code_lock_conflict() -> &'static str {
+    "lock_conflict"
+}
+
+fn failure_code_route_unavailable() -> &'static str {
+    "route_unavailable"
+}
+
+fn failure_code_executor_error() -> &'static str {
+    "executor_error"
+}
+
+fn failure_code_requeued_after_restart() -> &'static str {
+    "requeued_after_restart"
+}
+
+fn lease_failure_code(reason: &str) -> &'static str {
+    if reason.contains("revoked") {
+        failure_code_lease_revoked()
+    } else if reason.contains("expired") {
+        failure_code_lease_expired()
+    } else {
+        failure_code_approval_required()
+    }
+}
+
+fn set_action_failed(action: &mut Action, code: &str, reason: String) {
+    action.phase = ActionPhase::Failed;
+    action.finished_at = Some(now_timestamp());
+    action.failure_reason = Some(reason);
+    action.failure_code = Some(code.to_string());
+}
+
+fn set_action_blocked(action: &mut Action, code: &str, reason: String) {
+    action.phase = ActionPhase::Blocked;
+    action.finished_at = None;
+    action.failure_reason = Some(reason);
+    action.failure_code = Some(code.to_string());
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WorkspaceLockRecord {
+    workspace_root: String,
+    owner_action_id: String,
+    acquired_at: String,
+}
+
+struct WorkspaceLockAcquisition {
+    lock_path: PathBuf,
+    detail: crawfish_types::WorkspaceLockDetail,
+}
+
+enum WorkspaceLockAttempt {
+    Acquired(WorkspaceLockAcquisition),
+    Conflict(crawfish_types::WorkspaceLockDetail),
+}
+
 fn action_phase_name(phase: &ActionPhase) -> &'static str {
     match phase {
         ActionPhase::Accepted => "accepted",
@@ -1579,6 +1914,13 @@ impl SupervisorControl for Supervisor {
             external_refs: action.external_refs.clone(),
             grant_details,
             lease_detail,
+            blocked_reason: if matches!(action.phase, ActionPhase::Blocked) {
+                action.failure_reason.clone()
+            } else {
+                None
+            },
+            terminal_code: action.failure_code.clone(),
+            lock_detail: action.lock_detail.clone(),
             action,
             encounter,
             latest_audit_receipt: audit_receipt,
@@ -1695,8 +2037,16 @@ impl SupervisorControl for Supervisor {
             continuity_mode: None,
             degradation_profile: None,
             failure_reason: None,
+            failure_code: if requires_approval
+                || matches!(decision.disposition, EncounterDisposition::AwaitConsent)
+            {
+                Some(failure_code_approval_required().to_string())
+            } else {
+                None
+            },
             selected_executor: None,
             recovery_stage: None,
+            lock_detail: None,
             external_refs: Vec::new(),
             outputs: ActionOutputs::default(),
         };
@@ -1730,6 +2080,7 @@ impl SupervisorControl for Supervisor {
                         ActionPhase::AwaitingApproval => "awaiting_approval",
                         _ => "accepted",
                     },
+                    "code": action.failure_code,
                     "target_agent_id": action.target_agent_id,
                     "encounter_ref": action.encounter_ref,
                     "audit_receipt_ref": action.audit_receipt_ref,
@@ -1796,6 +2147,7 @@ impl SupervisorControl for Supervisor {
         action.audit_receipt_ref = Some(receipt.id);
         action.phase = ActionPhase::Accepted;
         action.failure_reason = None;
+        action.failure_code = None;
         self.store.upsert_action(&action).await?;
         self.store
             .append_action_event(
@@ -1803,6 +2155,7 @@ impl SupervisorControl for Supervisor {
                 "approved",
                 serde_json::json!({
                     "phase": "accepted",
+                    "code": serde_json::Value::Null,
                     "grant_refs": action.grant_refs,
                     "lease_ref": action.lease_ref,
                 }),
@@ -1846,9 +2199,11 @@ impl SupervisorControl for Supervisor {
                 Some(request.approver_ref),
             )
             .await?;
-        action.phase = ActionPhase::Failed;
-        action.finished_at = Some(now_timestamp());
-        action.failure_reason = Some("approval rejected".to_string());
+        set_action_failed(
+            &mut action,
+            failure_code_approval_rejected(),
+            "approval rejected".to_string(),
+        );
         action.audit_receipt_ref = Some(receipt.id);
         self.store.upsert_action(&action).await?;
         self.store
@@ -1857,6 +2212,7 @@ impl SupervisorControl for Supervisor {
                 "rejected",
                 serde_json::json!({
                     "phase": "failed",
+                    "code": action.failure_code,
                     "reason": action.failure_reason,
                     "finished_at": action.finished_at,
                 }),
@@ -1910,9 +2266,11 @@ impl SupervisorControl for Supervisor {
                     .await?;
                 action.audit_receipt_ref = Some(receipt.id);
             }
-            action.phase = ActionPhase::Failed;
-            action.finished_at = Some(now_timestamp());
-            action.failure_reason = Some(format!("lease revoked: {}", request.reason));
+            set_action_failed(
+                &mut action,
+                failure_code_lease_revoked(),
+                format!("lease revoked: {}", request.reason),
+            );
             self.store.upsert_action(&action).await?;
             self.store
                 .append_action_event(
@@ -1921,6 +2279,7 @@ impl SupervisorControl for Supervisor {
                     serde_json::json!({
                         "phase": "failed",
                         "lease_ref": lease.id,
+                        "code": action.failure_code,
                         "reason": action.failure_reason,
                     }),
                 )
@@ -2824,8 +3183,10 @@ depends_on = []
             continuity_mode: None,
             degradation_profile: None,
             failure_reason: None,
+            failure_code: None,
             selected_executor: Some("deterministic.repo_index".to_string()),
             recovery_stage: None,
+            lock_detail: None,
             external_refs: Vec::new(),
             outputs: ActionOutputs::default(),
         };
@@ -3302,6 +3663,180 @@ depends_on = []
             .artifact_refs
             .iter()
             .any(|artifact| artifact.kind == "workspace_apply_result"));
+    }
+
+    #[tokio::test]
+    async fn workspace_lock_conflict_blocks_second_mutation() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+        supervisor
+            .store()
+            .upsert_action(&Action {
+                id: "other-action".to_string(),
+                target_agent_id: "workspace_editor".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::System,
+                    id: "test".to_string(),
+                },
+                initiator_owner: local_owner("local-dev"),
+                counterparty_refs: Vec::new(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "hold workspace lock".to_string(),
+                    details: None,
+                },
+                capability: "workspace.patch.apply".to_string(),
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    ("edits".to_string(), serde_json::json!([])),
+                ]),
+                contract: supervisor.config().contracts.org_defaults.clone(),
+                execution_strategy: None,
+                grant_refs: Vec::new(),
+                lease_ref: None,
+                encounter_ref: None,
+                audit_receipt_ref: None,
+                data_boundary: "owner_local".to_string(),
+                schedule: Default::default(),
+                phase: ActionPhase::Running,
+                created_at: now_timestamp(),
+                started_at: Some(now_timestamp()),
+                finished_at: None,
+                checkpoint_ref: None,
+                continuity_mode: None,
+                degradation_profile: None,
+                failure_reason: None,
+                failure_code: None,
+                selected_executor: None,
+                recovery_stage: None,
+                lock_detail: None,
+                external_refs: Vec::new(),
+                outputs: ActionOutputs::default(),
+            })
+            .await
+            .unwrap();
+        let lock_path = supervisor.lock_file_path(&dir.path().display().to_string());
+        if let Some(parent) = lock_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(
+            &lock_path,
+            serde_json::to_vec_pretty(&WorkspaceLockRecord {
+                workspace_root: dir.path().display().to_string(),
+                owner_action_id: "other-action".to_string(),
+                acquired_at: now_timestamp(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(workspace_patch_request(
+                dir.path(),
+                serde_json::json!([
+                    {
+                        "path": "blocked.txt",
+                        "op": "create",
+                        "contents": "blocked\n"
+                    }
+                ]),
+                None,
+            ))
+            .await
+            .unwrap();
+        supervisor
+            .approve_action(
+                &submitted.action_id,
+                ApproveActionRequest {
+                    approver_ref: "local-dev".to_string(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Blocked);
+        assert_eq!(detail.terminal_code.as_deref(), Some("lock_conflict"));
+        assert_eq!(
+            detail
+                .lock_detail
+                .as_ref()
+                .and_then(|lock| lock.owner_action_id.as_deref()),
+            Some("other-action")
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_lease_fails_mutation_before_commit() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(workspace_patch_request(
+                dir.path(),
+                serde_json::json!([
+                    {
+                        "path": "expired-lease.txt",
+                        "op": "create",
+                        "contents": "should not apply\n"
+                    }
+                ]),
+                None,
+            ))
+            .await
+            .unwrap();
+        supervisor
+            .approve_action(
+                &submitted.action_id,
+                ApproveActionRequest {
+                    approver_ref: "local-dev".to_string(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let lease_id = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("action detail")
+            .lease_detail
+            .expect("lease detail")
+            .id;
+        let mut lease = supervisor
+            .store()
+            .get_capability_lease(&lease_id)
+            .await
+            .unwrap()
+            .expect("lease");
+        lease.expires_at = "1".to_string();
+        supervisor
+            .store()
+            .upsert_capability_lease(&lease)
+            .await
+            .unwrap();
+
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Failed);
+        assert_eq!(detail.terminal_code.as_deref(), Some("lease_expired"));
+        assert!(!dir.path().join("expired-lease.txt").exists());
     }
 
     #[tokio::test]
