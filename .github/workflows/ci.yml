@@ -9,12 +9,26 @@ on:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-stable
+            os: ubuntu-latest
+            toolchain: stable
+          - name: ubuntu-msrv
+            os: ubuntu-latest
+            toolchain: 1.88.0
+          - name: macos-stable
+            os: macos-latest
+            toolchain: stable
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.88.0
+          toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
@@ -23,3 +37,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  hero-smoke:
+    name: hero-smoke
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Hero P0 CLI smoke
+        run: cargo test -p crawfish-cli --test cli
