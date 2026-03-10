@@ -625,8 +625,8 @@ EOF
             LocalHarnessBinding {
                 capability: "task.plan".to_string(),
                 harness: LocalHarnessKind::ClaudeCode,
-                command: script.display().to_string(),
-                args: Vec::new(),
+                command: "sh".to_string(),
+                args: vec![script.display().to_string()],
                 required_scopes: Vec::new(),
                 lease_required: false,
                 workspace_policy: LocalHarnessWorkspacePolicy::CrawfishManaged,
@@ -692,8 +692,8 @@ EOF
             LocalHarnessBinding {
                 capability: "task.plan".to_string(),
                 harness: LocalHarnessKind::ClaudeCode,
-                command: script.display().to_string(),
-                args: Vec::new(),
+                command: "sh".to_string(),
+                args: vec![script.display().to_string()],
                 required_scopes: Vec::new(),
                 lease_required: false,
                 workspace_policy: LocalHarnessWorkspacePolicy::Inherit,
@@ -722,8 +722,8 @@ EOF
             LocalHarnessBinding {
                 capability: "task.plan".to_string(),
                 harness: LocalHarnessKind::Codex,
-                command: script.display().to_string(),
-                args: vec!["exec".to_string()],
+                command: "sh".to_string(),
+                args: vec![script.display().to_string()],
                 required_scopes: Vec::new(),
                 lease_required: false,
                 workspace_policy: LocalHarnessWorkspacePolicy::Inherit,
