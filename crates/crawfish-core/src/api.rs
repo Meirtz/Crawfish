@@ -1,8 +1,8 @@
 use crate::ExecutionContractPatch;
 use crawfish_types::{
-    Action, AgentManifest, ArtifactRef, AuditReceipt, CounterpartyRef, EncounterRecord,
-    ExecutionStrategy, ExternalRef, GoalSpec, LifecycleRecord, Metadata, OwnerRef, RequesterRef,
-    ScheduleSpec, TrustDomain,
+    Action, AgentManifest, ArtifactRef, AuditReceipt, CapabilityLease, ConsentGrant,
+    CounterpartyRef, EncounterRecord, ExecutionStrategy, ExternalRef, GoalSpec, LifecycleRecord,
+    Metadata, OwnerRef, RequesterRef, ScheduleSpec, TrustDomain,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,7 +49,31 @@ pub struct ActionDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encounter: Option<EncounterRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audit_receipt: Option<AuditReceipt>,
+    pub latest_audit_receipt: Option<AuditReceipt>,
+    #[serde(default)]
+    pub grant_details: Vec<ConsentGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_detail: Option<CapabilityLease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionSummary {
+    pub id: String,
+    pub target_agent_id: String,
+    pub capability: String,
+    pub phase: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encounter_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionListResponse {
+    pub actions: Vec<ActionSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -83,6 +107,25 @@ pub struct SubmitActionRequest {
 pub struct SubmittedAction {
     pub action_id: String,
     pub phase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApproveActionRequest {
+    pub approver_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectActionRequest {
+    pub approver_ref: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevokeLeaseRequest {
+    pub revoker_ref: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

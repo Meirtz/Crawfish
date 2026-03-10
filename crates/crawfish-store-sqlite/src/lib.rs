@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use crawfish_core::{ActionStore, CheckpointStore, QueueSummary};
-use crawfish_types::{Action, AgentManifest, AuditReceipt, EncounterRecord, LifecycleRecord};
+use crawfish_types::{
+    Action, AgentManifest, AuditReceipt, CapabilityLease, ConsentGrant, EncounterRecord,
+    LifecycleRecord,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, Pool, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
@@ -243,6 +246,104 @@ impl SqliteStore {
         .transpose()
     }
 
+    pub async fn upsert_consent_grant(&self, grant: &ConsentGrant) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(grant)?;
+        sqlx::query(
+            r#"
+            INSERT INTO consent_grants (id, grantor_id, grantee_id, expires_at, grant_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              grantor_id = excluded.grantor_id,
+              grantee_id = excluded.grantee_id,
+              expires_at = excluded.expires_at,
+              grant_json = excluded.grant_json
+            "#,
+        )
+        .bind(&grant.id)
+        .bind(&grant.grantor.id)
+        .bind(&grant.grantee.id)
+        .bind(&grant.expires_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_consent_grant(&self, grant_id: &str) -> anyhow::Result<Option<ConsentGrant>> {
+        let row = sqlx::query("SELECT grant_json FROM consent_grants WHERE id = ?1")
+            .bind(grant_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("grant_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn list_consent_grants(
+        &self,
+        grant_ids: &[String],
+    ) -> anyhow::Result<Vec<ConsentGrant>> {
+        let mut grants = Vec::new();
+        for grant_id in grant_ids {
+            if let Some(grant) = self.get_consent_grant(grant_id).await? {
+                grants.push(grant);
+            }
+        }
+        Ok(grants)
+    }
+
+    pub async fn upsert_capability_lease(&self, lease: &CapabilityLease) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(lease)?;
+        sqlx::query(
+            r#"
+            INSERT INTO capability_leases (
+              id,
+              grant_ref,
+              lessor_id,
+              lessee_id,
+              expires_at,
+              revocation_reason,
+              lease_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+              grant_ref = excluded.grant_ref,
+              lessor_id = excluded.lessor_id,
+              lessee_id = excluded.lessee_id,
+              expires_at = excluded.expires_at,
+              revocation_reason = excluded.revocation_reason,
+              lease_json = excluded.lease_json
+            "#,
+        )
+        .bind(&lease.id)
+        .bind(&lease.grant_ref)
+        .bind(&lease.lessor.id)
+        .bind(&lease.lessee.id)
+        .bind(&lease.expires_at)
+        .bind(&lease.revocation_reason)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_capability_lease(
+        &self,
+        lease_id: &str,
+    ) -> anyhow::Result<Option<CapabilityLease>> {
+        let row = sqlx::query("SELECT lease_json FROM capability_leases WHERE id = ?1")
+            .bind(lease_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("lease_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
     pub async fn latest_completed_action(
         &self,
         target_agent_id: &str,
@@ -270,18 +371,30 @@ impl SqliteStore {
         .transpose()
     }
 
-    pub async fn list_actions_by_phase(&self, phase: &str) -> anyhow::Result<Vec<Action>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT action_json
-            FROM actions
-            WHERE phase = ?1
-            ORDER BY created_at ASC
-            "#,
-        )
-        .bind(phase)
-        .fetch_all(&self.pool)
-        .await?;
+    pub async fn list_actions(&self, phase: Option<&str>) -> anyhow::Result<Vec<Action>> {
+        let rows = if let Some(phase) = phase {
+            sqlx::query(
+                r#"
+                SELECT action_json
+                FROM actions
+                WHERE phase = ?1
+                ORDER BY created_at DESC
+                "#,
+            )
+            .bind(phase)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT action_json
+                FROM actions
+                ORDER BY created_at DESC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         rows.into_iter()
             .map(|row| {
@@ -424,6 +537,10 @@ impl ActionStore for SqliteStore {
             Ok(serde_json::from_str(&payload)?)
         })
         .transpose()
+    }
+
+    async fn list_actions_by_phase(&self, phase: Option<&str>) -> anyhow::Result<Vec<Action>> {
+        self.list_actions(phase).await
     }
 
     async fn claim_next_accepted_action(&self) -> anyhow::Result<Option<Action>> {

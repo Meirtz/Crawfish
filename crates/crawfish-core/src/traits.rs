@@ -11,6 +11,7 @@ pub trait ActionStore: Send + Sync {
         payload: serde_json::Value,
     ) -> anyhow::Result<()>;
     async fn get_action(&self, action_id: &str) -> anyhow::Result<Option<Action>>;
+    async fn list_actions_by_phase(&self, phase: Option<&str>) -> anyhow::Result<Vec<Action>>;
     async fn claim_next_accepted_action(&self) -> anyhow::Result<Option<Action>>;
     async fn queue_summary(&self) -> anyhow::Result<crate::QueueSummary>;
 }
@@ -53,12 +54,28 @@ pub trait DeterministicExecutor: Send + Sync {
 #[async_trait]
 pub trait SupervisorControl: Send + Sync {
     async fn list_status(&self) -> anyhow::Result<crate::FleetStatusResponse>;
+    async fn list_actions(&self, phase: Option<&str>) -> anyhow::Result<crate::ActionListResponse>;
     async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<crate::AgentDetail>>;
     async fn inspect_action(&self, action_id: &str) -> anyhow::Result<Option<crate::ActionDetail>>;
     async fn submit_action(
         &self,
         request: crate::SubmitActionRequest,
     ) -> anyhow::Result<crate::SubmittedAction>;
+    async fn approve_action(
+        &self,
+        action_id: &str,
+        request: crate::ApproveActionRequest,
+    ) -> anyhow::Result<crate::SubmittedAction>;
+    async fn reject_action(
+        &self,
+        action_id: &str,
+        request: crate::RejectActionRequest,
+    ) -> anyhow::Result<crate::SubmittedAction>;
+    async fn revoke_lease(
+        &self,
+        lease_id: &str,
+        request: crate::RevokeLeaseRequest,
+    ) -> anyhow::Result<crate::AdminActionResponse>;
     async fn validate_policy_request(
         &self,
         request: crate::PolicyValidationRequest,

@@ -9,19 +9,20 @@ use axum::{
 };
 use crawfish_core::{
     authorize_encounter, compile_execution_plan, neutral_policy, now_timestamp,
-    owner_policy_for_manifest, ActionDetail, ActionStore, AdminActionResponse, AgentDetail,
-    CheckpointStore, CrawfishConfig, DeterministicExecutor, EncounterDecision,
-    EncounterDisposition, EncounterRequest, ExecutionContractPatch, ExecutionSurface,
-    FleetStatusResponse, GovernanceContext, HealthResponse, PolicyValidationRequest,
-    PolicyValidationResponse, SubmitActionRequest, SubmittedAction, SupervisorControl,
+    owner_policy_for_manifest, ActionDetail, ActionListResponse, ActionStore, ActionSummary,
+    AdminActionResponse, AgentDetail, ApproveActionRequest, CheckpointStore, CrawfishConfig,
+    DeterministicExecutor, EncounterDecision, EncounterDisposition, EncounterRequest,
+    ExecutionContractPatch, ExecutionSurface, FleetStatusResponse, GovernanceContext,
+    HealthResponse, PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest,
+    RevokeLeaseRequest, SubmitActionRequest, SubmittedAction, SupervisorControl,
 };
 use crawfish_mcp::McpAdapter;
 use crawfish_store_sqlite::SqliteStore;
 use crawfish_types::{
     Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, AuditOutcome,
-    AuditReceipt, CapabilityDescriptor, ContinuityModeName, CounterpartyRef, DegradedProfileName,
-    DeterministicCheckpoint, EncounterRecord, EncounterState, ExternalRef, HealthStatus,
-    LifecycleRecord, Mutability, TrustDomain,
+    AuditReceipt, CapabilityDescriptor, CapabilityLease, ConsentGrant, ContinuityModeName,
+    CounterpartyRef, DegradedProfileName, DeterministicCheckpoint, EncounterRecord, EncounterState,
+    ExternalRef, HealthStatus, LifecycleRecord, Mutability, TrustDomain,
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
@@ -181,7 +182,7 @@ impl Supervisor {
     }
 
     async fn recover_running_actions(&self) -> anyhow::Result<()> {
-        for mut action in self.store.list_actions_by_phase("running").await? {
+        for mut action in self.store.list_actions_by_phase(Some("running")).await? {
             let recovery_stage = match self.load_deterministic_checkpoint(&action).await? {
                 Some(checkpoint) => {
                     action.checkpoint_ref =
@@ -1162,6 +1163,26 @@ impl SupervisorControl for Supervisor {
         })
     }
 
+    async fn list_actions(&self, phase: Option<&str>) -> anyhow::Result<ActionListResponse> {
+        let actions = self
+            .store
+            .list_actions_by_phase(phase)
+            .await?
+            .into_iter()
+            .map(|action| ActionSummary {
+                id: action.id,
+                target_agent_id: action.target_agent_id,
+                capability: action.capability,
+                phase: format!("{:?}", action.phase).to_lowercase(),
+                created_at: action.created_at,
+                failure_reason: action.failure_reason,
+                encounter_ref: action.encounter_ref,
+                lease_ref: action.lease_ref,
+            })
+            .collect();
+        Ok(ActionListResponse { actions })
+    }
+
     async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<AgentDetail>> {
         let manifest = self.store.get_agent_manifest(agent_id).await?;
         let lifecycle = self.store.get_lifecycle_record(agent_id).await?;
@@ -1193,9 +1214,11 @@ impl SupervisorControl for Supervisor {
             selected_executor: action.selected_executor.clone(),
             recovery_stage: action.recovery_stage.clone(),
             external_refs: action.external_refs.clone(),
+            grant_details: Vec::<ConsentGrant>::new(),
+            lease_detail: None::<CapabilityLease>,
             action,
             encounter,
-            audit_receipt,
+            latest_audit_receipt: audit_receipt,
         }))
     }
 
@@ -1313,6 +1336,30 @@ impl SupervisorControl for Supervisor {
                 _ => "accepted".to_string(),
             },
         })
+    }
+
+    async fn approve_action(
+        &self,
+        _action_id: &str,
+        _request: ApproveActionRequest,
+    ) -> anyhow::Result<SubmittedAction> {
+        anyhow::bail!("approve action is not implemented yet");
+    }
+
+    async fn reject_action(
+        &self,
+        _action_id: &str,
+        _request: RejectActionRequest,
+    ) -> anyhow::Result<SubmittedAction> {
+        anyhow::bail!("reject action is not implemented yet");
+    }
+
+    async fn revoke_lease(
+        &self,
+        _lease_id: &str,
+        _request: RevokeLeaseRequest,
+    ) -> anyhow::Result<AdminActionResponse> {
+        anyhow::bail!("revoke lease is not implemented yet");
     }
 
     async fn validate_policy_request(
