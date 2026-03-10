@@ -18,6 +18,9 @@ fallback_chain = ["deterministic"]
 approval_policy = "on_mutation"
 mutation_mode = "proposal_only"
 
+[contract_defaults.quality]
+evaluation_profile = "task_plan_default"
+
 [strategy_defaults."task.plan"]
 mode = "verify_loop"
 feedback_policy = "inject_reason"

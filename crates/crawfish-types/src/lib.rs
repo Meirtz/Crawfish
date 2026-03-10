@@ -353,6 +353,8 @@ pub struct QualityPolicy {
     #[serde(default)]
     pub quality_class: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_hook: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_confidence: Option<f64>,
@@ -364,6 +366,7 @@ impl Default for QualityPolicy {
     fn default() -> Self {
         Self {
             quality_class: "standard".to_string(),
+            evaluation_profile: None,
             evaluation_hook: None,
             minimum_confidence: Some(0.6),
             human_review_rule: None,
@@ -1351,6 +1354,12 @@ pub struct TraceBundle {
     pub capability: String,
     pub goal_summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jurisdiction_class: Option<JurisdictionClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctrine_summary: Option<DoctrinePack>,
+    #[serde(default)]
+    pub checkpoint_status: Vec<CheckpointStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_executor: Option<String>,
     #[serde(default)]
     pub inputs: Metadata,
@@ -1406,9 +1415,13 @@ pub struct ReviewQueueItem {
     pub action_id: String,
     pub source: String,
     pub status: ReviewQueueStatus,
+    pub priority: String,
+    pub reason_code: String,
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_case_ref: Option<String>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<String>,
@@ -1431,6 +1444,178 @@ pub struct AlertRule {
     pub name: String,
     pub trigger: String,
     pub severity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScorecardCriterionKind {
+    ArtifactPresent,
+    JsonFieldNonempty,
+    ListMinLen,
+    TokenCoverage,
+    CheckpointPassed,
+    IncidentAbsent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScorecardCriterion {
+    pub id: String,
+    pub title: String,
+    pub kind: ScorecardCriterionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<OversightCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident_code: Option<String>,
+    #[serde(default = "default_scorecard_weight")]
+    pub weight: u32,
+}
+
+fn default_scorecard_weight() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScorecardSpec {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub criteria: Vec<ScorecardCriterion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_review_below: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvaluationProfile {
+    pub scorecard: String,
+    #[serde(default)]
+    pub review_queue: bool,
+    #[serde(default)]
+    pub alert_rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_name: Option<String>,
+    #[serde(default)]
+    pub dataset_capture: bool,
+    #[serde(default)]
+    pub post_result_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvaluationDataset {
+    pub capability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub auto_capture: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DatasetCase {
+    pub id: String,
+    pub dataset_name: String,
+    pub capability: String,
+    pub goal_summary: String,
+    #[serde(default)]
+    pub normalized_inputs: Metadata,
+    #[serde(default)]
+    pub expected_artifacts: Vec<String>,
+    #[serde(default)]
+    pub expected_output_signals: Vec<String>,
+    pub source_action_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jurisdiction_class: Option<JurisdictionClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctrine_summary: Option<DoctrinePack>,
+    #[serde(default)]
+    pub checkpoint_status: Vec<CheckpointStatus>,
+    #[serde(default)]
+    pub policy_incidents: Vec<PolicyIncident>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_summary: Option<VerificationSummary>,
+    #[serde(default)]
+    pub evaluation_refs: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentRunStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentCaseStatus {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExperimentRun {
+    pub id: String,
+    pub dataset_name: String,
+    pub executor: String,
+    pub strategy_mode: ExecutionStrategyMode,
+    pub allow_fallback: bool,
+    pub status: ExperimentRunStatus,
+    pub total_cases: u32,
+    pub completed_cases: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExperimentCaseResult {
+    pub id: String,
+    pub run_id: String,
+    pub dataset_case_id: String,
+    pub capability: String,
+    pub status: ExperimentCaseStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_executor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub external_refs: Vec<ExternalRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertEvent {
+    pub id: String,
+    pub rule_id: String,
+    pub action_id: String,
+    pub severity: String,
+    pub summary: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

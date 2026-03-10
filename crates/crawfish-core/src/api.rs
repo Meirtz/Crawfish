@@ -1,10 +1,11 @@
 use crate::ExecutionContractPatch;
 use crawfish_types::{
-    Action, AgentManifest, ArtifactRef, AuditReceipt, CapabilityLease, CheckpointStatus,
-    ConsentGrant, CounterpartyRef, DoctrinePack, EncounterRecord, EvaluationRecord,
-    ExecutionStrategy, ExecutionStrategyMode, ExternalRef, GoalSpec, JurisdictionClass,
-    LifecycleRecord, Metadata, OwnerRef, PolicyIncident, RequesterRef, ReviewQueueItem,
-    ScheduleSpec, TraceBundle, TrustDomain, VerificationSummary, WorkspaceLockDetail,
+    Action, AgentManifest, AlertEvent, ArtifactRef, AuditReceipt, CapabilityLease,
+    CheckpointStatus, ConsentGrant, CounterpartyRef, DatasetCase, DoctrinePack, EncounterRecord,
+    EvaluationDataset, EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode,
+    ExperimentCaseResult, ExperimentRun, ExternalRef, GoalSpec, JurisdictionClass, LifecycleRecord,
+    Metadata, OwnerRef, PolicyIncident, RequesterRef, ReviewQueueItem, ScheduleSpec, TraceBundle,
+    TrustDomain, VerificationSummary, WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -81,6 +82,14 @@ pub struct ActionDetail {
     pub policy_incidents: Vec<PolicyIncident>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_evaluation: Option<EvaluationRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_ref: Option<String>,
+    #[serde(default)]
+    pub review_queue_refs: Vec<String>,
+    #[serde(default)]
+    pub alert_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +139,62 @@ pub struct ActionTraceResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewQueueResponse {
     pub items: Vec<ReviewQueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvaluationDatasetSummary {
+    pub name: String,
+    pub capability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub auto_capture: bool,
+    pub case_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvaluationDatasetsResponse {
+    pub datasets: Vec<EvaluationDatasetSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationDatasetDetailResponse {
+    pub name: String,
+    pub config: EvaluationDataset,
+    #[serde(default)]
+    pub cases: Vec<DatasetCase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartEvaluationRunRequest {
+    pub dataset: String,
+    pub executor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StartEvaluationRunResponse {
+    pub run: ExperimentRun,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExperimentRunDetailResponse {
+    pub run: ExperimentRun,
+    #[serde(default)]
+    pub cases: Vec<ExperimentCaseResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertListResponse {
+    pub alerts: Vec<AlertEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcknowledgeAlertRequest {
+    pub actor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcknowledgeAlertResponse {
+    pub alert: AlertEvent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

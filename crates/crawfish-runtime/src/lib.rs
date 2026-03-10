@@ -9,37 +9,44 @@ use axum::{
 };
 use crawfish_core::{
     authorize_encounter, compile_execution_plan, neutral_policy, now_timestamp,
-    owner_policy_for_manifest, ActionDetail, ActionEvaluationsResponse, ActionEventsResponse,
-    ActionListResponse, ActionStore, ActionSummary, ActionTraceResponse, AdminActionResponse,
-    AgentDetail, ApproveActionRequest, CheckpointStore, CompiledExecutionPlan, CrawfishConfig,
+    owner_policy_for_manifest, AcknowledgeAlertRequest, AcknowledgeAlertResponse, ActionDetail,
+    ActionEvaluationsResponse, ActionEventsResponse, ActionListResponse, ActionStore,
+    ActionSummary, ActionTraceResponse, AdminActionResponse, AgentDetail, AlertListResponse,
+    ApproveActionRequest, CheckpointStore, CompiledExecutionPlan, CrawfishConfig,
     DeterministicExecutor, EncounterDecision, EncounterDisposition, EncounterRequest,
-    ExecutionContractPatch, ExecutionSurface, GovernanceContext, HealthResponse,
+    EvaluationDatasetDetailResponse, EvaluationDatasetsResponse, ExecutionContractPatch,
+    ExecutionSurface, ExperimentRunDetailResponse, GovernanceContext, HealthResponse,
     OpenClawAgentStatusResponse, OpenClawCallerContext, OpenClawInboundActionRequest,
     OpenClawInboundActionResponse, OpenClawInspectionContext, PolicyValidationRequest,
     PolicyValidationResponse, RejectActionRequest, ResolveReviewQueueItemRequest,
-    ResolveReviewQueueItemResponse, ReviewQueueResponse, RevokeLeaseRequest, SubmitActionRequest,
-    SubmittedAction, SupervisorControl, SwarmStatusResponse,
+    ResolveReviewQueueItemResponse, ReviewQueueResponse, RevokeLeaseRequest,
+    StartEvaluationRunRequest, StartEvaluationRunResponse, SubmitActionRequest, SubmittedAction,
+    SupervisorControl, SwarmStatusResponse,
 };
 use crawfish_harness_local::{LocalHarnessAdapter, LocalHarnessError};
 use crawfish_mcp::McpAdapter;
 use crawfish_openclaw::{OpenClawAdapter, OpenClawError};
 use crawfish_store_sqlite::SqliteStore;
 use crawfish_types::{
-    Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, ApprovalPolicy,
-    AuditOutcome, AuditReceipt, CallerOwnerMapping, CapabilityDescriptor, CapabilityLease,
-    CapabilityVisibility, CheckpointStatus, ConsentGrant, ContinuityModeName, CounterpartyRef,
+    Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, AlertEvent,
+    AlertRule, ApprovalPolicy, AuditOutcome, AuditReceipt, CallerOwnerMapping,
+    CapabilityDescriptor, CapabilityLease, CapabilityVisibility, CheckpointOutcome,
+    CheckpointStatus, ConsentGrant, ContinuityModeName, CounterpartyRef, DatasetCase,
     DegradedProfileName, DeterministicCheckpoint, DoctrinePack, EncounterRecord, EncounterState,
-    EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode, ExternalRef, FeedbackNote,
-    FeedbackPolicy, HealthStatus, JurisdictionClass, LifecycleRecord, LocalHarnessKind, Mutability,
-    OwnerKind, OwnerRef, PolicyIncident, ReviewQueueItem, ReviewQueueStatus,
+    EvaluationDataset, EvaluationProfile, EvaluationRecord, EvaluationStatus, ExecutionStrategy,
+    ExecutionStrategyMode, ExperimentCaseResult, ExperimentCaseStatus, ExperimentRun,
+    ExperimentRunStatus, ExternalRef, FeedbackNote, FeedbackPolicy, HealthStatus,
+    JurisdictionClass, LifecycleRecord, LocalHarnessKind, Metadata, Mutability,
+    OversightCheckpoint, OwnerKind, OwnerRef, PolicyIncident, PolicyIncidentSeverity,
+    ReviewQueueItem, ReviewQueueStatus, ScorecardCriterion, ScorecardCriterionKind, ScorecardSpec,
     StrategyCheckpointState, TraceBundle, TrustDomain, VerificationStatus, VerificationSummary,
     VerifyLoopFailureMode, WorkspaceEdit, WorkspaceEditOp,
 };
 use hero::{
-    load_json_artifact, required_input_string, task_plan_objective_from_action,
-    CiTriageDeterministicExecutor, IncidentEnricherDeterministicExecutor,
-    RepoIndexerDeterministicExecutor, RepoReviewerDeterministicExecutor,
-    TaskPlannerDeterministicExecutor, WorkspacePatchApplyDeterministicExecutor,
+    load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
+    IncidentEnricherDeterministicExecutor, RepoIndexerDeterministicExecutor,
+    RepoReviewerDeterministicExecutor, TaskPlannerDeterministicExecutor,
+    WorkspacePatchApplyDeterministicExecutor,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -82,6 +89,23 @@ struct OpenClawResolvedCaller {
     counterparty: CounterpartyRef,
     requester_id: String,
     effective_scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedEvaluationProfile {
+    name: String,
+    profile: EvaluationProfile,
+    scorecard: ScorecardSpec,
+    dataset: Option<(String, EvaluationDataset)>,
+    alert_rules: Vec<AlertRule>,
+}
+
+#[derive(Debug, Clone)]
+struct ScorecardOutcome {
+    status: EvaluationStatus,
+    score: f64,
+    summary: String,
+    findings: Vec<String>,
 }
 
 fn is_task_plan_capability(capability: &str) -> bool {
@@ -647,7 +671,18 @@ impl Supervisor {
     }
 
     async fn postprocess_terminal_action(&self, action: &mut Action) -> anyhow::Result<()> {
-        let evaluations = self.evaluate_action_outputs(action).await?;
+        let doctrine = default_doctrine_pack(action);
+        let resolved_profile = self.resolve_evaluation_profile(action)?;
+        let preliminary_checkpoint_status =
+            checkpoint_status_for_action(action, &doctrine, true, None, resolved_profile.is_some());
+        let evaluations = self
+            .evaluate_action_outputs(
+                action,
+                resolved_profile.as_ref(),
+                &doctrine,
+                &preliminary_checkpoint_status,
+            )
+            .await?;
         for evaluation in &evaluations {
             self.store.insert_evaluation(evaluation).await?;
             self.store
@@ -663,25 +698,12 @@ impl Supervisor {
                 .await?;
         }
 
-        if let Some(item) = self
-            .maybe_enqueue_review_item(action, evaluations.last())
-            .await?
-        {
-            self.store.insert_review_queue_item(&item).await?;
-            self.store
-                .append_action_event(
-                    &action.id,
-                    "review_queue_item_created",
-                    serde_json::json!({
-                        "review_id": item.id,
-                        "source": item.source,
-                        "status": format!("{:?}", item.status).to_lowercase(),
-                    }),
-                )
-                .await?;
-        }
-
-        let incidents = self.policy_incidents_for_action(action, evaluations.last());
+        let incidents = self.policy_incidents_for_action(
+            action,
+            resolved_profile.as_ref(),
+            evaluations.last(),
+            &preliminary_checkpoint_status,
+        );
         for incident in &incidents {
             self.store.insert_policy_incident(incident).await?;
             self.store
@@ -697,45 +719,16 @@ impl Supervisor {
                 .await?;
         }
 
-        if let Some(reason) =
-            self.post_result_enforcement_gap_reason(action, evaluations.last(), &incidents)
-        {
-            set_action_blocked(
-                action,
-                failure_code_policy_enforcement_gap(),
-                reason.clone(),
-            );
-            action.continuity_mode = Some(ContinuityModeName::HumanHandoff);
-            self.store.upsert_action(action).await?;
-            self.store
-                .append_action_event(
-                    &action.id,
-                    "blocked",
-                    serde_json::json!({
-                        "reason": reason,
-                        "code": action.failure_code,
-                        "continuity_mode": action.continuity_mode.as_ref().map(continuity_mode_name),
-                    }),
-                )
-                .await?;
-        }
-
-        for alert in self.alert_rules_for_action(action, evaluations.last(), &incidents) {
-            self.store
-                .append_action_event(
-                    &action.id,
-                    "alert_triggered",
-                    serde_json::json!({
-                        "rule_id": alert.id,
-                        "name": alert.name,
-                        "trigger": alert.trigger,
-                        "severity": alert.severity,
-                    }),
-                )
-                .await?;
-        }
-
-        let trace = self.build_trace_bundle_for_action(action).await?;
+        let checkpoint_status = checkpoint_status_for_action(
+            action,
+            &doctrine,
+            true,
+            evaluations.last(),
+            resolved_profile.is_some(),
+        );
+        let trace = self
+            .build_trace_bundle_for_action(action, &doctrine, &checkpoint_status, &incidents)
+            .await?;
         self.store.put_trace_bundle(&trace).await?;
         self.store
             .append_action_event(
@@ -748,18 +741,93 @@ impl Supervisor {
             )
             .await?;
 
+        let dataset_case = self
+            .maybe_capture_dataset_case(
+                action,
+                resolved_profile.as_ref(),
+                &trace,
+                evaluations.as_slice(),
+            )
+            .await?;
+        if let Some(case) = &dataset_case {
+            self.store.insert_dataset_case(case).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "dataset_case_captured",
+                    serde_json::json!({
+                        "dataset_case_id": case.id,
+                        "dataset_name": case.dataset_name,
+                    }),
+                )
+                .await?;
+        }
+
+        if let Some(item) = self
+            .maybe_enqueue_review_item(
+                action,
+                resolved_profile.as_ref(),
+                evaluations.last(),
+                &incidents,
+                dataset_case.as_ref(),
+            )
+            .await?
+        {
+            self.store.insert_review_queue_item(&item).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "review_queue_item_created",
+                    serde_json::json!({
+                        "review_id": item.id,
+                        "source": item.source,
+                        "status": format!("{:?}", item.status).to_lowercase(),
+                        "priority": item.priority,
+                        "reason_code": item.reason_code,
+                    }),
+                )
+                .await?;
+        }
+
+        for alert in self.build_alert_events(
+            action,
+            resolved_profile.as_ref(),
+            evaluations.last(),
+            &incidents,
+        ) {
+            self.store.insert_alert_event(&alert).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "alert_triggered",
+                    serde_json::json!({
+                        "rule_id": alert.rule_id,
+                        "summary": alert.summary,
+                        "severity": alert.severity,
+                    }),
+                )
+                .await?;
+        }
+
         Ok(())
     }
 
-    async fn build_trace_bundle_for_action(&self, action: &Action) -> anyhow::Result<TraceBundle> {
+    async fn build_trace_bundle_for_action(
+        &self,
+        action: &Action,
+        doctrine: &DoctrinePack,
+        checkpoint_status: &[CheckpointStatus],
+        incidents: &[PolicyIncident],
+    ) -> anyhow::Result<TraceBundle> {
         let events = self.store.list_action_events(&action.id).await?;
-        let incidents = self.store.list_policy_incidents(&action.id).await?;
-        let doctrine = default_doctrine_pack(action);
         let trace = TraceBundle {
             id: format!("trace-{}", action.id),
             action_id: action.id.clone(),
             capability: action.capability.clone(),
             goal_summary: action.goal.summary.clone(),
+            jurisdiction_class: Some(doctrine.jurisdiction.clone()),
+            doctrine_summary: Some(doctrine.clone()),
+            checkpoint_status: checkpoint_status.to_vec(),
             selected_executor: action.selected_executor.clone(),
             inputs: action.inputs.clone(),
             artifact_refs: action.outputs.artifacts.clone(),
@@ -786,8 +854,9 @@ impl Supervisor {
                 .get("verification_summary")
                 .cloned()
                 .and_then(|value| serde_json::from_value(value).ok()),
-            enforcement_records: checkpoint_status_for_action(action, &doctrine, None, None)
-                .into_iter()
+            enforcement_records: checkpoint_status
+                .iter()
+                .cloned()
                 .map(|status| crawfish_types::EnforcementRecord {
                     id: format!(
                         "enforcement-{}-{}",
@@ -803,7 +872,7 @@ impl Supervisor {
                     created_at: now_timestamp(),
                 })
                 .collect(),
-            policy_incidents: incidents,
+            policy_incidents: incidents.to_vec(),
             created_at: now_timestamp(),
         };
         Ok(trace)
@@ -812,198 +881,155 @@ impl Supervisor {
     async fn evaluate_action_outputs(
         &self,
         action: &Action,
+        profile: Option<&ResolvedEvaluationProfile>,
+        doctrine: &DoctrinePack,
+        checkpoint_status: &[CheckpointStatus],
     ) -> anyhow::Result<Vec<EvaluationRecord>> {
-        let Some(hook) = effective_evaluation_hook(action) else {
+        let Some(profile) = profile else {
             return Ok(Vec::new());
         };
 
-        let record = match hook.as_str() {
-            "deterministic_scorecard" | "operator_review_queue" => {
-                self.build_deterministic_evaluation_record(action, &hook)
-                    .await?
-            }
-            _ => return Ok(Vec::new()),
-        };
-
-        Ok(vec![record])
+        let outcome = self
+            .score_action_outputs(action, profile, doctrine, checkpoint_status)
+            .await?;
+        Ok(vec![EvaluationRecord {
+            id: Uuid::new_v4().to_string(),
+            action_id: action.id.clone(),
+            evaluator: profile.name.clone(),
+            status: outcome.status,
+            score: Some(outcome.score),
+            summary: outcome.summary,
+            findings: outcome.findings,
+            feedback_note_id: None,
+            created_at: now_timestamp(),
+        }])
     }
 
-    async fn build_deterministic_evaluation_record(
+    async fn score_action_outputs(
         &self,
         action: &Action,
-        hook: &str,
-    ) -> anyhow::Result<EvaluationRecord> {
-        match action.capability.as_str() {
-            "task.plan" | "coding.patch.plan" => {
-                let artifact_ref = action
-                    .outputs
-                    .artifacts
-                    .iter()
-                    .find(|artifact| artifact.path.ends_with("task_plan.json"))
-                    .ok_or_else(|| anyhow::anyhow!("missing task_plan.json artifact"))?;
-                let artifact: crawfish_types::TaskPlanArtifact =
-                    load_json_artifact(artifact_ref).await?;
-                let mut findings = Vec::new();
-                let mut passed = 0_u32;
-                let total = 4_u32;
-                if artifact.ordered_steps.len() >= 2 {
-                    passed += 1;
-                } else {
-                    findings.push("ordered_steps must contain at least 2 entries".to_string());
-                }
-                if !artifact.risks.is_empty()
-                    && !artifact.assumptions.is_empty()
-                    && !artifact.confidence_summary.trim().is_empty()
-                {
-                    passed += 1;
-                } else {
-                    findings.push(
-                        "risks, assumptions, and confidence_summary must be populated".to_string(),
-                    );
-                }
-                let objective = task_plan_objective_from_action(action)?;
-                let serialized = serde_json::to_string(&artifact)?;
-                if objective_tokens(&objective)
-                    .into_iter()
-                    .all(|token| serialized.to_lowercase().contains(&token))
-                {
-                    passed += 1;
-                } else {
-                    findings.push("objective coverage is incomplete".to_string());
-                }
-                let desired_outputs = metadata_string_array(&action.inputs, "desired_outputs");
-                if desired_outputs.is_empty()
-                    || desired_outputs
-                        .iter()
-                        .all(|value| serialized.contains(value))
-                {
-                    passed += 1;
-                } else {
-                    findings.push("desired output coverage is incomplete".to_string());
-                }
-                let status = if findings.is_empty() {
-                    crawfish_types::EvaluationStatus::Passed
-                } else if hook == "operator_review_queue" {
-                    crawfish_types::EvaluationStatus::NeedsReview
-                } else {
-                    crawfish_types::EvaluationStatus::Failed
-                };
-                Ok(EvaluationRecord {
-                    id: Uuid::new_v4().to_string(),
-                    action_id: action.id.clone(),
-                    evaluator: hook.to_string(),
-                    status,
-                    score: Some(f64::from(passed) / f64::from(total)),
-                    summary: "Deterministic scorecard for task.plan".to_string(),
-                    findings,
-                    feedback_note_id: None,
-                    created_at: now_timestamp(),
-                })
-            }
-            "repo.review" => {
-                let artifact_ref = action
-                    .outputs
-                    .artifacts
-                    .iter()
-                    .find(|artifact| artifact.path.ends_with("review_findings.json"))
-                    .ok_or_else(|| anyhow::anyhow!("missing review_findings.json artifact"))?;
-                let artifact: crawfish_types::ReviewFindingsArtifact =
-                    load_json_artifact(artifact_ref).await?;
-                let mut findings = Vec::new();
-                let status = if artifact.changed_files.is_empty() {
-                    findings.push("changed_files is empty".to_string());
-                    crawfish_types::EvaluationStatus::Failed
-                } else if matches!(artifact.risk_level, crawfish_types::ReviewRiskLevel::High) {
-                    findings.push("high-risk review should be operator-reviewed".to_string());
-                    crawfish_types::EvaluationStatus::NeedsReview
-                } else {
-                    crawfish_types::EvaluationStatus::Passed
-                };
-                Ok(EvaluationRecord {
-                    id: Uuid::new_v4().to_string(),
-                    action_id: action.id.clone(),
-                    evaluator: hook.to_string(),
-                    status,
-                    score: Some(if findings.is_empty() { 1.0 } else { 0.5 }),
-                    summary: "Deterministic scorecard for repo.review".to_string(),
-                    findings,
-                    feedback_note_id: None,
-                    created_at: now_timestamp(),
-                })
-            }
-            "incident.enrich" => {
-                let artifact_ref = action
-                    .outputs
-                    .artifacts
-                    .iter()
-                    .find(|artifact| artifact.path.ends_with("incident_enrichment.json"))
-                    .ok_or_else(|| anyhow::anyhow!("missing incident_enrichment.json artifact"))?;
-                let artifact: crawfish_types::IncidentEnrichmentArtifact =
-                    load_json_artifact(artifact_ref).await?;
-                let mut findings = Vec::new();
-                let has_signal = !artifact.probable_blast_radius.is_empty()
-                    || !artifact.error_signatures.is_empty()
-                    || !artifact.repeated_symptoms.is_empty();
-                let status = if has_signal && !artifact.next_steps.is_empty() {
-                    crawfish_types::EvaluationStatus::Passed
-                } else {
-                    if !has_signal {
-                        findings.push(
-                            "incident enrichment lacks blast radius or signal evidence".to_string(),
-                        );
-                    }
-                    if artifact.next_steps.is_empty() {
-                        findings
-                            .push("incident enrichment lacks deterministic next steps".to_string());
-                    }
-                    crawfish_types::EvaluationStatus::NeedsReview
-                };
-                Ok(EvaluationRecord {
-                    id: Uuid::new_v4().to_string(),
-                    action_id: action.id.clone(),
-                    evaluator: hook.to_string(),
-                    status,
-                    score: Some(if findings.is_empty() { 1.0 } else { 0.6 }),
-                    summary: "Deterministic scorecard for incident.enrich".to_string(),
-                    findings,
-                    feedback_note_id: None,
-                    created_at: now_timestamp(),
-                })
-            }
-            _ => Err(anyhow::anyhow!(
-                "deterministic evaluation is not implemented for {}",
-                action.capability
-            )),
+        profile: &ResolvedEvaluationProfile,
+        doctrine: &DoctrinePack,
+        checkpoint_status: &[CheckpointStatus],
+    ) -> anyhow::Result<ScorecardOutcome> {
+        let total_weight: u32 = profile
+            .scorecard
+            .criteria
+            .iter()
+            .map(|criterion| criterion.weight.max(1))
+            .sum();
+        if total_weight == 0 {
+            anyhow::bail!("scorecard {} has no criteria", profile.scorecard.id);
         }
+
+        let mut passed_weight = 0_u32;
+        let mut findings = Vec::new();
+        for criterion in &profile.scorecard.criteria {
+            if self
+                .scorecard_criterion_passed(action, doctrine, checkpoint_status, criterion)
+                .await?
+            {
+                passed_weight = passed_weight.saturating_add(criterion.weight.max(1));
+            } else {
+                findings.push(format!("{} failed", criterion.title));
+            }
+        }
+
+        let score = f64::from(passed_weight) / f64::from(total_weight);
+        let minimum_score = profile.scorecard.minimum_score.unwrap_or(0.5);
+        let needs_review_below = profile.scorecard.needs_review_below.unwrap_or(1.0);
+        let status = if score < minimum_score {
+            EvaluationStatus::Failed
+        } else if score < needs_review_below {
+            EvaluationStatus::NeedsReview
+        } else {
+            EvaluationStatus::Passed
+        };
+
+        Ok(ScorecardOutcome {
+            status,
+            score,
+            summary: format!("Deterministic scorecard for {}", action.capability),
+            findings,
+        })
     }
 
     async fn maybe_enqueue_review_item(
         &self,
         action: &Action,
+        profile: Option<&ResolvedEvaluationProfile>,
         evaluation: Option<&EvaluationRecord>,
+        incidents: &[PolicyIncident],
+        dataset_case: Option<&DatasetCase>,
     ) -> anyhow::Result<Option<ReviewQueueItem>> {
-        let Some(evaluation) = evaluation else {
-            return Ok(None);
-        };
-        let Some(hook) = effective_evaluation_hook(action) else {
-            return Ok(None);
-        };
-        let should_queue = hook == "operator_review_queue"
-            || matches!(
-                evaluation.status,
-                crawfish_types::EvaluationStatus::NeedsReview
-                    | crawfish_types::EvaluationStatus::Failed
-            );
+        let should_queue = profile
+            .map(|profile| profile.profile.review_queue)
+            .unwrap_or(false)
+            || evaluation
+                .map(|evaluation| {
+                    matches!(
+                        evaluation.status,
+                        EvaluationStatus::NeedsReview | EvaluationStatus::Failed
+                    )
+                })
+                .unwrap_or(false)
+            || incidents.iter().any(|incident| {
+                matches!(
+                    incident.severity,
+                    PolicyIncidentSeverity::Warning | PolicyIncidentSeverity::Critical
+                )
+            });
+
         if !should_queue {
             return Ok(None);
         }
+
+        let priority = if incidents
+            .iter()
+            .any(|incident| matches!(incident.severity, PolicyIncidentSeverity::Critical))
+            || evaluation
+                .map(|evaluation| matches!(evaluation.status, EvaluationStatus::Failed))
+                .unwrap_or(false)
+        {
+            "high".to_string()
+        } else {
+            "medium".to_string()
+        };
+
+        let reason_code = if incidents
+            .iter()
+            .any(|incident| incident.code == "unresolved_evaluation_profile")
+        {
+            "enforcement_gap".to_string()
+        } else if evaluation
+            .map(|evaluation| matches!(evaluation.status, EvaluationStatus::NeedsReview))
+            .unwrap_or(false)
+        {
+            "needs_review".to_string()
+        } else if evaluation
+            .map(|evaluation| matches!(evaluation.status, EvaluationStatus::Failed))
+            .unwrap_or(false)
+        {
+            "evaluation_failed".to_string()
+        } else {
+            "policy_incident".to_string()
+        };
+
         Ok(Some(ReviewQueueItem {
             id: Uuid::new_v4().to_string(),
             action_id: action.id.clone(),
-            source: hook,
+            source: profile
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| "policy_incident".to_string()),
             status: ReviewQueueStatus::Open,
-            summary: evaluation.summary.clone(),
-            evaluation_ref: Some(evaluation.id.clone()),
+            priority,
+            reason_code,
+            summary: evaluation
+                .map(|evaluation| evaluation.summary.clone())
+                .or_else(|| incidents.first().map(|incident| incident.summary.clone()))
+                .unwrap_or_else(|| "operator review required".to_string()),
+            evaluation_ref: evaluation.map(|evaluation| evaluation.id.clone()),
+            dataset_case_ref: dataset_case.map(|case| case.id.clone()),
             created_at: now_timestamp(),
             resolved_at: None,
             resolution: None,
@@ -1013,7 +1039,9 @@ impl Supervisor {
     fn policy_incidents_for_action(
         &self,
         action: &Action,
+        profile: Option<&ResolvedEvaluationProfile>,
         evaluation: Option<&EvaluationRecord>,
+        checkpoint_status: &[CheckpointStatus],
     ) -> Vec<PolicyIncident> {
         let doctrine = default_doctrine_pack(action);
         let mut incidents = Vec::new();
@@ -1033,7 +1061,7 @@ impl Supervisor {
             });
         }
         if let Some(hook) = action.contract.quality.evaluation_hook.as_deref() {
-            if !matches!(hook, "deterministic_scorecard" | "operator_review_queue") {
+            if legacy_evaluation_hook_profile_name(hook).is_none() {
                 incidents.push(PolicyIncident {
                     id: Uuid::new_v4().to_string(),
                     action_id: action.id.clone(),
@@ -1041,16 +1069,29 @@ impl Supervisor {
                     jurisdiction: doctrine.jurisdiction.clone(),
                     code: "unsupported_evaluation_hook".to_string(),
                     summary: format!(
-                        "Required post-result evaluation hook `{hook}` is not supported by the runtime."
+                        "evaluation_hook `{hook}` is deprecated and could not be normalized into a named evaluation profile"
                     ),
-                    severity: crawfish_types::PolicyIncidentSeverity::Critical,
+                    severity: PolicyIncidentSeverity::Critical,
                     checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
                     created_at: now_timestamp(),
                 });
             }
         }
+        if evaluation_required_for_action(action) && profile.is_none() {
+            incidents.push(PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: doctrine.id.clone(),
+                jurisdiction: doctrine.jurisdiction.clone(),
+                code: "unresolved_evaluation_profile".to_string(),
+                summary: "post-result evaluation is required but no resolvable evaluation profile was available".to_string(),
+                severity: PolicyIncidentSeverity::Critical,
+                checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                created_at: now_timestamp(),
+            });
+        }
         if let Some(evaluation) = evaluation {
-            if matches!(evaluation.status, crawfish_types::EvaluationStatus::Failed) {
+            if matches!(evaluation.status, EvaluationStatus::Failed) {
                 incidents.push(PolicyIncident {
                     id: Uuid::new_v4().to_string(),
                     action_id: action.id.clone(),
@@ -1058,75 +1099,464 @@ impl Supervisor {
                     jurisdiction: doctrine.jurisdiction.clone(),
                     code: "evaluation_failed".to_string(),
                     summary: evaluation.summary.clone(),
-                    severity: crawfish_types::PolicyIncidentSeverity::Warning,
+                    severity: PolicyIncidentSeverity::Warning,
                     checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
                     created_at: now_timestamp(),
                 });
             }
         }
+        if checkpoint_status.iter().any(|status| {
+            status.checkpoint == crawfish_types::OversightCheckpoint::PostResult
+                && status.required
+                && matches!(status.outcome, CheckpointOutcome::Failed)
+        }) {
+            incidents.push(PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: doctrine.id.clone(),
+                jurisdiction: doctrine.jurisdiction.clone(),
+                code: "post_result_checkpoint_failed".to_string(),
+                summary: "post-result checkpoint could not be proven with current evidence"
+                    .to_string(),
+                severity: PolicyIncidentSeverity::Critical,
+                checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                created_at: now_timestamp(),
+            });
+        }
         incidents
     }
 
-    fn post_result_enforcement_gap_reason(
+    fn build_alert_events(
         &self,
         action: &Action,
+        profile: Option<&ResolvedEvaluationProfile>,
         evaluation: Option<&EvaluationRecord>,
         incidents: &[PolicyIncident],
-    ) -> Option<String> {
-        if incidents
+    ) -> Vec<AlertEvent> {
+        let mut configured_rules = profile
+            .map(|profile| profile.alert_rules.clone())
+            .unwrap_or_default();
+        if !configured_rules
             .iter()
-            .any(|incident| incident.code == "unsupported_evaluation_hook")
+            .any(|rule| rule.id == "frontier_gap_detected")
         {
-            return Some(
-                "post-result doctrine requires an evaluation hook the runtime cannot enforce"
-                    .to_string(),
-            );
+            configured_rules.push(default_alert_rule_frontier_gap());
         }
-        if action.capability == "workspace.patch.apply" && evaluation.is_none() {
-            return None;
+        if !configured_rules
+            .iter()
+            .any(|rule| rule.id == "evaluation_attention_required")
+        {
+            configured_rules.push(default_alert_rule_evaluation_attention());
         }
-        None
+        configured_rules
+            .into_iter()
+            .filter(|rule| alert_rule_matches(rule, evaluation, incidents))
+            .map(|rule| AlertEvent {
+                id: Uuid::new_v4().to_string(),
+                rule_id: rule.id.clone(),
+                action_id: action.id.clone(),
+                severity: rule.severity.clone(),
+                summary: alert_summary_for_rule(&rule, evaluation, incidents),
+                created_at: now_timestamp(),
+                acknowledged_at: None,
+                acknowledged_by: None,
+            })
+            .collect()
     }
 
-    fn alert_rules_for_action(
-        &self,
-        _action: &Action,
-        evaluation: Option<&EvaluationRecord>,
-        incidents: &[PolicyIncident],
-    ) -> Vec<crawfish_types::AlertRule> {
-        let mut rules = Vec::new();
-        if incidents.iter().any(|incident| {
-            matches!(
-                incident.severity,
-                crawfish_types::PolicyIncidentSeverity::Warning
-                    | crawfish_types::PolicyIncidentSeverity::Critical
-            )
-        }) {
-            rules.push(crawfish_types::AlertRule {
-                id: "frontier_gap_detected".to_string(),
-                name: "Frontier gap detected".to_string(),
-                trigger: "policy_incident".to_string(),
-                severity: "warning".to_string(),
-            });
-        }
-        if evaluation
-            .map(|evaluation| {
-                matches!(
-                    evaluation.status,
-                    crawfish_types::EvaluationStatus::Failed
-                        | crawfish_types::EvaluationStatus::NeedsReview
-                )
-            })
-            .unwrap_or(false)
-        {
-            rules.push(crawfish_types::AlertRule {
-                id: "evaluation_attention_required".to_string(),
-                name: "Evaluation attention required".to_string(),
-                trigger: "evaluation".to_string(),
-                severity: "info".to_string(),
-            });
-        }
+    fn evaluation_profiles(&self) -> BTreeMap<String, EvaluationProfile> {
+        let mut profiles = builtin_evaluation_profiles();
+        profiles.extend(self.config.evaluation.profiles.clone());
+        profiles
+    }
+
+    fn evaluation_scorecards(&self) -> BTreeMap<String, ScorecardSpec> {
+        let mut scorecards = builtin_scorecards();
+        scorecards.extend(self.config.evaluation.scorecards.clone());
+        scorecards
+    }
+
+    fn evaluation_datasets(&self) -> BTreeMap<String, EvaluationDataset> {
+        let mut datasets = builtin_evaluation_datasets();
+        datasets.extend(self.config.evaluation.datasets.clone());
+        datasets
+    }
+
+    fn evaluation_alert_rules(&self) -> BTreeMap<String, AlertRule> {
+        let mut rules = builtin_alert_rules();
+        rules.extend(self.config.evaluation.alerts.clone());
         rules
+    }
+
+    fn resolve_evaluation_profile(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<Option<ResolvedEvaluationProfile>> {
+        let requested_name =
+            if let Some(profile) = action.contract.quality.evaluation_profile.clone() {
+                Some(profile)
+            } else if let Some(hook) = action.contract.quality.evaluation_hook.as_deref() {
+                legacy_evaluation_hook_profile_name(hook).map(ToString::to_string)
+            } else {
+                builtin_profile_name_for_capability(&action.capability).map(ToString::to_string)
+            };
+
+        let Some(profile_name) = requested_name else {
+            return Ok(None);
+        };
+
+        let profiles = self.evaluation_profiles();
+        let Some(profile) = profiles.get(&profile_name).cloned() else {
+            return Ok(None);
+        };
+        let scorecards = self.evaluation_scorecards();
+        let Some(scorecard) = scorecards.get(&profile.scorecard).cloned() else {
+            return Ok(None);
+        };
+        let datasets = self.evaluation_datasets();
+        let dataset = profile.dataset_name.as_ref().and_then(|name| {
+            datasets
+                .get(name)
+                .cloned()
+                .map(|dataset| (name.clone(), dataset))
+        });
+        let alerts = self.evaluation_alert_rules();
+        let alert_rules = profile
+            .alert_rules
+            .iter()
+            .filter_map(|name| alerts.get(name).cloned())
+            .collect();
+
+        Ok(Some(ResolvedEvaluationProfile {
+            name: profile_name,
+            profile,
+            scorecard,
+            dataset,
+            alert_rules,
+        }))
+    }
+
+    async fn scorecard_criterion_passed(
+        &self,
+        action: &Action,
+        _doctrine: &DoctrinePack,
+        checkpoint_status: &[CheckpointStatus],
+        criterion: &ScorecardCriterion,
+    ) -> anyhow::Result<bool> {
+        match criterion.kind {
+            ScorecardCriterionKind::ArtifactPresent => Ok(criterion
+                .artifact_name
+                .as_deref()
+                .and_then(|name| artifact_ref_by_name(action, name))
+                .is_some()),
+            ScorecardCriterionKind::JsonFieldNonempty => {
+                let Some(target) = scorecard_target_value(
+                    action,
+                    criterion.artifact_name.as_deref(),
+                    criterion.field_path.as_deref(),
+                )
+                .await?
+                else {
+                    return Ok(false);
+                };
+                Ok(json_value_is_nonempty(&target))
+            }
+            ScorecardCriterionKind::ListMinLen => {
+                let Some(target) = scorecard_target_value(
+                    action,
+                    criterion.artifact_name.as_deref(),
+                    criterion.field_path.as_deref(),
+                )
+                .await?
+                else {
+                    return Ok(false);
+                };
+                Ok(target
+                    .as_array()
+                    .map(|items| items.len() >= criterion.min_len.unwrap_or(1) as usize)
+                    .unwrap_or(false))
+            }
+            ScorecardCriterionKind::TokenCoverage => {
+                let Some(source_path) = criterion.source_path.as_deref() else {
+                    return Ok(false);
+                };
+                let source_tokens = scorecard_source_tokens(action, source_path);
+                if source_tokens.is_empty() {
+                    return Ok(true);
+                }
+                let Some(target_text) = scorecard_target_text(
+                    action,
+                    criterion.artifact_name.as_deref(),
+                    criterion.field_path.as_deref(),
+                )
+                .await?
+                else {
+                    return Ok(false);
+                };
+                let target_text = target_text.to_ascii_lowercase();
+                Ok(source_tokens
+                    .into_iter()
+                    .all(|token| target_text.contains(&token)))
+            }
+            ScorecardCriterionKind::CheckpointPassed => {
+                let Some(checkpoint) = criterion.checkpoint.as_ref() else {
+                    return Ok(false);
+                };
+                Ok(checkpoint_status.iter().any(|status| {
+                    &status.checkpoint == checkpoint
+                        && matches!(status.outcome, CheckpointOutcome::Passed)
+                }))
+            }
+            ScorecardCriterionKind::IncidentAbsent => {
+                let incidents = self.store.list_policy_incidents(&action.id).await?;
+                if let Some(code) = criterion.incident_code.as_deref() {
+                    Ok(!incidents.iter().any(|incident| incident.code == code))
+                } else {
+                    Ok(incidents.is_empty())
+                }
+            }
+        }
+    }
+
+    async fn maybe_capture_dataset_case(
+        &self,
+        action: &Action,
+        profile: Option<&ResolvedEvaluationProfile>,
+        trace: &TraceBundle,
+        evaluations: &[EvaluationRecord],
+    ) -> anyhow::Result<Option<DatasetCase>> {
+        let Some(profile) = profile else {
+            return Ok(None);
+        };
+        if !profile.profile.dataset_capture {
+            return Ok(None);
+        }
+        let Some((dataset_name, dataset)) = profile.dataset.as_ref() else {
+            return Ok(None);
+        };
+        if !dataset.auto_capture {
+            return Ok(None);
+        }
+
+        Ok(Some(DatasetCase {
+            id: Uuid::new_v4().to_string(),
+            dataset_name: dataset_name.clone(),
+            capability: action.capability.clone(),
+            goal_summary: action.goal.summary.clone(),
+            normalized_inputs: action.inputs.clone(),
+            expected_artifacts: action
+                .outputs
+                .artifacts
+                .iter()
+                .map(artifact_basename)
+                .collect(),
+            expected_output_signals: metadata_string_array(&action.inputs, "desired_outputs"),
+            source_action_id: action.id.clone(),
+            jurisdiction_class: trace.jurisdiction_class.clone(),
+            doctrine_summary: trace.doctrine_summary.clone(),
+            checkpoint_status: trace.checkpoint_status.clone(),
+            policy_incidents: trace.policy_incidents.clone(),
+            verification_summary: trace.verification_summary.clone(),
+            evaluation_refs: evaluations
+                .iter()
+                .map(|evaluation| evaluation.id.clone())
+                .collect(),
+            created_at: now_timestamp(),
+        }))
+    }
+
+    async fn run_experiment_case(
+        &self,
+        run: &ExperimentRun,
+        case: &DatasetCase,
+    ) -> anyhow::Result<ExperimentCaseResult> {
+        let source_action = self
+            .store
+            .get_action(&case.source_action_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("source action not found: {}", case.source_action_id))?;
+        let manifest = self
+            .store
+            .get_agent_manifest(&source_action.target_agent_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("agent not found: {}", source_action.target_agent_id))?;
+
+        let mut action = source_action.clone();
+        action.id = format!("experiment-{}", Uuid::new_v4());
+        action.phase = ActionPhase::Running;
+        action.created_at = now_timestamp();
+        action.started_at = Some(now_timestamp());
+        action.finished_at = None;
+        action.checkpoint_ref = None;
+        action.selected_executor = None;
+        action.recovery_stage = None;
+        action.external_refs = Vec::new();
+        action.outputs = ActionOutputs::default();
+        action.continuity_mode = None;
+        action.degradation_profile = None;
+        action.failure_reason = None;
+        action.failure_code = None;
+        action.inputs = case.normalized_inputs.clone();
+        action.execution_strategy = Some(ExecutionStrategy {
+            mode: ExecutionStrategyMode::SinglePass,
+            verification_spec: None,
+            stop_budget: None,
+            feedback_policy: crawfish_types::FeedbackPolicy::default(),
+        });
+        action.contract.execution.fallback_chain = Vec::new();
+        action.contract.execution.preferred_harnesses = vec![run.executor.clone()];
+
+        let outcome = match case.capability.as_str() {
+            "task.plan" => {
+                self.execute_task_plan_single_pass(&mut action, &manifest)
+                    .await?
+            }
+            "repo.review" if run.executor == "deterministic" => {
+                let workspace_root = required_input_string(&action, "workspace_root")?;
+                let (repo_index_ref, repo_index) = self
+                    .ensure_repo_index_for_workspace(&workspace_root)
+                    .await?;
+                let executor = RepoReviewerDeterministicExecutor::new(
+                    self.state_dir(),
+                    repo_index,
+                    Some(repo_index_ref),
+                );
+                match executor.execute(&action).await {
+                    Ok(outputs) => ExecutionOutcome::Completed {
+                        outputs,
+                        selected_executor: "deterministic.repo_review".to_string(),
+                        checkpoint: None,
+                        external_refs: Vec::new(),
+                        surface_events: Vec::new(),
+                    },
+                    Err(error) => ExecutionOutcome::Failed {
+                        reason: error.to_string(),
+                        failure_code: failure_code_executor_error().to_string(),
+                        outputs: ActionOutputs::default(),
+                        checkpoint: None,
+                        external_refs: Vec::new(),
+                        surface_events: Vec::new(),
+                    },
+                }
+            }
+            "incident.enrich" if run.executor == "deterministic" => {
+                let executor = IncidentEnricherDeterministicExecutor::new(self.state_dir());
+                match executor.execute(&action).await {
+                    Ok(outputs) => ExecutionOutcome::Completed {
+                        outputs,
+                        selected_executor: "deterministic.incident_enrich".to_string(),
+                        checkpoint: None,
+                        external_refs: Vec::new(),
+                        surface_events: Vec::new(),
+                    },
+                    Err(error) => ExecutionOutcome::Failed {
+                        reason: error.to_string(),
+                        failure_code: failure_code_executor_error().to_string(),
+                        outputs: ActionOutputs::default(),
+                        checkpoint: None,
+                        external_refs: Vec::new(),
+                        surface_events: Vec::new(),
+                    },
+                }
+            }
+            _ => ExecutionOutcome::Failed {
+                reason: format!(
+                    "executor {} does not support replay for {}",
+                    run.executor, case.capability
+                ),
+                failure_code: failure_code_route_unavailable().to_string(),
+                outputs: ActionOutputs::default(),
+                checkpoint: None,
+                external_refs: Vec::new(),
+                surface_events: Vec::new(),
+            },
+        };
+
+        match outcome {
+            ExecutionOutcome::Completed {
+                outputs,
+                selected_executor,
+                external_refs,
+                ..
+            } => {
+                action.phase = ActionPhase::Completed;
+                action.finished_at = Some(now_timestamp());
+                action.outputs = outputs.clone();
+                action.selected_executor = Some(selected_executor.clone());
+                action.external_refs = external_refs.clone();
+                let doctrine = default_doctrine_pack(&action);
+                let resolved_profile = self.resolve_evaluation_profile(&action)?;
+                let checkpoint_status = checkpoint_status_for_action(
+                    &action,
+                    &doctrine,
+                    false,
+                    None,
+                    resolved_profile.is_some(),
+                );
+                let evaluation = self
+                    .evaluate_action_outputs(
+                        &action,
+                        resolved_profile.as_ref(),
+                        &doctrine,
+                        &checkpoint_status,
+                    )
+                    .await?
+                    .into_iter()
+                    .last();
+                Ok(ExperimentCaseResult {
+                    id: Uuid::new_v4().to_string(),
+                    run_id: run.id.clone(),
+                    dataset_case_id: case.id.clone(),
+                    capability: case.capability.clone(),
+                    status: match evaluation.as_ref().map(|evaluation| &evaluation.status) {
+                        Some(EvaluationStatus::Failed) => ExperimentCaseStatus::Failed,
+                        _ => ExperimentCaseStatus::Passed,
+                    },
+                    selected_executor: Some(selected_executor),
+                    score: evaluation.as_ref().and_then(|evaluation| evaluation.score),
+                    summary: evaluation
+                        .as_ref()
+                        .map(|evaluation| evaluation.summary.clone())
+                        .unwrap_or_else(|| "experiment run completed".to_string()),
+                    findings: evaluation
+                        .as_ref()
+                        .map(|evaluation| evaluation.findings.clone())
+                        .unwrap_or_default(),
+                    artifact_refs: outputs.artifacts,
+                    external_refs,
+                    failure_code: None,
+                    created_at: now_timestamp(),
+                })
+            }
+            ExecutionOutcome::Blocked {
+                reason,
+                failure_code,
+                outputs,
+                external_refs,
+                ..
+            }
+            | ExecutionOutcome::Failed {
+                reason,
+                failure_code,
+                outputs,
+                external_refs,
+                ..
+            } => Ok(ExperimentCaseResult {
+                id: Uuid::new_v4().to_string(),
+                run_id: run.id.clone(),
+                dataset_case_id: case.id.clone(),
+                capability: case.capability.clone(),
+                status: ExperimentCaseStatus::Failed,
+                selected_executor: action.selected_executor.clone(),
+                score: None,
+                summary: reason,
+                findings: Vec::new(),
+                artifact_refs: outputs.artifacts,
+                external_refs,
+                failure_code: Some(failure_code),
+                created_at: now_timestamp(),
+            }),
+        }
     }
 
     async fn record_verification_evaluation(
@@ -3746,23 +4176,6 @@ fn failure_code_verification_spec_invalid() -> &'static str {
     "verification_spec_invalid"
 }
 
-fn failure_code_policy_enforcement_gap() -> &'static str {
-    "policy_enforcement_gap"
-}
-
-fn effective_evaluation_hook(action: &Action) -> Option<String> {
-    action
-        .contract
-        .quality
-        .evaluation_hook
-        .clone()
-        .or_else(|| match action.capability.as_str() {
-            "task.plan" | "coding.patch.plan" => Some("operator_review_queue".to_string()),
-            "repo.review" | "incident.enrich" => Some("deterministic_scorecard".to_string()),
-            _ => None,
-        })
-}
-
 fn runtime_enum_to_snake<T: std::fmt::Debug>(value: &T) -> String {
     format!("{value:?}")
         .chars()
@@ -3786,6 +4199,109 @@ fn objective_tokens(objective: &str) -> Vec<String> {
         .filter(|token| token.len() >= 4)
         .map(|token| token.to_ascii_lowercase())
         .collect()
+}
+
+fn artifact_basename(artifact: &crawfish_types::ArtifactRef) -> String {
+    Path::new(&artifact.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&artifact.path)
+        .to_string()
+}
+
+fn artifact_ref_by_name<'a>(
+    action: &'a Action,
+    artifact_name: &str,
+) -> Option<&'a crawfish_types::ArtifactRef> {
+    action.outputs.artifacts.iter().find(|artifact| {
+        artifact_basename(artifact) == artifact_name || artifact.path.ends_with(artifact_name)
+    })
+}
+
+async fn scorecard_target_value(
+    action: &Action,
+    artifact_name: Option<&str>,
+    field_path: Option<&str>,
+) -> anyhow::Result<Option<Value>> {
+    if let Some(artifact_name) = artifact_name {
+        let Some(artifact_ref) = artifact_ref_by_name(action, artifact_name) else {
+            return Ok(None);
+        };
+        let value: Value = load_json_artifact(artifact_ref).await?;
+        if let Some(field_path) = field_path {
+            return Ok(json_value_at_path(&value, field_path).cloned());
+        }
+        return Ok(Some(value));
+    }
+
+    Ok(field_path
+        .and_then(|field_path| metadata_value_at_path(&action.inputs, field_path).cloned()))
+}
+
+async fn scorecard_target_text(
+    action: &Action,
+    artifact_name: Option<&str>,
+    field_path: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(value) = scorecard_target_value(action, artifact_name, field_path).await? else {
+        return Ok(None);
+    };
+    Ok(Some(match value {
+        Value::String(text) => text,
+        other => serde_json::to_string(&other)?,
+    }))
+}
+
+fn json_value_at_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for part in path.split('.') {
+        match current {
+            Value::Object(map) => current = map.get(part)?,
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn metadata_value_at_path<'a>(metadata: &'a Metadata, path: &str) -> Option<&'a Value> {
+    let mut parts = path.split('.');
+    let first = parts.next()?;
+    let mut current = metadata.get(first)?;
+    for part in parts {
+        current = match current {
+            Value::Object(map) => map.get(part)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+fn json_value_is_nonempty(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Bool(value) => *value,
+        Value::Number(_) => true,
+    }
+}
+
+fn scorecard_source_tokens(action: &Action, source_path: &str) -> Vec<String> {
+    if source_path == "goal_summary" {
+        return objective_tokens(&action.goal.summary);
+    }
+    metadata_value_at_path(&action.inputs, source_path)
+        .map(scorecard_value_tokens)
+        .unwrap_or_default()
+}
+
+fn scorecard_value_tokens(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(text) => objective_tokens(text),
+        Value::Array(items) => items.iter().flat_map(scorecard_value_tokens).collect(),
+        other => objective_tokens(&other.to_string()),
+    }
 }
 
 fn lease_failure_code(reason: &str) -> &'static str {
@@ -3936,8 +4452,9 @@ fn default_doctrine_pack(action: &Action) -> DoctrinePack {
 fn checkpoint_status_for_action(
     action: &Action,
     doctrine: &DoctrinePack,
-    trace: Option<&TraceBundle>,
+    has_trace_bundle: bool,
     latest_evaluation: Option<&EvaluationRecord>,
+    profile_resolved: bool,
 ) -> Vec<CheckpointStatus> {
     use crawfish_types::{CheckpointOutcome, OversightCheckpoint};
 
@@ -4001,15 +4518,18 @@ fn checkpoint_status_for_action(
                     | ActionPhase::Expired
             ) {
                 CheckpointOutcome::Pending
-            } else if trace.is_some()
-                && (!evaluation_required_for_action(action) || latest_evaluation.is_some())
+            } else if has_trace_bundle
+                && (!evaluation_required_for_action(action)
+                    || (profile_resolved && latest_evaluation.is_some()))
             {
                 CheckpointOutcome::Passed
             } else {
                 CheckpointOutcome::Failed
             },
-            reason: if trace.is_none() {
+            reason: if !has_trace_bundle {
                 Some("trace bundle not available".to_string())
+            } else if evaluation_required_for_action(action) && !profile_resolved {
+                Some("evaluation profile required but unresolved".to_string())
             } else if evaluation_required_for_action(action) && latest_evaluation.is_none() {
                 Some("evaluation required but missing".to_string())
             } else {
@@ -4024,6 +4544,447 @@ fn evaluation_required_for_action(action: &Action) -> bool {
         action.capability.as_str(),
         "task.plan" | "coding.patch.plan" | "repo.review" | "incident.enrich"
     ) || action.contract.quality.evaluation_hook.is_some()
+        || action.contract.quality.evaluation_profile.is_some()
+}
+
+fn legacy_evaluation_hook_profile_name(hook: &str) -> Option<&'static str> {
+    match hook {
+        "operator_review_queue" => Some("task_plan_default"),
+        "deterministic_scorecard" => Some("repo_review_default"),
+        _ => None,
+    }
+}
+
+fn builtin_evaluation_profiles() -> BTreeMap<String, EvaluationProfile> {
+    BTreeMap::from([
+        (
+            "task_plan_default".to_string(),
+            EvaluationProfile {
+                scorecard: "task_plan_scorecard".to_string(),
+                review_queue: true,
+                alert_rules: vec![
+                    "evaluation_attention_required".to_string(),
+                    "frontier_gap_detected".to_string(),
+                ],
+                dataset_name: Some("task_plan_dataset".to_string()),
+                dataset_capture: true,
+                post_result_required: true,
+            },
+        ),
+        (
+            "repo_review_default".to_string(),
+            EvaluationProfile {
+                scorecard: "repo_review_scorecard".to_string(),
+                review_queue: true,
+                alert_rules: vec![
+                    "evaluation_attention_required".to_string(),
+                    "frontier_gap_detected".to_string(),
+                ],
+                dataset_name: Some("repo_review_dataset".to_string()),
+                dataset_capture: true,
+                post_result_required: true,
+            },
+        ),
+        (
+            "incident_enrich_default".to_string(),
+            EvaluationProfile {
+                scorecard: "incident_enrich_scorecard".to_string(),
+                review_queue: true,
+                alert_rules: vec![
+                    "evaluation_attention_required".to_string(),
+                    "frontier_gap_detected".to_string(),
+                ],
+                dataset_name: Some("incident_enrich_dataset".to_string()),
+                dataset_capture: true,
+                post_result_required: true,
+            },
+        ),
+    ])
+}
+
+fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
+    BTreeMap::from([
+        (
+            "task_plan_scorecard".to_string(),
+            ScorecardSpec {
+                id: "task_plan_scorecard".to_string(),
+                title: "Task plan default scorecard".to_string(),
+                criteria: vec![
+                    ScorecardCriterion {
+                        id: "artifact_json".to_string(),
+                        title: "task_plan.json present".to_string(),
+                        kind: ScorecardCriterionKind::ArtifactPresent,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        field_path: None,
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "artifact_markdown".to_string(),
+                        title: "task_plan.md present".to_string(),
+                        kind: ScorecardCriterionKind::ArtifactPresent,
+                        artifact_name: Some("task_plan.md".to_string()),
+                        field_path: None,
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "ordered_steps".to_string(),
+                        title: "ordered_steps has enough entries".to_string(),
+                        kind: ScorecardCriterionKind::ListMinLen,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        field_path: Some("ordered_steps".to_string()),
+                        source_path: None,
+                        min_len: Some(2),
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 2,
+                    },
+                    ScorecardCriterion {
+                        id: "risks".to_string(),
+                        title: "risks populated".to_string(),
+                        kind: ScorecardCriterionKind::JsonFieldNonempty,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        field_path: Some("risks".to_string()),
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "assumptions".to_string(),
+                        title: "assumptions populated".to_string(),
+                        kind: ScorecardCriterionKind::JsonFieldNonempty,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        field_path: Some("assumptions".to_string()),
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "confidence_summary".to_string(),
+                        title: "confidence summary populated".to_string(),
+                        kind: ScorecardCriterionKind::JsonFieldNonempty,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        field_path: Some("confidence_summary".to_string()),
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "objective_coverage".to_string(),
+                        title: "objective tokens covered".to_string(),
+                        kind: ScorecardCriterionKind::TokenCoverage,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        field_path: None,
+                        source_path: Some("inputs.objective".to_string()),
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 2,
+                    },
+                    ScorecardCriterion {
+                        id: "desired_outputs".to_string(),
+                        title: "desired outputs covered".to_string(),
+                        kind: ScorecardCriterionKind::TokenCoverage,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        field_path: None,
+                        source_path: Some("inputs.desired_outputs".to_string()),
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "pre_dispatch".to_string(),
+                        title: "pre-dispatch checkpoint passed".to_string(),
+                        kind: ScorecardCriterionKind::CheckpointPassed,
+                        artifact_name: None,
+                        field_path: None,
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: Some(OversightCheckpoint::PreDispatch),
+                        incident_code: None,
+                        weight: 1,
+                    },
+                ],
+                minimum_score: Some(0.6),
+                needs_review_below: Some(1.0),
+            },
+        ),
+        (
+            "repo_review_scorecard".to_string(),
+            ScorecardSpec {
+                id: "repo_review_scorecard".to_string(),
+                title: "Repo review default scorecard".to_string(),
+                criteria: vec![
+                    ScorecardCriterion {
+                        id: "findings_json".to_string(),
+                        title: "review_findings.json present".to_string(),
+                        kind: ScorecardCriterionKind::ArtifactPresent,
+                        artifact_name: Some("review_findings.json".to_string()),
+                        field_path: None,
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "summary_md".to_string(),
+                        title: "review_summary.md present".to_string(),
+                        kind: ScorecardCriterionKind::ArtifactPresent,
+                        artifact_name: Some("review_summary.md".to_string()),
+                        field_path: None,
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "changed_files".to_string(),
+                        title: "changed files captured".to_string(),
+                        kind: ScorecardCriterionKind::ListMinLen,
+                        artifact_name: Some("review_findings.json".to_string()),
+                        field_path: Some("changed_files".to_string()),
+                        source_path: None,
+                        min_len: Some(1),
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 2,
+                    },
+                    ScorecardCriterion {
+                        id: "findings".to_string(),
+                        title: "findings present".to_string(),
+                        kind: ScorecardCriterionKind::JsonFieldNonempty,
+                        artifact_name: Some("review_findings.json".to_string()),
+                        field_path: Some("findings".to_string()),
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "pre_dispatch".to_string(),
+                        title: "pre-dispatch checkpoint passed".to_string(),
+                        kind: ScorecardCriterionKind::CheckpointPassed,
+                        artifact_name: None,
+                        field_path: None,
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: Some(OversightCheckpoint::PreDispatch),
+                        incident_code: None,
+                        weight: 1,
+                    },
+                ],
+                minimum_score: Some(0.5),
+                needs_review_below: Some(1.0),
+            },
+        ),
+        (
+            "incident_enrich_scorecard".to_string(),
+            ScorecardSpec {
+                id: "incident_enrich_scorecard".to_string(),
+                title: "Incident enrich default scorecard".to_string(),
+                criteria: vec![
+                    ScorecardCriterion {
+                        id: "enrichment_json".to_string(),
+                        title: "incident_enrichment.json present".to_string(),
+                        kind: ScorecardCriterionKind::ArtifactPresent,
+                        artifact_name: Some("incident_enrichment.json".to_string()),
+                        field_path: None,
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "summary_md".to_string(),
+                        title: "incident_summary.md present".to_string(),
+                        kind: ScorecardCriterionKind::ArtifactPresent,
+                        artifact_name: Some("incident_summary.md".to_string()),
+                        field_path: None,
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 1,
+                    },
+                    ScorecardCriterion {
+                        id: "blast_radius".to_string(),
+                        title: "blast radius captured".to_string(),
+                        kind: ScorecardCriterionKind::JsonFieldNonempty,
+                        artifact_name: Some("incident_enrichment.json".to_string()),
+                        field_path: Some("probable_blast_radius".to_string()),
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 2,
+                    },
+                    ScorecardCriterion {
+                        id: "next_steps".to_string(),
+                        title: "next steps present".to_string(),
+                        kind: ScorecardCriterionKind::JsonFieldNonempty,
+                        artifact_name: Some("incident_enrichment.json".to_string()),
+                        field_path: Some("next_steps".to_string()),
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: None,
+                        incident_code: None,
+                        weight: 2,
+                    },
+                    ScorecardCriterion {
+                        id: "pre_dispatch".to_string(),
+                        title: "pre-dispatch checkpoint passed".to_string(),
+                        kind: ScorecardCriterionKind::CheckpointPassed,
+                        artifact_name: None,
+                        field_path: None,
+                        source_path: None,
+                        min_len: None,
+                        checkpoint: Some(OversightCheckpoint::PreDispatch),
+                        incident_code: None,
+                        weight: 1,
+                    },
+                ],
+                minimum_score: Some(0.5),
+                needs_review_below: Some(1.0),
+            },
+        ),
+    ])
+}
+
+fn builtin_evaluation_datasets() -> BTreeMap<String, EvaluationDataset> {
+    BTreeMap::from([
+        (
+            "task_plan_dataset".to_string(),
+            EvaluationDataset {
+                capability: "task.plan".to_string(),
+                title: Some("Task planning replay set".to_string()),
+                auto_capture: true,
+            },
+        ),
+        (
+            "repo_review_dataset".to_string(),
+            EvaluationDataset {
+                capability: "repo.review".to_string(),
+                title: Some("Repo review replay set".to_string()),
+                auto_capture: true,
+            },
+        ),
+        (
+            "incident_enrich_dataset".to_string(),
+            EvaluationDataset {
+                capability: "incident.enrich".to_string(),
+                title: Some("Incident enrichment replay set".to_string()),
+                auto_capture: true,
+            },
+        ),
+    ])
+}
+
+fn default_alert_rule_frontier_gap() -> AlertRule {
+    AlertRule {
+        id: "frontier_gap_detected".to_string(),
+        name: "Frontier gap detected".to_string(),
+        trigger: "policy_incident".to_string(),
+        severity: "warning".to_string(),
+    }
+}
+
+fn default_alert_rule_evaluation_attention() -> AlertRule {
+    AlertRule {
+        id: "evaluation_attention_required".to_string(),
+        name: "Evaluation attention required".to_string(),
+        trigger: "evaluation_attention".to_string(),
+        severity: "info".to_string(),
+    }
+}
+
+fn builtin_alert_rules() -> BTreeMap<String, AlertRule> {
+    BTreeMap::from([
+        (
+            "frontier_gap_detected".to_string(),
+            default_alert_rule_frontier_gap(),
+        ),
+        (
+            "evaluation_attention_required".to_string(),
+            default_alert_rule_evaluation_attention(),
+        ),
+    ])
+}
+
+fn builtin_profile_name_for_capability(capability: &str) -> Option<&'static str> {
+    match capability {
+        "task.plan" | "coding.patch.plan" => Some("task_plan_default"),
+        "repo.review" => Some("repo_review_default"),
+        "incident.enrich" => Some("incident_enrich_default"),
+        _ => None,
+    }
+}
+
+fn alert_rule_matches(
+    rule: &AlertRule,
+    evaluation: Option<&EvaluationRecord>,
+    incidents: &[PolicyIncident],
+) -> bool {
+    match rule.trigger.as_str() {
+        "policy_incident" => incidents.iter().any(|incident| {
+            matches!(
+                incident.severity,
+                PolicyIncidentSeverity::Warning | PolicyIncidentSeverity::Critical
+            )
+        }),
+        "evaluation_attention" => evaluation
+            .map(|evaluation| {
+                matches!(
+                    evaluation.status,
+                    EvaluationStatus::Failed | EvaluationStatus::NeedsReview
+                )
+            })
+            .unwrap_or(false),
+        "evaluation_failed" => evaluation
+            .map(|evaluation| matches!(evaluation.status, EvaluationStatus::Failed))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn alert_summary_for_rule(
+    rule: &AlertRule,
+    evaluation: Option<&EvaluationRecord>,
+    incidents: &[PolicyIncident],
+) -> String {
+    match rule.trigger.as_str() {
+        "policy_incident" => incidents
+            .iter()
+            .find(|incident| {
+                matches!(
+                    incident.severity,
+                    PolicyIncidentSeverity::Warning | PolicyIncidentSeverity::Critical
+                )
+            })
+            .map(|incident| incident.summary.clone())
+            .unwrap_or_else(|| rule.name.clone()),
+        "evaluation_attention" | "evaluation_failed" => evaluation
+            .map(|evaluation| evaluation.summary.clone())
+            .unwrap_or_else(|| rule.name.clone()),
+        _ => rule.name.clone(),
+    }
 }
 
 fn action_phase_name(phase: &ActionPhase) -> &'static str {
@@ -4141,6 +5102,131 @@ impl SupervisorControl for Supervisor {
         })
     }
 
+    async fn list_evaluation_datasets(&self) -> anyhow::Result<EvaluationDatasetsResponse> {
+        let datasets = self.evaluation_datasets();
+        let mut items = Vec::new();
+        for (name, config) in datasets {
+            let case_count = self.store.list_dataset_cases(&name).await?.len() as u64;
+            items.push(crawfish_core::EvaluationDatasetSummary {
+                name,
+                capability: config.capability,
+                title: config.title,
+                auto_capture: config.auto_capture,
+                case_count,
+            });
+        }
+        Ok(EvaluationDatasetsResponse { datasets: items })
+    }
+
+    async fn get_evaluation_dataset(
+        &self,
+        dataset_name: &str,
+    ) -> anyhow::Result<Option<EvaluationDatasetDetailResponse>> {
+        let datasets = self.evaluation_datasets();
+        let Some(config) = datasets.get(dataset_name).cloned() else {
+            return Ok(None);
+        };
+        let cases = self.store.list_dataset_cases(dataset_name).await?;
+        Ok(Some(EvaluationDatasetDetailResponse {
+            name: dataset_name.to_string(),
+            config,
+            cases,
+        }))
+    }
+
+    async fn start_evaluation_run(
+        &self,
+        request: StartEvaluationRunRequest,
+    ) -> anyhow::Result<StartEvaluationRunResponse> {
+        let datasets = self.evaluation_datasets();
+        let dataset = datasets
+            .get(&request.dataset)
+            .ok_or_else(|| anyhow::anyhow!("dataset not found: {}", request.dataset))?;
+        let cases = self.store.list_dataset_cases(&request.dataset).await?;
+        let run = ExperimentRun {
+            id: Uuid::new_v4().to_string(),
+            dataset_name: request.dataset.clone(),
+            executor: request.executor.clone(),
+            strategy_mode: ExecutionStrategyMode::SinglePass,
+            allow_fallback: false,
+            status: ExperimentRunStatus::Running,
+            total_cases: cases.len() as u32,
+            completed_cases: 0,
+            started_at: Some(now_timestamp()),
+            finished_at: None,
+            created_at: now_timestamp(),
+            summary: Some(format!(
+                "Replaying {} {} cases against {}",
+                cases.len(),
+                dataset.capability,
+                request.executor
+            )),
+        };
+        self.store.insert_experiment_run(&run).await?;
+
+        let mut completed = 0_u32;
+        let mut failed = 0_u32;
+        for case in cases {
+            let result = self.run_experiment_case(&run, &case).await?;
+            if matches!(result.status, ExperimentCaseStatus::Failed) {
+                failed = failed.saturating_add(1);
+            }
+            completed = completed.saturating_add(1);
+            self.store.insert_experiment_case_result(&result).await?;
+            let mut updated = run.clone();
+            updated.completed_cases = completed;
+            updated.status = ExperimentRunStatus::Running;
+            self.store.update_experiment_run(&updated).await?;
+        }
+
+        let mut completed_run = run.clone();
+        completed_run.completed_cases = completed;
+        completed_run.finished_at = Some(now_timestamp());
+        completed_run.status = if failed > 0 {
+            ExperimentRunStatus::Failed
+        } else {
+            ExperimentRunStatus::Completed
+        };
+        completed_run.summary = Some(format!("{completed} cases replayed, {failed} failed"));
+        self.store.update_experiment_run(&completed_run).await?;
+        Ok(StartEvaluationRunResponse { run: completed_run })
+    }
+
+    async fn get_evaluation_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<ExperimentRunDetailResponse>> {
+        let Some(run) = self.store.get_experiment_run(run_id).await? else {
+            return Ok(None);
+        };
+        let cases = self.store.list_experiment_case_results(run_id).await?;
+        Ok(Some(ExperimentRunDetailResponse { run, cases }))
+    }
+
+    async fn list_alerts(&self) -> anyhow::Result<AlertListResponse> {
+        Ok(AlertListResponse {
+            alerts: self.store.list_alert_events().await?,
+        })
+    }
+
+    async fn acknowledge_alert(
+        &self,
+        alert_id: &str,
+        request: AcknowledgeAlertRequest,
+    ) -> anyhow::Result<AcknowledgeAlertResponse> {
+        let mut alert = self
+            .store
+            .list_alert_events()
+            .await?
+            .into_iter()
+            .find(|alert| alert.id == alert_id)
+            .ok_or_else(|| anyhow::anyhow!("alert not found: {alert_id}"))?;
+        alert.acknowledged_at = Some(now_timestamp());
+        alert.acknowledged_by = Some(request.actor);
+        self.store.acknowledge_alert_event(&alert).await?;
+        Ok(AcknowledgeAlertResponse { alert })
+    }
+
     async fn resolve_review_queue_item(
         &self,
         review_id: &str,
@@ -4245,11 +5331,27 @@ impl SupervisorControl for Supervisor {
         let doctrine_summary = Some(default_doctrine_pack(&action));
         let jurisdiction_class = Some(jurisdiction_class_for_action(&action, encounter.as_ref()));
         let trace_bundle = self.store.get_trace_bundle(action_id).await?;
+        let review_queue_items = self
+            .store
+            .list_review_queue_items()
+            .await?
+            .into_iter()
+            .filter(|item| item.action_id == action.id)
+            .collect::<Vec<_>>();
+        let alert_events = self
+            .store
+            .list_alert_events()
+            .await?
+            .into_iter()
+            .filter(|alert| alert.action_id == action.id)
+            .collect::<Vec<_>>();
+        let resolved_profile = self.resolve_evaluation_profile(&action)?;
         let checkpoint_status = checkpoint_status_for_action(
             &action,
             doctrine_summary.as_ref().expect("doctrine summary"),
-            trace_bundle.as_ref(),
+            trace_bundle.is_some(),
             latest_evaluation.as_ref(),
+            resolved_profile.is_some(),
         );
         Ok(Some(ActionDetail {
             artifact_refs: action.outputs.artifacts.clone(),
@@ -4273,6 +5375,13 @@ impl SupervisorControl for Supervisor {
             checkpoint_status,
             policy_incidents,
             latest_evaluation,
+            evaluation_profile: resolved_profile.map(|profile| profile.name),
+            trace_ref: trace_bundle.as_ref().map(|trace| trace.id.clone()),
+            review_queue_refs: review_queue_items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect(),
+            alert_refs: alert_events.iter().map(|alert| alert.id.clone()).collect(),
             action,
             encounter,
             latest_audit_receipt: audit_receipt,
@@ -4903,6 +6012,18 @@ fn api_router(supervisor: Arc<Supervisor>) -> Router {
             "/v1/review-queue/{id}/resolve",
             post(resolve_review_queue_item_handler),
         )
+        .route("/v1/evaluation/datasets", get(evaluation_datasets_handler))
+        .route(
+            "/v1/evaluation/datasets/{name}",
+            get(evaluation_dataset_detail_handler),
+        )
+        .route("/v1/evaluation/runs", post(start_evaluation_run_handler))
+        .route(
+            "/v1/evaluation/runs/{id}",
+            get(evaluation_run_detail_handler),
+        )
+        .route("/v1/alerts", get(alert_list_handler))
+        .route("/v1/alerts/{id}/ack", post(alert_ack_handler))
         .route(
             "/v1/inbound/openclaw/actions",
             post(openclaw_submit_action_handler),
@@ -5166,6 +6287,87 @@ async fn resolve_review_queue_item_handler(
         Err(error) => {
             let message = error.to_string();
             if message.starts_with("review queue item not found:") {
+                Err(RuntimeError::NotFound(message))
+            } else {
+                Err(RuntimeError::BadRequest(message))
+            }
+        }
+    }
+}
+
+async fn evaluation_datasets_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+) -> Result<Json<EvaluationDatasetsResponse>, RuntimeError> {
+    Ok(Json(
+        supervisor
+            .list_evaluation_datasets()
+            .await
+            .map_err(RuntimeError::Internal)?,
+    ))
+}
+
+async fn evaluation_dataset_detail_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<EvaluationDatasetDetailResponse>, RuntimeError> {
+    supervisor
+        .get_evaluation_dataset(&name)
+        .await
+        .map_err(RuntimeError::Internal)?
+        .map(Json)
+        .ok_or_else(|| RuntimeError::NotFound(format!("dataset not found: {name}")))
+}
+
+async fn start_evaluation_run_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    Json(request): Json<StartEvaluationRunRequest>,
+) -> Result<Json<StartEvaluationRunResponse>, RuntimeError> {
+    match supervisor.start_evaluation_run(request).await {
+        Ok(response) => Ok(Json(response)),
+        Err(error) => {
+            let message = error.to_string();
+            if message.starts_with("dataset not found:") {
+                Err(RuntimeError::NotFound(message))
+            } else {
+                Err(RuntimeError::BadRequest(message))
+            }
+        }
+    }
+}
+
+async fn evaluation_run_detail_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ExperimentRunDetailResponse>, RuntimeError> {
+    supervisor
+        .get_evaluation_run(&id)
+        .await
+        .map_err(RuntimeError::Internal)?
+        .map(Json)
+        .ok_or_else(|| RuntimeError::NotFound(format!("evaluation run not found: {id}")))
+}
+
+async fn alert_list_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+) -> Result<Json<AlertListResponse>, RuntimeError> {
+    Ok(Json(
+        supervisor
+            .list_alerts()
+            .await
+            .map_err(RuntimeError::Internal)?,
+    ))
+}
+
+async fn alert_ack_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<AcknowledgeAlertRequest>,
+) -> Result<Json<AcknowledgeAlertResponse>, RuntimeError> {
+    match supervisor.acknowledge_alert(&id, request).await {
+        Ok(response) => Ok(Json(response)),
+        Err(error) => {
+            let message = error.to_string();
+            if message.starts_with("alert not found:") {
                 Err(RuntimeError::NotFound(message))
             } else {
                 Err(RuntimeError::BadRequest(message))
@@ -7971,7 +9173,149 @@ depends_on = []
     }
 
     #[tokio::test]
-    async fn unsupported_evaluation_hook_creates_frontier_gap_and_blocks_result() {
+    async fn task_plan_dataset_capture_and_replay_are_operator_visible() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Plan a doctrine-aware evaluation rollout for the local swarm",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let datasets = supervisor.list_evaluation_datasets().await.unwrap();
+        let dataset = datasets
+            .datasets
+            .iter()
+            .find(|dataset| dataset.name == "task_plan_dataset")
+            .expect("task plan dataset");
+        assert!(dataset.case_count >= 1);
+
+        let detail = supervisor
+            .get_evaluation_dataset("task_plan_dataset")
+            .await
+            .unwrap()
+            .expect("dataset detail");
+        let dataset_case_ids: std::collections::BTreeSet<String> =
+            detail.cases.iter().map(|case| case.id.clone()).collect();
+        assert!(detail
+            .cases
+            .iter()
+            .any(|case| case.source_action_id == submitted.action_id));
+
+        let review_count_before = supervisor.list_review_queue().await.unwrap().items.len();
+        let run = supervisor
+            .start_evaluation_run(StartEvaluationRunRequest {
+                dataset: "task_plan_dataset".to_string(),
+                executor: "deterministic".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            run.run.status,
+            ExperimentRunStatus::Completed | ExperimentRunStatus::Failed
+        ));
+
+        let run_detail = supervisor
+            .get_evaluation_run(&run.run.id)
+            .await
+            .unwrap()
+            .expect("experiment run detail");
+        assert_eq!(run_detail.run.dataset_name, "task_plan_dataset");
+        assert!(!run_detail.cases.is_empty());
+        assert!(run_detail
+            .cases
+            .iter()
+            .all(|case| dataset_case_ids.contains(&case.dataset_case_id)));
+
+        let review_count_after = supervisor.list_review_queue().await.unwrap().items.len();
+        assert_eq!(review_count_before, review_count_after);
+    }
+
+    #[tokio::test]
+    async fn unresolved_evaluation_profile_creates_alert_that_can_be_acknowledged() {
+        let dir = tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn value() -> u32 { 42 }\n",
+        )
+        .await
+        .unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "repo_reviewer".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: local_owner("local-dev"),
+                capability: "repo.review".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "Review this repo change".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "changed_files".to_string(),
+                        serde_json::json!(["src/lib.rs"]),
+                    ),
+                ]),
+                contract_overrides: Some(ExecutionContractPatch {
+                    quality: crawfish_core::QualityPolicyPatch {
+                        evaluation_profile: Some(Some("missing_profile".to_string())),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let alerts = supervisor.list_alerts().await.unwrap();
+        let alert = alerts
+            .alerts
+            .iter()
+            .find(|alert| alert.action_id == submitted.action_id)
+            .expect("alert event");
+        assert!(matches!(alert.severity.as_str(), "warning" | "critical"));
+        assert!(alert.summary.contains("frontier") || alert.summary.contains("evaluation"));
+
+        let ack = supervisor
+            .acknowledge_alert(
+                &alert.id,
+                AcknowledgeAlertRequest {
+                    actor: "operator-1".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ack.alert.id, alert.id);
+        assert_eq!(ack.alert.acknowledged_by.as_deref(), Some("operator-1"));
+        assert!(ack.alert.acknowledged_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn unsupported_evaluation_hook_creates_frontier_gap_but_preserves_terminal_result() {
         let dir = tempdir().unwrap();
         let supervisor = build_supervisor(dir.path()).await.unwrap();
 
@@ -8022,15 +9366,13 @@ depends_on = []
             .await
             .unwrap()
             .expect("action detail");
-        assert_eq!(detail.action.phase, ActionPhase::Blocked);
-        assert_eq!(
-            detail.terminal_code.as_deref(),
-            Some("policy_enforcement_gap")
-        );
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(detail.terminal_code.as_deref(), None);
         assert!(detail
             .policy_incidents
             .iter()
             .any(|incident| incident.code == "unsupported_evaluation_hook"));
+        assert!(detail.latest_evaluation.is_some());
     }
 
     #[tokio::test]

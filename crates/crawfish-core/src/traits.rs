@@ -56,6 +56,37 @@ pub trait ActionStore: Send + Sync {
         &self,
         action_id: &str,
     ) -> anyhow::Result<Vec<crawfish_types::PolicyIncident>>;
+    async fn insert_dataset_case(&self, case: &crawfish_types::DatasetCase) -> anyhow::Result<()>;
+    async fn list_dataset_cases(
+        &self,
+        dataset_name: &str,
+    ) -> anyhow::Result<Vec<crawfish_types::DatasetCase>>;
+    async fn insert_experiment_run(
+        &self,
+        run: &crawfish_types::ExperimentRun,
+    ) -> anyhow::Result<()>;
+    async fn get_experiment_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<crawfish_types::ExperimentRun>>;
+    async fn update_experiment_run(
+        &self,
+        run: &crawfish_types::ExperimentRun,
+    ) -> anyhow::Result<()>;
+    async fn insert_experiment_case_result(
+        &self,
+        result: &crawfish_types::ExperimentCaseResult,
+    ) -> anyhow::Result<()>;
+    async fn list_experiment_case_results(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<crawfish_types::ExperimentCaseResult>>;
+    async fn insert_alert_event(&self, alert: &crawfish_types::AlertEvent) -> anyhow::Result<()>;
+    async fn list_alert_events(&self) -> anyhow::Result<Vec<crawfish_types::AlertEvent>>;
+    async fn acknowledge_alert_event(
+        &self,
+        alert: &crawfish_types::AlertEvent,
+    ) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -128,6 +159,25 @@ pub trait SupervisorControl: Send + Sync {
         review_id: &str,
         request: crate::ResolveReviewQueueItemRequest,
     ) -> anyhow::Result<crate::ResolveReviewQueueItemResponse>;
+    async fn list_evaluation_datasets(&self) -> anyhow::Result<crate::EvaluationDatasetsResponse>;
+    async fn get_evaluation_dataset(
+        &self,
+        dataset_name: &str,
+    ) -> anyhow::Result<Option<crate::EvaluationDatasetDetailResponse>>;
+    async fn start_evaluation_run(
+        &self,
+        request: crate::StartEvaluationRunRequest,
+    ) -> anyhow::Result<crate::StartEvaluationRunResponse>;
+    async fn get_evaluation_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<crate::ExperimentRunDetailResponse>>;
+    async fn list_alerts(&self) -> anyhow::Result<crate::AlertListResponse>;
+    async fn acknowledge_alert(
+        &self,
+        alert_id: &str,
+        request: crate::AcknowledgeAlertRequest,
+    ) -> anyhow::Result<crate::AcknowledgeAlertResponse>;
     async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<crate::AgentDetail>>;
     async fn inspect_action(&self, action_id: &str) -> anyhow::Result<Option<crate::ActionDetail>>;
     async fn submit_action(

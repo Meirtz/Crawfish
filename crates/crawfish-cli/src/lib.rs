@@ -1,11 +1,14 @@
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crawfish_core::{
-    ActionDetail, ActionEvaluationsResponse, ActionEventsResponse, ActionListResponse,
-    ActionTraceResponse, AdminActionResponse, AgentDetail, ApproveActionRequest, CrawfishConfig,
-    ExecutionContractPatch, PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest,
-    ResolveReviewQueueItemRequest, ResolveReviewQueueItemResponse, ReviewQueueResponse,
-    RevokeLeaseRequest, SubmitActionRequest, SubmittedAction, SwarmStatusResponse,
+    AcknowledgeAlertRequest, AcknowledgeAlertResponse, ActionDetail, ActionEvaluationsResponse,
+    ActionEventsResponse, ActionListResponse, ActionTraceResponse, AdminActionResponse,
+    AgentDetail, AlertListResponse, ApproveActionRequest, CrawfishConfig,
+    EvaluationDatasetDetailResponse, EvaluationDatasetsResponse, ExecutionContractPatch,
+    ExperimentRunDetailResponse, PolicyValidationRequest, PolicyValidationResponse,
+    RejectActionRequest, ResolveReviewQueueItemRequest, ResolveReviewQueueItemResponse,
+    ReviewQueueResponse, RevokeLeaseRequest, StartEvaluationRunRequest, StartEvaluationRunResponse,
+    SubmitActionRequest, SubmittedAction, SwarmStatusResponse,
 };
 use crawfish_runtime::Supervisor;
 use crawfish_types::{
@@ -39,6 +42,8 @@ pub enum Commands {
     Action(ActionCommand),
     Lease(LeaseCommand),
     Review(ReviewCommand),
+    Eval(EvalCommand),
+    Alert(AlertCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -79,6 +84,43 @@ pub enum ReviewSubcommands {
 pub struct ReviewCommand {
     #[command(subcommand)]
     pub command: ReviewSubcommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvalSubcommands {
+    Dataset(EvalDatasetCommand),
+    Run(EvalRunCommand),
+    RunStatus(EvalRunStatusCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct EvalCommand {
+    #[command(subcommand)]
+    pub command: EvalSubcommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EvalDatasetSubcommands {
+    List(EvalDatasetListCommand),
+    Show(EvalDatasetShowCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct EvalDatasetCommand {
+    #[command(subcommand)]
+    pub command: EvalDatasetSubcommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AlertSubcommands {
+    List(AlertListCommand),
+    Ack(AlertAckCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct AlertCommand {
+    #[command(subcommand)]
+    pub command: AlertSubcommands,
 }
 
 #[derive(Debug, Args)]
@@ -303,6 +345,62 @@ pub struct ResolveReviewQueueCommand {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct EvalDatasetListCommand {
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvalDatasetShowCommand {
+    pub dataset: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvalRunCommand {
+    pub dataset: String,
+    #[arg(long)]
+    pub executor: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvalRunStatusCommand {
+    pub run_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AlertListCommand {
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AlertAckCommand {
+    pub alert_id: String,
+    #[arg(long)]
+    pub actor: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
 impl From<OwnerKindArg> for OwnerKind {
     fn from(value: OwnerKindArg) -> Self {
         match value {
@@ -355,6 +453,18 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Commands::Review(review) => match review.command {
             ReviewSubcommands::List(command) => list_review_queue_command(command).await,
             ReviewSubcommands::Resolve(command) => resolve_review_queue_command(command).await,
+        },
+        Commands::Eval(eval) => match eval.command {
+            EvalSubcommands::Dataset(command) => match command.command {
+                EvalDatasetSubcommands::List(command) => eval_dataset_list_command(command).await,
+                EvalDatasetSubcommands::Show(command) => eval_dataset_show_command(command).await,
+            },
+            EvalSubcommands::Run(command) => eval_run_command(command).await,
+            EvalSubcommands::RunStatus(command) => eval_run_status_command(command).await,
+        },
+        Commands::Alert(alert) => match alert.command {
+            AlertSubcommands::List(command) => alert_list_command(command).await,
+            AlertSubcommands::Ack(command) => alert_ack_command(command).await,
         },
     }
 }
@@ -641,6 +751,67 @@ async fn resolve_review_queue_command(command: ResolveReviewQueueCommand) -> any
     Ok(())
 }
 
+async fn eval_dataset_list_command(command: EvalDatasetListCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: EvaluationDatasetsResponse = client.get_json("/v1/evaluation/datasets").await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn eval_dataset_show_command(command: EvalDatasetShowCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: EvaluationDatasetDetailResponse = client
+        .get_json(&format!("/v1/evaluation/datasets/{}", command.dataset))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn eval_run_command(command: EvalRunCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: StartEvaluationRunResponse = client
+        .post_json(
+            "/v1/evaluation/runs",
+            &StartEvaluationRunRequest {
+                dataset: command.dataset,
+                executor: command.executor,
+            },
+        )
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn eval_run_status_command(command: EvalRunStatusCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: ExperimentRunDetailResponse = client
+        .get_json(&format!("/v1/evaluation/runs/{}", command.run_id))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn alert_list_command(command: AlertListCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: AlertListResponse = client.get_json("/v1/alerts").await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn alert_ack_command(command: AlertAckCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: AcknowledgeAlertResponse = client
+        .post_json(
+            &format!("/v1/alerts/{}/ack", command.alert_id),
+            &AcknowledgeAlertRequest {
+                actor: command.actor,
+            },
+        )
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
 fn print_output(value: serde_json::Value, _json: bool) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
@@ -770,4 +941,8 @@ default_trust_domain = "same_device_foreign_owner"
 
 [runtime]
 reconcile_interval_ms = 5000
+
+[evaluation]
+# Built-in profiles are resolved automatically for the current task-plan,
+# repo-review, and incident-enrichment reference paths.
 "#;

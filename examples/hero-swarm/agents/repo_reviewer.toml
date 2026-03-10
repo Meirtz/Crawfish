@@ -11,6 +11,9 @@ kind = "human"
 id = "local-dev"
 display_name = "Local Developer"
 
+[contract_defaults.quality]
+evaluation_profile = "repo_review_default"
+
 [[adapters]]
 adapter = "mcp"
 capability = "github.pull_request.review"

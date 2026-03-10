@@ -1,7 +1,8 @@
 use crawfish_types::{
-    CallerOwnerMapping, CapabilityVisibility, DataBoundaryPolicy, DefaultDisposition,
-    EncounterPolicy, ExecutionContract, McpServerConfig, NetworkBoundaryPolicy, OwnerKind,
-    ToolBoundaryPolicy, TrustDomain, WorkspaceBoundaryPolicy,
+    AlertRule, CallerOwnerMapping, CapabilityVisibility, DataBoundaryPolicy, DefaultDisposition,
+    EncounterPolicy, EvaluationDataset, EvaluationProfile, ExecutionContract, McpServerConfig,
+    NetworkBoundaryPolicy, OwnerKind, ScorecardSpec, ToolBoundaryPolicy, TrustDomain,
+    WorkspaceBoundaryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -92,6 +93,18 @@ pub struct RuntimeConfig {
     pub reconcile_interval_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct EvaluationConfig {
+    #[serde(default)]
+    pub profiles: BTreeMap<String, EvaluationProfile>,
+    #[serde(default)]
+    pub scorecards: BTreeMap<String, ScorecardSpec>,
+    #[serde(default)]
+    pub datasets: BTreeMap<String, EvaluationDataset>,
+    #[serde(default)]
+    pub alerts: BTreeMap<String, AlertRule>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CrawfishConfig {
     pub storage: StorageConfig,
@@ -107,6 +120,8 @@ pub struct CrawfishConfig {
     pub contracts: ContractDefaultsConfig,
     #[serde(default)]
     pub governance: GovernanceConfig,
+    #[serde(default)]
+    pub evaluation: EvaluationConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
 }
@@ -212,6 +227,7 @@ mod tests {
             openclaw: OpenClawConfig::default(),
             contracts: ContractDefaultsConfig::default(),
             governance: GovernanceConfig::default(),
+            evaluation: EvaluationConfig::default(),
             runtime: RuntimeConfig::default(),
         };
 

@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use crawfish_core::{ActionEventRecord, ActionStore, CheckpointStore, QueueSummary};
 use crawfish_types::{
-    Action, AgentManifest, AuditReceipt, CapabilityLease, ConsentGrant, EncounterRecord,
-    EvaluationRecord, FeedbackNote, LifecycleRecord, PolicyIncident, ReviewQueueItem, TraceBundle,
+    Action, AgentManifest, AlertEvent, AuditReceipt, CapabilityLease, ConsentGrant, DatasetCase,
+    EncounterRecord, EvaluationRecord, ExperimentCaseResult, ExperimentRun, FeedbackNote,
+    LifecycleRecord, PolicyIncident, ReviewQueueItem, TraceBundle,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, Pool, Row, Sqlite, SqlitePool};
@@ -546,6 +547,165 @@ impl SqliteStore {
             .collect()
     }
 
+    pub async fn insert_dataset_case(&self, case: &DatasetCase) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(case)?;
+        sqlx::query(
+            r#"
+            INSERT INTO dataset_cases (id, dataset_name, capability, source_action_id, created_at, case_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+              dataset_name = excluded.dataset_name,
+              capability = excluded.capability,
+              source_action_id = excluded.source_action_id,
+              created_at = excluded.created_at,
+              case_json = excluded.case_json
+            "#,
+        )
+        .bind(&case.id)
+        .bind(&case.dataset_name)
+        .bind(&case.capability)
+        .bind(&case.source_action_id)
+        .bind(&case.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_dataset_cases(&self, dataset_name: &str) -> anyhow::Result<Vec<DatasetCase>> {
+        let rows = sqlx::query(
+            "SELECT case_json FROM dataset_cases WHERE dataset_name = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(dataset_name)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("case_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
+    pub async fn insert_experiment_run(&self, run: &ExperimentRun) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(run)?;
+        sqlx::query(
+            r#"
+            INSERT INTO experiment_runs (id, dataset_name, status, created_at, run_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              dataset_name = excluded.dataset_name,
+              status = excluded.status,
+              created_at = excluded.created_at,
+              run_json = excluded.run_json
+            "#,
+        )
+        .bind(&run.id)
+        .bind(&run.dataset_name)
+        .bind(format!("{:?}", run.status).to_lowercase())
+        .bind(&run.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_experiment_run(&self, run_id: &str) -> anyhow::Result<Option<ExperimentRun>> {
+        let row = sqlx::query("SELECT run_json FROM experiment_runs WHERE id = ?1")
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("run_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn insert_experiment_case_result(
+        &self,
+        result: &ExperimentCaseResult,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(result)?;
+        sqlx::query(
+            r#"
+            INSERT INTO experiment_case_results (id, run_id, dataset_case_id, created_at, result_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              run_id = excluded.run_id,
+              dataset_case_id = excluded.dataset_case_id,
+              created_at = excluded.created_at,
+              result_json = excluded.result_json
+            "#,
+        )
+        .bind(&result.id)
+        .bind(&result.run_id)
+        .bind(&result.dataset_case_id)
+        .bind(&result.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_experiment_case_results(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<ExperimentCaseResult>> {
+        let rows = sqlx::query(
+            "SELECT result_json FROM experiment_case_results WHERE run_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("result_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
+    pub async fn insert_alert_event(&self, alert: &AlertEvent) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(alert)?;
+        sqlx::query(
+            r#"
+            INSERT INTO alert_events (id, action_id, rule_id, severity, created_at, acknowledged_at, alert_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+              action_id = excluded.action_id,
+              rule_id = excluded.rule_id,
+              severity = excluded.severity,
+              created_at = excluded.created_at,
+              acknowledged_at = excluded.acknowledged_at,
+              alert_json = excluded.alert_json
+            "#,
+        )
+        .bind(&alert.id)
+        .bind(&alert.action_id)
+        .bind(&alert.rule_id)
+        .bind(&alert.severity)
+        .bind(&alert.created_at)
+        .bind(&alert.acknowledged_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_alert_events(&self) -> anyhow::Result<Vec<AlertEvent>> {
+        let rows =
+            sqlx::query("SELECT alert_json FROM alert_events ORDER BY created_at DESC, id DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("alert_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
     pub async fn latest_completed_action(
         &self,
         target_agent_id: &str,
@@ -860,6 +1020,52 @@ impl ActionStore for SqliteStore {
 
     async fn list_policy_incidents(&self, action_id: &str) -> anyhow::Result<Vec<PolicyIncident>> {
         SqliteStore::list_policy_incidents(self, action_id).await
+    }
+
+    async fn insert_dataset_case(&self, case: &DatasetCase) -> anyhow::Result<()> {
+        SqliteStore::insert_dataset_case(self, case).await
+    }
+
+    async fn list_dataset_cases(&self, dataset_name: &str) -> anyhow::Result<Vec<DatasetCase>> {
+        SqliteStore::list_dataset_cases(self, dataset_name).await
+    }
+
+    async fn insert_experiment_run(&self, run: &ExperimentRun) -> anyhow::Result<()> {
+        SqliteStore::insert_experiment_run(self, run).await
+    }
+
+    async fn get_experiment_run(&self, run_id: &str) -> anyhow::Result<Option<ExperimentRun>> {
+        SqliteStore::get_experiment_run(self, run_id).await
+    }
+
+    async fn update_experiment_run(&self, run: &ExperimentRun) -> anyhow::Result<()> {
+        SqliteStore::insert_experiment_run(self, run).await
+    }
+
+    async fn insert_experiment_case_result(
+        &self,
+        result: &ExperimentCaseResult,
+    ) -> anyhow::Result<()> {
+        SqliteStore::insert_experiment_case_result(self, result).await
+    }
+
+    async fn list_experiment_case_results(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<ExperimentCaseResult>> {
+        SqliteStore::list_experiment_case_results(self, run_id).await
+    }
+
+    async fn insert_alert_event(&self, alert: &AlertEvent) -> anyhow::Result<()> {
+        SqliteStore::insert_alert_event(self, alert).await
+    }
+
+    async fn list_alert_events(&self) -> anyhow::Result<Vec<AlertEvent>> {
+        SqliteStore::list_alert_events(self).await
+    }
+
+    async fn acknowledge_alert_event(&self, alert: &AlertEvent) -> anyhow::Result<()> {
+        SqliteStore::insert_alert_event(self, alert).await
     }
 }
 

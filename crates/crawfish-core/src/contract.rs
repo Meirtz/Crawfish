@@ -35,6 +35,7 @@ pub struct SafetyPolicyPatch {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QualityPolicyPatch {
     pub quality_class: Option<String>,
+    pub evaluation_profile: Option<Option<String>>,
     pub evaluation_hook: Option<Option<String>>,
     pub minimum_confidence: Option<Option<f64>>,
     pub human_review_rule: Option<Option<String>>,
@@ -161,6 +162,9 @@ fn apply_safety_patch(contract: &mut SafetyPolicy, patch: &SafetyPolicyPatch) {
 fn apply_quality_patch(contract: &mut QualityPolicy, patch: &QualityPolicyPatch) {
     if let Some(value) = &patch.quality_class {
         contract.quality_class = value.clone();
+    }
+    if let Some(value) = &patch.evaluation_profile {
+        contract.evaluation_profile = value.clone();
     }
     if let Some(value) = &patch.evaluation_hook {
         contract.evaluation_hook = value.clone();

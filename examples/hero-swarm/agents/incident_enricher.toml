@@ -10,6 +10,9 @@ kind = "human"
 id = "local-dev"
 display_name = "Local Developer"
 
+[contract_defaults.quality]
+evaluation_profile = "incident_enrich_default"
+
 [[adapters]]
 adapter = "mcp"
 capability = "observability.logs.read"
