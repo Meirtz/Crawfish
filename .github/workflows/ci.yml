@@ -58,3 +58,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Hero P0 CLI smoke
         run: cargo test -p crawfish-cli --test cli
+
+  openclaw-inbound:
+    name: openclaw-inbound
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: integrations/openclaw-inbound/package-lock.json
+      - name: Install OpenClaw inbound bridge deps
+        run: npm ci --prefix integrations/openclaw-inbound
+      - name: Test OpenClaw inbound bridge
+        run: npm test --prefix integrations/openclaw-inbound
