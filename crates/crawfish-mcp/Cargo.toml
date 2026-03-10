@@ -11,7 +11,16 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 crawfish-core = { path = "../crawfish-core" }
 crawfish-types = { path = "../crawfish-types" }
+futures-util.workspace = true
+reqwest.workspace = true
 rmcp.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
