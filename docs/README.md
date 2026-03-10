@@ -22,6 +22,16 @@ Current spec entry points:
 - [`spec/v0.1-plan.md`](spec/v0.1-plan.md)
 - [`spec/glossary.md`](spec/glossary.md)
 
+## Project Governance
+
+Public maintenance and contribution policy lives in:
+
+- [`../.github/CONTRIBUTING.md`](../.github/CONTRIBUTING.md)
+- [`../.github/CODE_OF_CONDUCT.md`](../.github/CODE_OF_CONDUCT.md)
+- [`../.github/SECURITY.md`](../.github/SECURITY.md)
+- [`../.github/SUPPORT.md`](../.github/SUPPORT.md)
+- [`project/CHANGELOG.md`](project/CHANGELOG.md)
+
 ## Runnable Example
 
 The live alpha example fleet is tracked under:
