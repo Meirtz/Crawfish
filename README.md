@@ -187,7 +187,7 @@ The demo shows five things at once:
 
 The same demo should also prove a harder claim: if every external model route is unavailable, the fleet does not simply disappear. It keeps the control plane alive, continues deterministic work where possible, queues or hands off the rest, and makes the contraction explicit.
 
-Future versions of the same demo should also show bidirectional OpenClaw interop and Ralph-style verified coding actions: OpenClaw can submit work into Crawfish as an external control surface, while selected coding actions such as `coding.patch.plan` route out through the OpenClaw Gateway agent loop and complete only after deterministic verification passes.
+The same demo can now also show bidirectional OpenClaw interop when a local Gateway is available: OpenClaw can submit work into Crawfish as an external control surface, while `coding.patch.plan` routes out through the OpenClaw Gateway agent loop and returns a proposal-only patch plan. Ralph-style verified coding loops remain a later milestone.
 
 That same future demo should also show a same-device foreign-owner encounter: a roaming external agent can request access to a local capability, but it must pass encounter policy, receive explicit consent, and execute only through a revocable capability lease.
 
@@ -210,7 +210,7 @@ OpenClaw interoperability, `ACP`, and `A2A` remain important parts of the produc
 
 ## Current Alpha Slice
 
-The current Rust alpha now covers one runnable Hero P0 slice plus the first `P1a` OpenClaw inbound surface:
+The current Rust alpha now covers one runnable Hero P0 slice plus `P1a` OpenClaw inbound and the first `P1b` outbound harness slice:
 
 - `repo.index` scans a local workspace and emits `repo_index.json`.
 - `repo.review` runs deterministic review checks and reuses or bootstraps the latest repo index.
@@ -219,15 +219,19 @@ The current Rust alpha now covers one runnable Hero P0 slice plus the first `P1a
 - `workspace.patch.apply` performs deterministic local file edits under explicit approval, grant, and lease control.
 - `P1a` adds a thin OpenClaw inbound Gateway RPC bridge under [`integrations/openclaw-inbound/`](integrations/openclaw-inbound/) with `crawfish.action.submit`, `crawfish.action.inspect`, `crawfish.action.events`, and `crawfish.agent.status`.
 - OpenClaw inbound caller mapping is configured under `[openclaw.inbound]` in [`examples/hero-fleet/Crawfish.toml`](examples/hero-fleet/Crawfish.toml), and governance remains enforced in `crawfishd`, not in the bridge.
+- `coding.patch.plan` now uses the new `coding_planner` agent and can route out through the OpenClaw Gateway with streamed lifecycle, assistant, and tool events.
+- when OpenClaw outbound is unavailable, `coding.patch.plan` falls back to a deterministic planner when the contract fallback chain permits it.
+- current OpenClaw outbound support is intentionally narrow: `auth_ref` resolves to an environment variable, `session_mode = ephemeral` is supported, and `workspace_policy = inherit | crawfish_managed` is supported.
 - `inspect` surfaces artifact refs, checkpoint refs, recovery stage, continuity mode, encounter metadata, and external refs.
 - `action list`, `action events`, `action approve`, `action reject`, and `lease revoke` expose the operator control path over the local UDS API.
 - restart recovery requeues `running` actions and resumes deterministic work from checkpoint metadata.
+- restart recovery records when an in-flight OpenClaw run was abandoned and a fresh local attempt was requeued.
 - same-owner local read-only actions can be leased automatically, while same-device foreign-owner mutation remains denied by default.
 - `workspace_editor` now enforces workspace-scoped file locks and surfaces lock conflict and lease-expiry failures as stable operator-visible metadata.
 
 The first external tool transport implemented in code is `MCP over SSE`. `repo_reviewer` remains deterministic-first, while `ci_triage` can fetch remote log material through MCP and then complete the actual classification locally.
 
-With this `P1a` inbound slice in place, the next planned milestone is `P1b OpenClaw outbound`.
+The next planned milestone after this `P1b` outbound slice is `P1c` runtime verification for coding-heavy actions, starting with Ralph-style verify-loop support on top of the existing OpenClaw route.
 
 ## Quickstart
 

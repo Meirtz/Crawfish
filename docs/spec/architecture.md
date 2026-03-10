@@ -662,6 +662,10 @@ Outbound rules:
 - lifecycle, assistant, and tool stream events are converted into action feedback records
 - outbound OpenClaw execution must be bound to a `CapabilityLease`
 - OpenClaw session or workspace scopes may narrow permissions, but never widen Crawfish hard policy
+- the current `P1b` implementation supports `session_mode = ephemeral` only
+- the current `P1b` implementation supports `workspace_policy = inherit | crawfish_managed`; `openclaw_managed` is parsed but rejected at runtime
+- `auth_ref` currently resolves to an environment variable name containing the Gateway bearer token
+- `coding.patch.plan` is the first outbound capability and remains proposal-only; mutation and verify-loop semantics are deferred
 
 ### Shared Governance Kernel
 

@@ -19,6 +19,10 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - reference hero demo assets plus `examples/hero-fleet/demo.sh`
 - `P1a` OpenClaw inbound Gateway RPC bridge under `integrations/openclaw-inbound/`
 - OpenClaw inbound caller mapping, scoped action inspection, and scoped agent status over the local UDS API
+- `coding.patch.plan` and the `coding_planner` hero agent as the first OpenClaw outbound capability
+- native Rust `crawfish-openclaw` Gateway adapter with streamed lifecycle, assistant, and tool event mapping
+- deterministic fallback planning for `coding.patch.plan` when the preferred OpenClaw route is unavailable
+- explicit abandoned-run lineage for restarted OpenClaw-backed actions
 
 ### Changed
 
@@ -28,6 +32,7 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - action phase persistence now uses canonical snake_case values such as `awaiting_approval`
 - workspace mutation now enforces workspace-scoped file locking and stable failure codes for lock, lease, approval, route, executor, and restart states
 - denied action admission now fails before encounter persistence when governance rejects the request at preflight
+- `ExecutionSurface` now returns structured outputs plus external refs and surface event batches, so harness adapters can attach run lineage without bypassing runtime inspection
 
 ### Security
 

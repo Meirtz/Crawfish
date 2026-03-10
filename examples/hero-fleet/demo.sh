@@ -58,6 +58,32 @@ INCIDENT_ID="$(cargo run -p crawfish-cli --bin crawfish -- action submit \
   --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["action_id"])')"
 cargo run -p crawfish-cli --bin crawfish -- inspect "${INCIDENT_ID}" --config "${WORKDIR}/Crawfish.toml" --json
 
+if [[ -n "${OPENCLAW_GATEWAY_URL:-}" ]] && [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
+  python3 - "${WORKDIR}/agents/coding_planner.toml" "${OPENCLAW_GATEWAY_URL}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+gateway_url = sys.argv[2]
+contents = path.read_text()
+path.write_text(contents.replace("ws://127.0.0.1:9988/gateway", gateway_url))
+PY
+
+  echo "== Submit OpenClaw outbound planning action =="
+  PLAN_ID="$(cargo run -p crawfish-cli --bin crawfish -- action submit \
+    --config "${WORKDIR}/Crawfish.toml" \
+    --target-agent coding_planner \
+    --capability coding.patch.plan \
+    --goal "plan a safe patch" \
+    --caller-owner local-dev \
+    --inputs-json "{\"workspace_root\":\"${WORKDIR}\",\"task\":\"Add validation checks around the repo indexing path\",\"files_of_interest\":[\"src/lib.rs\"]}" \
+    --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["action_id"])')"
+  cargo run -p crawfish-cli --bin crawfish -- inspect "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
+  cargo run -p crawfish-cli --bin crawfish -- action events "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
+else
+  echo "== Skip OpenClaw outbound demo (set OPENCLAW_GATEWAY_URL and OPENCLAW_GATEWAY_TOKEN to enable) =="
+fi
+
 echo "== Submit approval-gated mutation action =="
 MUTATION_ID="$(cargo run -p crawfish-cli --bin crawfish -- action submit \
   --config "${WORKDIR}/Crawfish.toml" \
