@@ -23,8 +23,8 @@ use crawfish_types::{
     EncounterRecord, EncounterState, HealthStatus, LifecycleRecord, Mutability, TrustDomain,
 };
 use hero::{
-    load_json_artifact, required_input_string, RepoIndexerDeterministicExecutor,
-    RepoReviewerDeterministicExecutor,
+    load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
+    RepoIndexerDeterministicExecutor, RepoReviewerDeterministicExecutor,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -460,6 +460,15 @@ impl Supervisor {
             return Ok(ExecutionOutcome::Completed {
                 outputs,
                 selected_executor: "deterministic.repo_review".to_string(),
+            });
+        }
+
+        if action.capability == "ci.triage" {
+            let executor = CiTriageDeterministicExecutor::new(self.state_dir());
+            let outputs = executor.execute(action).await?;
+            return Ok(ExecutionOutcome::Completed {
+                outputs,
+                selected_executor: "deterministic.ci_triage".to_string(),
             });
         }
 

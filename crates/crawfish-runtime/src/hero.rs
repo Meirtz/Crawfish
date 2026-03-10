@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use crawfish_core::DeterministicExecutor;
 use crawfish_types::{
-    Action, ActionOutputs, ArtifactRef, RepoIndexArtifact, ReviewFinding, ReviewFindingsArtifact,
-    ReviewRiskLevel,
+    Action, ActionOutputs, ArtifactRef, CiFailureFamily, CiTriageArtifact, RepoIndexArtifact,
+    ReviewFinding, ReviewFindingsArtifact, ReviewRiskLevel,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,10 @@ pub struct RepoReviewerDeterministicExecutor {
     state_dir: PathBuf,
     repo_index: RepoIndexArtifact,
     repo_index_ref: Option<ArtifactRef>,
+}
+
+pub struct CiTriageDeterministicExecutor {
+    state_dir: PathBuf,
 }
 
 impl RepoIndexerDeterministicExecutor {
@@ -37,6 +41,12 @@ impl RepoReviewerDeterministicExecutor {
             repo_index,
             repo_index_ref,
         }
+    }
+}
+
+impl CiTriageDeterministicExecutor {
+    pub fn new(state_dir: PathBuf) -> Self {
+        Self { state_dir }
     }
 }
 
@@ -231,6 +241,38 @@ impl DeterministicExecutor for RepoReviewerDeterministicExecutor {
     }
 }
 
+#[async_trait]
+impl DeterministicExecutor for CiTriageDeterministicExecutor {
+    async fn execute(&self, action: &Action) -> anyhow::Result<ActionOutputs> {
+        let log_text = triage_log_text_from_action(action).await?;
+        let artifact = classify_ci_failure(&log_text);
+        let json_ref =
+            write_json_artifact(&self.state_dir, &action.id, "ci_triage.json", &artifact).await?;
+        let markdown_ref = write_text_artifact(
+            &self.state_dir,
+            &action.id,
+            "ci_triage_summary.md",
+            &build_ci_triage_summary_markdown(&artifact, action),
+        )
+        .await?;
+
+        Ok(ActionOutputs {
+            summary: Some(artifact.summary.clone()),
+            artifacts: vec![json_ref, markdown_ref],
+            metadata: BTreeMap::from([
+                (
+                    "executor_class".to_string(),
+                    serde_json::json!("deterministic"),
+                ),
+                (
+                    "failure_family".to_string(),
+                    serde_json::json!(format!("{:?}", artifact.family).to_lowercase()),
+                ),
+            ]),
+        })
+    }
+}
+
 pub async fn write_json_artifact<T: serde::Serialize>(
     state_dir: &Path,
     action_id: &str,
@@ -413,6 +455,34 @@ async fn diff_text_from_action(action: &Action) -> anyhow::Result<String> {
     ))
 }
 
+async fn triage_log_text_from_action(action: &Action) -> anyhow::Result<String> {
+    if let Some(log_text) = action
+        .inputs
+        .get("log_text")
+        .and_then(|value| value.as_str())
+    {
+        return Ok(log_text.to_string());
+    }
+
+    if let Some(log_file) = action
+        .inputs
+        .get("log_file")
+        .and_then(|value| value.as_str())
+    {
+        return Ok(fs::read_to_string(log_file).await?);
+    }
+
+    if action.inputs.contains_key("mcp_resource_ref") {
+        return Err(anyhow!(
+            "ci.triage with mcp_resource_ref requires MCP transport support"
+        ));
+    }
+
+    Err(anyhow!(
+        "ci.triage requires log_text, log_file, or mcp_resource_ref"
+    ))
+}
+
 fn parse_changed_files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
     for line in diff.lines() {
@@ -531,6 +601,140 @@ fn build_review_summary_markdown(artifact: &ReviewFindingsArtifact, action: &Act
         if !finding.files.is_empty() {
             lines.push(format!("  Files: {}", finding.files.join(", ")));
         }
+    }
+
+    lines.join("\n")
+}
+
+fn classify_ci_failure(log_text: &str) -> CiTriageArtifact {
+    let lower = log_text.to_lowercase();
+    let (family, summary, next_steps) = if lower.contains("test failed")
+        || lower.contains("assertion failed")
+        || lower.contains("failures:")
+    {
+        (
+            CiFailureFamily::Test,
+            "CI run failed due to test failures.",
+            vec![
+                "Inspect the failing test cases and rerun the affected suite.".to_string(),
+                "Check whether the change removed required fixtures or mocks.".to_string(),
+            ],
+        )
+    } else if lower.contains("eslint") || lower.contains("clippy") || lower.contains("lint") {
+        (
+            CiFailureFamily::Lint,
+            "CI run failed during lint or static style checks.",
+            vec![
+                "Run the relevant lint command locally and apply the suggested fixes.".to_string(),
+                "Confirm formatter and lint config versions match CI.".to_string(),
+            ],
+        )
+    } else if lower.contains("type error")
+        || lower.contains("cannot find type")
+        || lower.contains("mismatched types")
+        || lower.contains("ts2304")
+    {
+        (
+            CiFailureFamily::Typecheck,
+            "CI run failed during type checking.",
+            vec![
+                "Reproduce the typecheck step locally and inspect the reported symbols."
+                    .to_string(),
+                "Check recently changed interfaces or generated types.".to_string(),
+            ],
+        )
+    } else if lower.contains("error: could not compile")
+        || lower.contains("build failed")
+        || lower.contains("linker")
+    {
+        (
+            CiFailureFamily::Build,
+            "CI run failed during build or compile steps.",
+            vec![
+                "Reproduce the build locally with the same target and feature set.".to_string(),
+                "Check for missing files, features, or linker/system dependencies.".to_string(),
+            ],
+        )
+    } else if lower.contains("could not resolve")
+        || lower.contains("failed to fetch")
+        || lower.contains("timed out downloading")
+        || lower.contains("npm err")
+        || lower.contains("cargo failed to get")
+    {
+        (
+            CiFailureFamily::DependencyInstall,
+            "CI run failed while resolving or installing dependencies.",
+            vec![
+                "Check package registry availability and lockfile consistency.".to_string(),
+                "Retry after confirming dependency mirrors and credentials.".to_string(),
+            ],
+        )
+    } else if lower.contains("connection reset")
+        || lower.contains("503 service unavailable")
+        || lower.contains("timed out")
+        || lower.contains("context deadline exceeded")
+    {
+        (
+            CiFailureFamily::InfraTransient,
+            "CI run appears to have failed because of transient infrastructure issues.",
+            vec![
+                "Retry the job to confirm the failure is transient.".to_string(),
+                "Inspect runner, network, and remote service status dashboards.".to_string(),
+            ],
+        )
+    } else {
+        (
+            CiFailureFamily::Unknown,
+            "CI run failed, but the deterministic classifier could not categorize it confidently.",
+            vec![
+                "Inspect the full logs manually and attach the relevant excerpt.".to_string(),
+                "Add a new deterministic triage rule if this failure repeats.".to_string(),
+            ],
+        )
+    };
+
+    let evidence = log_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(5)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    CiTriageArtifact {
+        family,
+        summary: summary.to_string(),
+        evidence,
+        next_steps,
+    }
+}
+
+fn build_ci_triage_summary_markdown(artifact: &CiTriageArtifact, action: &Action) -> String {
+    let mut lines = vec![
+        "# CI Triage Summary".to_string(),
+        String::new(),
+        format!("- Capability: `{}`", action.capability),
+        format!(
+            "- Failure family: `{}`",
+            format!("{:?}", artifact.family).to_lowercase()
+        ),
+        String::new(),
+        "## Summary".to_string(),
+        String::new(),
+        artifact.summary.clone(),
+        String::new(),
+        "## Evidence".to_string(),
+        String::new(),
+    ];
+
+    for line in &artifact.evidence {
+        lines.push(format!("- {line}"));
+    }
+
+    lines.push(String::new());
+    lines.push("## Suggested Next Steps".to_string());
+    lines.push(String::new());
+    for step in &artifact.next_steps {
+        lines.push(format!("- {step}"));
     }
 
     lines.join("\n")
@@ -804,5 +1008,26 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.title == "Potential secret material detected"));
+    }
+
+    #[tokio::test]
+    async fn ci_triage_classifies_failure_family() {
+        let dir = tempdir().unwrap();
+        let executor = CiTriageDeterministicExecutor::new(dir.path().join(".crawfish/state"));
+        let action = action_with_capability(
+            "ci.triage",
+            BTreeMap::from([(
+                "log_text".to_string(),
+                serde_json::json!("error: test failed, to rerun pass `cargo test`"),
+            )]),
+        );
+
+        let outputs = executor.execute(&action).await.unwrap();
+        assert_eq!(outputs.artifacts.len(), 2);
+        let artifact = fs::read_to_string(&outputs.artifacts[0].path)
+            .await
+            .unwrap();
+        let triage: CiTriageArtifact = serde_json::from_str(&artifact).unwrap();
+        assert_eq!(triage.family, CiFailureFamily::Test);
     }
 }
