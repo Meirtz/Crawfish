@@ -1535,26 +1535,37 @@ fn error_body(message: String) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::{Query, State as AxumState},
+        response::sse::{Event, Sse},
+        routing::{get, post},
+        Json, Router,
+    };
     use bytes::Bytes;
     use crawfish_core::CheckpointStore;
-    use crawfish_types::{RequesterKind, RequesterRef};
+    use crawfish_types::{CiTriageArtifact, RequesterKind, RequesterRef};
+    use futures_util::{stream, StreamExt};
     use http_body_util::{BodyExt, Full};
     use hyper::{Method, Request, Uri};
     use hyper_util::client::legacy::Client;
     use hyperlocal::UnixClientExt;
+    use std::collections::HashMap;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, Mutex};
 
-    async fn build_supervisor(dir: &Path) -> anyhow::Result<Arc<Supervisor>> {
+    async fn build_supervisor_with_config(
+        dir: &Path,
+        config_contents: String,
+    ) -> anyhow::Result<Arc<Supervisor>> {
         tokio::fs::create_dir_all(dir.join("agents")).await?;
         tokio::fs::create_dir_all(dir.join(".crawfish/state")).await?;
         tokio::fs::create_dir_all(dir.join(".crawfish/run")).await?;
         tokio::fs::create_dir_all(dir.join("src")).await?;
         tokio::fs::create_dir_all(dir.join("tests")).await?;
-        tokio::fs::write(
-            dir.join("Crawfish.toml"),
-            include_str!("../../../examples/hero-fleet/Crawfish.toml"),
-        )
-        .await?;
+        tokio::fs::write(dir.join("Crawfish.toml"), config_contents).await?;
         tokio::fs::write(
             dir.join("src/lib.rs"),
             "pub fn value() -> u32 { 42 } // TODO follow up\n",
@@ -1579,6 +1590,127 @@ mod tests {
         let supervisor = Arc::new(Supervisor::from_config_path(&dir.join("Crawfish.toml")).await?);
         supervisor.run_once().await?;
         Ok(supervisor)
+    }
+
+    async fn build_supervisor(dir: &Path) -> anyhow::Result<Arc<Supervisor>> {
+        build_supervisor_with_config(
+            dir,
+            include_str!("../../../examples/hero-fleet/Crawfish.toml").to_string(),
+        )
+        .await
+    }
+
+    async fn build_supervisor_with_mcp(
+        dir: &Path,
+        mcp_url: &str,
+    ) -> anyhow::Result<Arc<Supervisor>> {
+        let config = include_str!("../../../examples/hero-fleet/Crawfish.toml")
+            .replace("http://127.0.0.1:8877/sse", mcp_url);
+        build_supervisor_with_config(dir, config).await
+    }
+
+    #[derive(Clone)]
+    struct RuntimeMcpState {
+        sessions: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
+        next_session: Arc<AtomicUsize>,
+        log_text: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SessionQuery {
+        session: String,
+    }
+
+    async fn spawn_runtime_mcp_server(log_text: &str) -> String {
+        let state = RuntimeMcpState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_session: Arc::new(AtomicUsize::new(1)),
+            log_text: log_text.to_string(),
+        };
+
+        let app = Router::new()
+            .route("/sse", get(runtime_mock_sse))
+            .route("/messages", post(runtime_mock_messages))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/sse")
+    }
+
+    async fn runtime_mock_sse(
+        AxumState(state): AxumState<RuntimeMcpState>,
+    ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+        let session_id = format!(
+            "session-{}",
+            state.next_session.fetch_add(1, Ordering::SeqCst)
+        );
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        state.sessions.lock().await.insert(session_id.clone(), tx);
+
+        let initial = stream::once(async move {
+            Ok(Event::default()
+                .event("endpoint")
+                .data(format!("/messages?session={session_id}")))
+        });
+        let rest = stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|payload| (Ok(Event::default().event("message").data(payload)), rx))
+        });
+        Sse::new(initial.chain(rest))
+    }
+
+    async fn runtime_mock_messages(
+        AxumState(state): AxumState<RuntimeMcpState>,
+        Query(query): Query<SessionQuery>,
+        Json(payload): Json<Value>,
+    ) -> Json<Value> {
+        let sender = state.sessions.lock().await.get(&query.session).cloned();
+        if let Some(sender) = sender {
+            let id = payload.get("id").cloned().unwrap_or(Value::Null);
+            let method = payload
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let log_text = state.log_text.clone();
+            tokio::spawn(async move {
+                let response = match method.as_str() {
+                    "initialize" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"protocolVersion": "2024-11-05"}
+                    }),
+                    "tools/list" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"tools": [{"name": "ci_runs_inspect"}]}
+                    }),
+                    "tools/call" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{"type": "text", "text": "remote CI logs fetched"}],
+                            "structuredContent": {
+                                "provider": "github_actions",
+                                "log_text": log_text
+                            }
+                        }
+                    }),
+                    _ => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"message": "unknown method"}
+                    }),
+                };
+                let _ = sender.send(response.to_string());
+            });
+        }
+
+        Json(serde_json::json!({"accepted": true}))
     }
 
     #[tokio::test]
@@ -1632,6 +1764,134 @@ mod tests {
             .unwrap()
             .expect("action detail");
         assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert!(detail
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact.kind == "repo_index"));
+        assert!(detail
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact.kind == "review_summary"));
+        assert!(detail.action.checkpoint_ref.is_some());
+    }
+
+    #[tokio::test]
+    async fn ci_triage_completes_with_direct_logs() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "ci_triage".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: crawfish_types::OwnerRef {
+                    kind: crawfish_types::OwnerKind::Human,
+                    id: "local-dev".to_string(),
+                    display_name: None,
+                },
+                capability: "ci.triage".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "triage CI logs".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([(
+                    "log_text".to_string(),
+                    serde_json::json!("error: test failed, to rerun pass `cargo test`"),
+                )]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+
+        supervisor.process_action_queue_once().await.unwrap();
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        let artifact = tokio::fs::read_to_string(&detail.artifact_refs[0].path)
+            .await
+            .unwrap();
+        let triage: CiTriageArtifact = serde_json::from_str(&artifact).unwrap();
+        assert_eq!(triage.family, crawfish_types::CiFailureFamily::Test);
+    }
+
+    #[tokio::test]
+    async fn ci_triage_can_fetch_logs_via_mcp() {
+        let dir = tempdir().unwrap();
+        let mcp_url = spawn_runtime_mcp_server(
+            "error: test failed, to rerun pass `cargo test`\nfailures:\n    tests::smoke\n",
+        )
+        .await;
+        let supervisor = build_supervisor_with_mcp(dir.path(), &mcp_url)
+            .await
+            .unwrap();
+
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "ci_triage".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: crawfish_types::OwnerRef {
+                    kind: crawfish_types::OwnerKind::Human,
+                    id: "local-dev".to_string(),
+                    display_name: None,
+                },
+                capability: "ci.triage".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "triage remote CI logs".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([(
+                    "mcp_resource_ref".to_string(),
+                    serde_json::json!("ci://runs/1/logs"),
+                )]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+
+        supervisor.process_action_queue_once().await.unwrap();
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert!(detail
+            .external_refs
+            .iter()
+            .any(|external| external.kind == "mcp_server"));
+        assert!(detail
+            .external_refs
+            .iter()
+            .any(|external| external.kind == "mcp_resource"));
+        assert!(detail.action.outputs.metadata.contains_key("mcp_result"));
+        let artifact = tokio::fs::read_to_string(&detail.artifact_refs[0].path)
+            .await
+            .unwrap();
+        let triage: CiTriageArtifact = serde_json::from_str(&artifact).unwrap();
+        assert_eq!(triage.family, crawfish_types::CiFailureFamily::Test);
     }
 
     #[tokio::test]
@@ -1750,6 +2010,62 @@ mod tests {
         assert_eq!(detail.action.phase, ActionPhase::Completed);
         assert_eq!(detail.recovery_stage.as_deref(), Some("completed"));
         assert!(detail.action.checkpoint_ref.is_some());
+    }
+
+    #[tokio::test]
+    async fn foreign_owner_mutation_is_denied_by_default() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let error = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "repo_reviewer".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: crawfish_types::OwnerRef {
+                    kind: crawfish_types::OwnerKind::Human,
+                    id: "foreign-owner".to_string(),
+                    display_name: None,
+                },
+                capability: "repo.review".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "attempt write".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "changed_files".to_string(),
+                        serde_json::json!(["src/lib.rs"]),
+                    ),
+                ]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: vec![CounterpartyRef {
+                    agent_id: None,
+                    session_id: Some("cli".to_string()),
+                    owner: crawfish_types::OwnerRef {
+                        kind: crawfish_types::OwnerKind::Human,
+                        id: "foreign-owner".to_string(),
+                        display_name: None,
+                    },
+                    trust_domain: TrustDomain::SameDeviceForeignOwner,
+                }],
+                data_boundary: None,
+                workspace_write: true,
+                secret_access: false,
+                mutating: true,
+            })
+            .await
+            .expect_err("foreign mutation should be denied");
+
+        assert!(error.to_string().contains("denied"));
     }
 
     #[tokio::test]
