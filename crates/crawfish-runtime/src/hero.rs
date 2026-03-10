@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use crawfish_core::DeterministicExecutor;
 use crawfish_types::{
     Action, ActionOutputs, ArtifactRef, CiFailureFamily, CiTriageArtifact,
-    IncidentEnrichmentArtifact, RepoIndexArtifact, ReviewFinding, ReviewFindingsArtifact,
-    ReviewRiskLevel, WorkspaceApplyResult, WorkspaceEdit, WorkspaceEditOp, WorkspaceRejectedEdit,
+    IncidentEnrichmentArtifact, PatchPlanArtifact, PatchPlanStep, RepoIndexArtifact, ReviewFinding,
+    ReviewFindingsArtifact, ReviewRiskLevel, WorkspaceApplyResult, WorkspaceEdit, WorkspaceEditOp,
+    WorkspaceRejectedEdit,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -27,6 +28,10 @@ pub struct CiTriageDeterministicExecutor {
 }
 
 pub struct IncidentEnricherDeterministicExecutor {
+    state_dir: PathBuf,
+}
+
+pub struct CodingPatchPlannerDeterministicExecutor {
     state_dir: PathBuf,
 }
 
@@ -61,6 +66,12 @@ impl CiTriageDeterministicExecutor {
 }
 
 impl IncidentEnricherDeterministicExecutor {
+    pub fn new(state_dir: PathBuf) -> Self {
+        Self { state_dir }
+    }
+}
+
+impl CodingPatchPlannerDeterministicExecutor {
     pub fn new(state_dir: PathBuf) -> Self {
         Self { state_dir }
     }
@@ -358,6 +369,62 @@ impl DeterministicExecutor for IncidentEnricherDeterministicExecutor {
                 (
                     "blast_radius_count".to_string(),
                     serde_json::json!(artifact.probable_blast_radius.len()),
+                ),
+            ]),
+        })
+    }
+}
+
+#[async_trait]
+impl DeterministicExecutor for CodingPatchPlannerDeterministicExecutor {
+    async fn execute(&self, action: &Action) -> anyhow::Result<ActionOutputs> {
+        let workspace_root = required_input_string(action, "workspace_root")?;
+        let workspace_path = PathBuf::from(&workspace_root);
+        if !workspace_path.is_dir() {
+            return Err(anyhow!(
+                "workspace_root must point to an existing directory: {workspace_root}"
+            ));
+        }
+
+        let brief = patch_plan_brief_from_action(action)?;
+        let files_of_interest = input_string_array(action, "files_of_interest");
+        let constraints = input_string_array(action, "constraints");
+        let repo_files = collect_repo_files(&workspace_path);
+        let target_files =
+            select_patch_plan_target_files(&repo_files, &brief, &files_of_interest, &constraints);
+        let risks = patch_plan_risks(&target_files, &constraints);
+        let assumptions = patch_plan_assumptions(action, &target_files);
+        let test_suggestions = patch_plan_test_suggestions(&target_files);
+
+        let artifact = PatchPlanArtifact {
+            target_files: target_files.clone(),
+            ordered_steps: patch_plan_steps(&brief, &target_files, &constraints),
+            risks,
+            assumptions,
+            test_suggestions,
+            confidence_summary: patch_plan_confidence_summary(&target_files, &constraints),
+        };
+
+        let json_ref =
+            write_json_artifact(&self.state_dir, &action.id, "patch_plan.json", &artifact).await?;
+        let markdown = build_patch_plan_markdown(&artifact, action, &brief);
+        let markdown_ref =
+            write_text_artifact(&self.state_dir, &action.id, "patch_plan.md", &markdown).await?;
+
+        Ok(ActionOutputs {
+            summary: Some(format!(
+                "Generated a patch plan for {} target files",
+                artifact.target_files.len()
+            )),
+            artifacts: vec![json_ref, markdown_ref],
+            metadata: BTreeMap::from([
+                (
+                    "executor_class".to_string(),
+                    serde_json::json!("deterministic"),
+                ),
+                (
+                    "target_file_count".to_string(),
+                    serde_json::json!(artifact.target_files.len()),
                 ),
             ]),
         })
@@ -782,6 +849,252 @@ fn optional_input_string(action: &Action, key: &str) -> Option<String> {
         .get(key)
         .and_then(|value| value.as_str())
         .map(ToString::to_string)
+}
+
+fn input_string_array(action: &Action, key: &str) -> Vec<String> {
+    action
+        .inputs
+        .get(key)
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .filter_map(|value| value.as_str())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn patch_plan_brief_from_action(action: &Action) -> anyhow::Result<String> {
+    [
+        optional_input_string(action, "task"),
+        optional_input_string(action, "spec_text"),
+        optional_input_string(action, "problem_statement"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !value.trim().is_empty())
+    .ok_or_else(|| anyhow!("coding.patch.plan requires task, spec_text, or problem_statement"))
+}
+
+fn select_patch_plan_target_files(
+    repo_files: &[String],
+    brief: &str,
+    files_of_interest: &[String],
+    constraints: &[String],
+) -> Vec<String> {
+    if !files_of_interest.is_empty() {
+        return files_of_interest.to_vec();
+    }
+
+    let lowered = format!("{brief} {}", constraints.join(" ")).to_lowercase();
+    let tokens = lowered
+        .split(|char: char| !char.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 3)
+        .collect::<Vec<_>>();
+
+    let mut scored = repo_files
+        .iter()
+        .map(|file| {
+            let lower = file.to_lowercase();
+            let mut score = 0usize;
+            for token in &tokens {
+                if lower.contains(token) {
+                    score += 2;
+                }
+            }
+            if lower.contains("test") {
+                score += 1;
+            }
+            if lower.ends_with("readme.md") {
+                score += 1;
+            }
+            (file.clone(), score)
+        })
+        .filter(|(_, score)| *score > 0)
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(&rhs.0)));
+    let mut selected = scored
+        .into_iter()
+        .take(6)
+        .map(|(file, _)| file)
+        .collect::<Vec<_>>();
+
+    if selected.is_empty() {
+        selected = repo_files
+            .iter()
+            .filter(|file| file.starts_with("src/") || file.starts_with("tests/"))
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>();
+    }
+
+    if selected.is_empty() {
+        selected = repo_files.iter().take(4).cloned().collect::<Vec<_>>();
+    }
+
+    selected
+}
+
+fn patch_plan_steps(
+    brief: &str,
+    target_files: &[String],
+    constraints: &[String],
+) -> Vec<PatchPlanStep> {
+    let target_files_summary = if target_files.is_empty() {
+        "the current workspace".to_string()
+    } else {
+        target_files.join(", ")
+    };
+    let constraint_summary = if constraints.is_empty() {
+        "No explicit constraints were supplied.".to_string()
+    } else {
+        format!("Honor these constraints: {}.", constraints.join("; "))
+    };
+
+    vec![
+        PatchPlanStep {
+            title: "Confirm scope".to_string(),
+            detail: format!(
+                "Review the request and anchor on this objective: {brief}. {constraint_summary}"
+            ),
+        },
+        PatchPlanStep {
+            title: "Inspect likely touch points".to_string(),
+            detail: format!(
+                "Start with these files or modules: {target_files_summary}."
+            ),
+        },
+        PatchPlanStep {
+            title: "Draft the proposal".to_string(),
+            detail: "Describe the intended code changes, why they are needed, and what should stay unchanged.".to_string(),
+        },
+        PatchPlanStep {
+            title: "Plan validation".to_string(),
+            detail: "List deterministic checks, tests, and edge cases that should confirm the patch is safe before any mutation path is used.".to_string(),
+        },
+    ]
+}
+
+fn patch_plan_risks(target_files: &[String], constraints: &[String]) -> Vec<String> {
+    let mut risks = Vec::new();
+    if target_files.is_empty() {
+        risks.push("Target file selection is heuristic because the request did not include files_of_interest.".to_string());
+    }
+    if target_files.iter().any(|file| is_risky_path(file)) {
+        risks.push(
+            "The proposed patch touches sensitive configuration, auth, or policy code paths."
+                .to_string(),
+        );
+    }
+    if constraints.is_empty() {
+        risks.push("No explicit constraints were provided, so the plan may need operator narrowing before implementation.".to_string());
+    }
+    if risks.is_empty() {
+        risks.push("No deterministic blockers were found, but the plan still requires human review before any mutation path.".to_string());
+    }
+    risks
+}
+
+fn patch_plan_assumptions(action: &Action, target_files: &[String]) -> Vec<String> {
+    let mut assumptions = Vec::new();
+    if target_files.is_empty() {
+        assumptions.push(
+            "The request can be satisfied without prior knowledge of the exact target files."
+                .to_string(),
+        );
+    }
+    if optional_input_string(action, "base_ref").is_none()
+        || optional_input_string(action, "head_ref").is_none()
+    {
+        assumptions.push("The plan is based on the current workspace state because base/head refs were not both supplied.".to_string());
+    }
+    assumptions.push(
+        "This capability produces a proposal only and does not mutate the workspace.".to_string(),
+    );
+    assumptions
+}
+
+fn patch_plan_test_suggestions(target_files: &[String]) -> Vec<String> {
+    let mut suggestions = vec![
+        "Run the narrowest existing test target that covers the changed modules.".to_string(),
+        "Add or update deterministic tests for the intended behavior delta.".to_string(),
+    ];
+    if target_files.iter().any(|file| file.ends_with(".rs")) {
+        suggestions.push(
+            "Run `cargo test --workspace` and targeted Rust checks for the touched crate."
+                .to_string(),
+        );
+    }
+    if target_files
+        .iter()
+        .any(|file| file.ends_with(".ts") || file.ends_with(".js"))
+    {
+        suggestions.push("Run the project’s TypeScript or JavaScript test/lint targets for the affected package.".to_string());
+    }
+    suggestions
+}
+
+fn patch_plan_confidence_summary(target_files: &[String], constraints: &[String]) -> String {
+    match (target_files.is_empty(), constraints.is_empty()) {
+        (false, false) => "medium confidence: likely target files and constraints are both available".to_string(),
+        (false, true) => "medium-low confidence: target files are available, but the request lacks explicit constraints".to_string(),
+        (true, false) => "medium-low confidence: constraints exist, but file targeting is heuristic".to_string(),
+        (true, true) => "low confidence: both file targeting and constraints are heuristic".to_string(),
+    }
+}
+
+fn build_patch_plan_markdown(artifact: &PatchPlanArtifact, action: &Action, brief: &str) -> String {
+    let mut markdown = vec![
+        "# Patch Plan".to_string(),
+        String::new(),
+        format!("Request: {}", action.goal.summary),
+        format!("Brief: {brief}"),
+        String::new(),
+        "## Target Files".to_string(),
+    ];
+
+    if artifact.target_files.is_empty() {
+        markdown.push("- No concrete file set was identified.".to_string());
+    } else {
+        markdown.extend(artifact.target_files.iter().map(|file| format!("- {file}")));
+    }
+
+    markdown.push(String::new());
+    markdown.push("## Ordered Steps".to_string());
+    markdown.extend(
+        artifact
+            .ordered_steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| format!("{}. **{}**: {}", index + 1, step.title, step.detail)),
+    );
+
+    markdown.push(String::new());
+    markdown.push("## Risks".to_string());
+    markdown.extend(artifact.risks.iter().map(|risk| format!("- {risk}")));
+
+    markdown.push(String::new());
+    markdown.push("## Assumptions".to_string());
+    markdown.extend(
+        artifact
+            .assumptions
+            .iter()
+            .map(|assumption| format!("- {assumption}")),
+    );
+
+    markdown.push(String::new());
+    markdown.push("## Suggested Validation".to_string());
+    markdown.extend(
+        artifact
+            .test_suggestions
+            .iter()
+            .map(|suggestion| format!("- {suggestion}")),
+    );
+
+    markdown.push(String::new());
+    markdown.push(format!("Confidence: {}", artifact.confidence_summary));
+
+    markdown.join("\n")
 }
 
 fn parse_changed_files_from_diff(diff: &str) -> Vec<String> {
@@ -1396,7 +1709,8 @@ mod tests {
     use crawfish_core::now_timestamp;
     use crawfish_types::{
         Action, ActionPhase, ExecutionContract, GoalSpec, IncidentEnrichmentArtifact, OwnerKind,
-        OwnerRef, RequesterKind, RequesterRef, ScheduleSpec, WorkspaceApplyResult,
+        OwnerRef, PatchPlanArtifact, RequesterKind, RequesterRef, ScheduleSpec,
+        WorkspaceApplyResult,
     };
     use tempfile::tempdir;
 
@@ -1416,10 +1730,13 @@ mod tests {
     ) -> Action {
         Action {
             id: "action-1".to_string(),
-            target_agent_id: if capability == "repo.review" {
-                "repo_reviewer".to_string()
-            } else {
-                "repo_indexer".to_string()
+            target_agent_id: match capability {
+                "repo.review" => "repo_reviewer".to_string(),
+                "ci.triage" => "ci_triage".to_string(),
+                "incident.enrich" => "incident_enricher".to_string(),
+                "coding.patch.plan" => "coding_planner".to_string(),
+                "workspace.patch.apply" => "workspace_editor".to_string(),
+                _ => "repo_indexer".to_string(),
             },
             requester: RequesterRef {
                 kind: RequesterKind::User,
@@ -1642,6 +1959,59 @@ depends_on = []
             .probable_blast_radius
             .contains(&"worker".to_string()));
         assert!(!enrichment.error_signatures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn coding_patch_planner_emits_patch_plan_artifacts() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join("src")).await.unwrap();
+        fs::create_dir_all(workspace.join("tests")).await.unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn compute() -> u32 { 1 }\n",
+        )
+        .await
+        .unwrap();
+        fs::write(
+            workspace.join("tests/lib_test.rs"),
+            "#[test] fn smoke() { assert_eq!(1, 1); }\n",
+        )
+        .await
+        .unwrap();
+
+        let executor =
+            CodingPatchPlannerDeterministicExecutor::new(dir.path().join(".crawfish/state"));
+        let outputs = executor
+            .execute(&action_with_capability(
+                "coding.patch.plan",
+                BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(workspace.display().to_string()),
+                    ),
+                    (
+                        "task".to_string(),
+                        serde_json::json!("Add validation to compute and update related tests"),
+                    ),
+                    (
+                        "files_of_interest".to_string(),
+                        serde_json::json!(["src/lib.rs", "tests/lib_test.rs"]),
+                    ),
+                ]),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outputs.artifacts.len(), 2);
+        let plan: PatchPlanArtifact = load_json_artifact(&outputs.artifacts[0]).await.unwrap();
+        assert!(plan.target_files.contains(&"src/lib.rs".to_string()));
+        assert!(!plan.ordered_steps.is_empty());
+        let summary = fs::read_to_string(&outputs.artifacts[1].path)
+            .await
+            .unwrap();
+        assert!(summary.contains("# Patch Plan"));
+        assert!(summary.contains("src/lib.rs"));
     }
 
     #[tokio::test]

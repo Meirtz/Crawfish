@@ -1,0 +1,31 @@
+id = "coding_planner"
+role = "coding_planner"
+trust_domain = "same_owner_local"
+capabilities = ["coding.patch.plan"]
+exposed_capabilities = ["coding.patch.plan"]
+default_data_boundaries = ["owner_local"]
+
+[owner]
+kind = "human"
+id = "local-dev"
+display_name = "Local Developer"
+
+[contract_defaults.execution]
+preferred_harnesses = ["openclaw"]
+fallback_chain = ["deterministic"]
+
+[contract_defaults.safety]
+approval_policy = "on_mutation"
+mutation_mode = "proposal_only"
+
+[[adapters]]
+adapter = "openclaw"
+gateway_url = "ws://127.0.0.1:9988/gateway"
+auth_ref = "OPENCLAW_GATEWAY_TOKEN"
+target_agent = "coding-planner"
+session_mode = "ephemeral"
+caller_owner_mapping = "required"
+default_trust_domain = "same_device_foreign_owner"
+required_scopes = ["repo:read", "planning:write"]
+lease_required = false
+workspace_policy = "crawfish_managed"

@@ -30,8 +30,9 @@ use crawfish_types::{
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
-    IncidentEnricherDeterministicExecutor, RepoIndexerDeterministicExecutor,
-    RepoReviewerDeterministicExecutor, WorkspacePatchApplyDeterministicExecutor,
+    CodingPatchPlannerDeterministicExecutor, IncidentEnricherDeterministicExecutor,
+    RepoIndexerDeterministicExecutor, RepoReviewerDeterministicExecutor,
+    WorkspacePatchApplyDeterministicExecutor,
 };
 use serde_json::Value;
 use std::fs;
@@ -410,6 +411,47 @@ impl Supervisor {
                 if !(has_log_text || has_log_file || has_service_manifest) {
                     anyhow::bail!(
                         "invalid action request: incident.enrich requires log_text, log_file, or service_manifest_file"
+                    );
+                }
+            }
+            "coding.patch.plan" => {
+                let workspace_root = request
+                    .inputs
+                    .get("workspace_root")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid action request: coding.patch.plan requires workspace_root"
+                        )
+                    })?;
+                if !Path::new(workspace_root).is_dir() {
+                    anyhow::bail!(
+                        "invalid action request: workspace_root must be an existing directory"
+                    );
+                }
+
+                let has_task = request
+                    .inputs
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                let has_spec_text = request
+                    .inputs
+                    .get("spec_text")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                let has_problem_statement = request
+                    .inputs
+                    .get("problem_statement")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+
+                if !(has_task || has_spec_text || has_problem_statement) {
+                    anyhow::bail!(
+                        "invalid action request: coding.patch.plan requires task, spec_text, or problem_statement"
                     );
                 }
             }
@@ -1209,6 +1251,19 @@ impl Supervisor {
                     action,
                     "deterministic.incident_enrich",
                     "enriching",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
+        }
+
+        if action.capability == "coding.patch.plan" {
+            let executor = CodingPatchPlannerDeterministicExecutor::new(self.state_dir());
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.coding_patch_plan",
+                    "planning",
                     Vec::new(),
                     &executor,
                 )
@@ -3090,6 +3145,7 @@ mod tests {
             "repo_reviewer",
             "ci_triage",
             "incident_enricher",
+            "coding_planner",
             "workspace_editor",
         ] {
             tokio::fs::write(
