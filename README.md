@@ -16,6 +16,39 @@ To regenerate the consolidated DOCX export from Markdown, run `python3 scripts/e
 
 To compile and test the Rust workspace, run `cargo test --workspace`.
 
+## Project Status
+
+Crawfish is public and maintained seriously, but it is still an **explicit alpha** project.
+
+- Current maturity: `0.x` / `alpha`
+- Supported implementation baseline: Rust-first
+- Supported runtime environments: macOS and Linux
+- Supported MCP transport: SSE only
+
+Alpha means the project is real, tested, and maintained, but not yet compatibility-stable.
+
+## Public Surfaces (Alpha)
+
+These surfaces are public today, but still unstable during alpha:
+
+- `crawfish` CLI
+- `Crawfish.toml` and agent manifest format
+- local UDS HTTP API
+- Rust crates in the workspace
+
+Breaking alpha changes are allowed, but they must ship with:
+
+- a changelog entry in [`docs/project/CHANGELOG.md`](docs/project/CHANGELOG.md)
+- README or spec updates for the changed behavior
+- a migration note when the break is user-visible
+
+Project maintenance docs live in:
+
+- [`docs/project/CHANGELOG.md`](docs/project/CHANGELOG.md)
+- [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md)
+- [`.github/SECURITY.md`](.github/SECURITY.md)
+- [`.github/SUPPORT.md`](.github/SUPPORT.md)
+
 ## Why Crawfish
 
 - **Harnesses are plentiful; operability is scarce.** Crawfish exists to make many harnesses, gateways, and agent runtimes behave like one governable system.
