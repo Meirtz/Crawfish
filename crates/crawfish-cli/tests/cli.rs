@@ -247,6 +247,18 @@ reconcile_interval_ms = 100
     );
     assert_eq!(approved["phase"], "accepted");
 
+    let events = run_cli_json(dir.path(), &["action", "events", &action_id, "--json"]);
+    assert!(events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["event_type"] == "awaiting_approval"));
+    assert!(events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["event_type"] == "approved"));
+
     let inspected = run_cli_json(dir.path(), &["inspect", &action_id, "--json"]);
     let lease_id = inspected["lease_detail"]["id"]
         .as_str()

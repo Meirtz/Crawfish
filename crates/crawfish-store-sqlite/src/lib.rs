@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use crawfish_core::{ActionStore, CheckpointStore, QueueSummary};
+use crawfish_core::{ActionEventRecord, ActionStore, CheckpointStore, QueueSummary};
 use crawfish_types::{
     Action, AgentManifest, AuditReceipt, CapabilityLease, ConsentGrant, EncounterRecord,
     LifecycleRecord,
@@ -537,6 +537,27 @@ impl ActionStore for SqliteStore {
             Ok(serde_json::from_str(&payload)?)
         })
         .transpose()
+    }
+
+    async fn list_action_events(&self, action_id: &str) -> anyhow::Result<Vec<ActionEventRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, action_id, event_type, payload_json, created_at FROM action_events WHERE action_id = ?1 ORDER BY id ASC",
+        )
+        .bind(action_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload_json: String = row.try_get("payload_json")?;
+                Ok(ActionEventRecord {
+                    id: row.try_get("id")?,
+                    action_id: row.try_get("action_id")?,
+                    event_type: row.try_get("event_type")?,
+                    payload: serde_json::from_str(&payload_json)?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
     }
 
     async fn list_actions_by_phase(&self, phase: Option<&str>) -> anyhow::Result<Vec<Action>> {

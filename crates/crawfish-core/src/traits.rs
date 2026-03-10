@@ -11,6 +11,10 @@ pub trait ActionStore: Send + Sync {
         payload: serde_json::Value,
     ) -> anyhow::Result<()>;
     async fn get_action(&self, action_id: &str) -> anyhow::Result<Option<Action>>;
+    async fn list_action_events(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<crate::ActionEventRecord>>;
     async fn list_actions_by_phase(&self, phase: Option<&str>) -> anyhow::Result<Vec<Action>>;
     async fn claim_next_accepted_action(&self) -> anyhow::Result<Option<Action>>;
     async fn queue_summary(&self) -> anyhow::Result<crate::QueueSummary>;
@@ -55,6 +59,10 @@ pub trait DeterministicExecutor: Send + Sync {
 pub trait SupervisorControl: Send + Sync {
     async fn list_status(&self) -> anyhow::Result<crate::FleetStatusResponse>;
     async fn list_actions(&self, phase: Option<&str>) -> anyhow::Result<crate::ActionListResponse>;
+    async fn list_action_events(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<crate::ActionEventsResponse>;
     async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<crate::AgentDetail>>;
     async fn inspect_action(&self, action_id: &str) -> anyhow::Result<Option<crate::ActionDetail>>;
     async fn submit_action(

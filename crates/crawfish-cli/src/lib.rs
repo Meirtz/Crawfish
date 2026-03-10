@@ -1,10 +1,10 @@
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crawfish_core::{
-    ActionDetail, ActionListResponse, AdminActionResponse, AgentDetail, ApproveActionRequest,
-    CrawfishConfig, ExecutionContractPatch, FleetStatusResponse, PolicyValidationRequest,
-    PolicyValidationResponse, RejectActionRequest, RevokeLeaseRequest, SubmitActionRequest,
-    SubmittedAction,
+    ActionDetail, ActionEventsResponse, ActionListResponse, AdminActionResponse, AgentDetail,
+    ApproveActionRequest, CrawfishConfig, ExecutionContractPatch, FleetStatusResponse,
+    PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest, RevokeLeaseRequest,
+    SubmitActionRequest, SubmittedAction,
 };
 use crawfish_runtime::Supervisor;
 use crawfish_types::{
@@ -42,6 +42,7 @@ pub enum Commands {
 #[derive(Debug, Subcommand)]
 pub enum ActionSubcommands {
     List(ListActionsCommand),
+    Events(ActionEventsCommand),
     Submit(SubmitActionCommand),
     Approve(ApproveActionCommand),
     Reject(RejectActionCommand),
@@ -198,6 +199,15 @@ pub struct ListActionsCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct ActionEventsCommand {
+    pub action_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct ApproveActionCommand {
     pub action_id: String,
     #[arg(long, default_value = "Crawfish.toml")]
@@ -275,6 +285,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
         },
         Commands::Action(action) => match action.command {
             ActionSubcommands::List(command) => list_actions_command(command).await,
+            ActionSubcommands::Events(command) => action_events_command(command).await,
             ActionSubcommands::Submit(command) => submit_action_command(command).await,
             ActionSubcommands::Approve(command) => approve_action_command(command).await,
             ActionSubcommands::Reject(command) => reject_action_command(command).await,
@@ -465,6 +476,15 @@ async fn list_actions_command(command: ListActionsCommand) -> anyhow::Result<()>
     }
     let actions: ActionListResponse = client.get_json(&path).await?;
     print_output(serde_json::to_value(actions)?, command.json)?;
+    Ok(())
+}
+
+async fn action_events_command(command: ActionEventsCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: ActionEventsResponse = client
+        .get_json(&format!("/v1/actions/{}/events", command.action_id))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
     Ok(())
 }
 

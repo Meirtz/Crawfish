@@ -5,6 +5,7 @@ use crawfish_types::{
     Metadata, OwnerRef, RequesterRef, ScheduleSpec, TrustDomain,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthResponse {
@@ -74,6 +75,20 @@ pub struct ActionSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionListResponse {
     pub actions: Vec<ActionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActionEventRecord {
+    pub id: i64,
+    pub action_id: String,
+    pub event_type: String,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActionEventsResponse {
+    pub events: Vec<ActionEventRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

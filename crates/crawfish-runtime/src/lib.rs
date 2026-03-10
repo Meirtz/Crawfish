@@ -9,12 +9,13 @@ use axum::{
 };
 use crawfish_core::{
     authorize_encounter, compile_execution_plan, neutral_policy, now_timestamp,
-    owner_policy_for_manifest, ActionDetail, ActionListResponse, ActionStore, ActionSummary,
-    AdminActionResponse, AgentDetail, ApproveActionRequest, CheckpointStore, CrawfishConfig,
-    DeterministicExecutor, EncounterDecision, EncounterDisposition, EncounterRequest,
-    ExecutionContractPatch, ExecutionSurface, FleetStatusResponse, GovernanceContext,
-    HealthResponse, PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest,
-    RevokeLeaseRequest, SubmitActionRequest, SubmittedAction, SupervisorControl,
+    owner_policy_for_manifest, ActionDetail, ActionEventsResponse, ActionListResponse, ActionStore,
+    ActionSummary, AdminActionResponse, AgentDetail, ApproveActionRequest, CheckpointStore,
+    CrawfishConfig, DeterministicExecutor, EncounterDecision, EncounterDisposition,
+    EncounterRequest, ExecutionContractPatch, ExecutionSurface, FleetStatusResponse,
+    GovernanceContext, HealthResponse, PolicyValidationRequest, PolicyValidationResponse,
+    RejectActionRequest, RevokeLeaseRequest, SubmitActionRequest, SubmittedAction,
+    SupervisorControl,
 };
 use crawfish_mcp::McpAdapter;
 use crawfish_store_sqlite::SqliteStore;
@@ -1494,6 +1495,12 @@ impl SupervisorControl for Supervisor {
         Ok(ActionListResponse { actions })
     }
 
+    async fn list_action_events(&self, action_id: &str) -> anyhow::Result<ActionEventsResponse> {
+        Ok(ActionEventsResponse {
+            events: self.store.list_action_events(action_id).await?,
+        })
+    }
+
     async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<AgentDetail>> {
         let manifest = self.store.get_agent_manifest(agent_id).await?;
         let lifecycle = self.store.get_lifecycle_record(agent_id).await?;
@@ -1995,6 +2002,7 @@ fn api_router(supervisor: Arc<Supervisor>) -> Router {
             get(list_actions_handler).post(submit_action_handler),
         )
         .route("/v1/actions/{id}", get(action_detail_handler))
+        .route("/v1/actions/{id}/events", get(action_events_handler))
         .route("/v1/actions/{id}/approve", post(approve_action_handler))
         .route("/v1/actions/{id}/reject", post(reject_action_handler))
         .route("/v1/leases/{id}/revoke", post(revoke_lease_handler))
@@ -2050,6 +2058,28 @@ async fn action_detail_handler(
         .map_err(RuntimeError::Internal)?
         .map(Json)
         .ok_or_else(|| RuntimeError::NotFound(format!("action not found: {id}")))
+}
+
+async fn action_events_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ActionEventsResponse>, RuntimeError> {
+    if supervisor
+        .store()
+        .get_action(&id)
+        .await
+        .map_err(RuntimeError::Internal)?
+        .is_none()
+    {
+        return Err(RuntimeError::NotFound(format!("action not found: {id}")));
+    }
+
+    Ok(Json(
+        supervisor
+            .list_action_events(&id)
+            .await
+            .map_err(RuntimeError::Internal)?,
+    ))
 }
 
 async fn list_actions_handler(
@@ -2914,6 +2944,53 @@ mod tests {
             detail.latest_audit_receipt.expect("audit").outcome,
             AuditOutcome::Allowed
         );
+    }
+
+    #[tokio::test]
+    async fn action_events_surface_operator_timeline() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(workspace_patch_request(
+                dir.path(),
+                serde_json::json!([
+                    {
+                        "path": "timeline.txt",
+                        "op": "create",
+                        "contents": "timeline\n"
+                    }
+                ]),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        supervisor
+            .approve_action(
+                &submitted.action_id,
+                ApproveActionRequest {
+                    approver_ref: "local-dev".to_string(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let events = supervisor
+            .list_action_events(&submitted.action_id)
+            .await
+            .unwrap();
+        let event_types = events
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"awaiting_approval"));
+        assert!(event_types.contains(&"approved"));
+        assert!(event_types.contains(&"running"));
+        assert!(event_types.contains(&"completed"));
     }
 
     #[tokio::test]
