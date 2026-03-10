@@ -5,11 +5,14 @@ state_dir = ".crawfish/state"
 [fleet]
 manifests_dir = "agents"
 
+[api]
+socket_path = ".crawfish/run/crawfishd.sock"
+
 [runtime]
 reconcile_interval_ms = 5000
 
 [governance.system_defaults]
-default_disposition = "deny"
+default_disposition = "allow_with_lease"
 capability_visibility = "owner_only"
 data_boundary = "owner_only"
 tool_boundary = "no_cross_owner_mutation"
@@ -46,4 +49,3 @@ resumability = "checkpoint_resume"
 fallback_behavior = "degrade"
 continuity_preference = ["deterministic_only", "store_and_forward", "human_handoff"]
 deterministic_fallbacks = ["local.rule_engine"]
-

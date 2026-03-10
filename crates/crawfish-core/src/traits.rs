@@ -1,8 +1,5 @@
 use async_trait::async_trait;
-use crawfish_types::{
-    Action, ActionOutputs, AgentManifest, AuditReceipt, CapabilityDescriptor, EncounterRecord,
-    LifecycleRecord,
-};
+use crawfish_types::{Action, ActionOutputs, AgentManifest, CapabilityDescriptor};
 
 #[async_trait]
 pub trait ActionStore: Send + Sync {
@@ -14,6 +11,8 @@ pub trait ActionStore: Send + Sync {
         payload: serde_json::Value,
     ) -> anyhow::Result<()>;
     async fn get_action(&self, action_id: &str) -> anyhow::Result<Option<Action>>;
+    async fn claim_next_accepted_action(&self) -> anyhow::Result<Option<Action>>;
+    async fn queue_summary(&self) -> anyhow::Result<crate::QueueSummary>;
 }
 
 #[async_trait]
@@ -53,15 +52,17 @@ pub trait DeterministicExecutor: Send + Sync {
 
 #[async_trait]
 pub trait SupervisorControl: Send + Sync {
-    async fn list_status(&self) -> anyhow::Result<Vec<LifecycleRecord>>;
-    async fn inspect_agent(
+    async fn list_status(&self) -> anyhow::Result<crate::FleetStatusResponse>;
+    async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<crate::AgentDetail>>;
+    async fn inspect_action(&self, action_id: &str) -> anyhow::Result<Option<crate::ActionDetail>>;
+    async fn submit_action(
         &self,
-        agent_id: &str,
-    ) -> anyhow::Result<Option<(AgentManifest, LifecycleRecord)>>;
-    async fn inspect_action(
+        request: crate::SubmitActionRequest,
+    ) -> anyhow::Result<crate::SubmittedAction>;
+    async fn validate_policy_request(
         &self,
-        action_id: &str,
-    ) -> anyhow::Result<Option<(Action, Option<EncounterRecord>, Option<AuditReceipt>)>>;
+        request: crate::PolicyValidationRequest,
+    ) -> anyhow::Result<crate::PolicyValidationResponse>;
     async fn drain(&self) -> anyhow::Result<()>;
     async fn resume(&self) -> anyhow::Result<()>;
 }

@@ -10,10 +10,15 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 clap.workspace = true
 crawfish-core = { path = "../crawfish-core" }
 crawfish-runtime = { path = "../crawfish-runtime" }
 crawfish-types = { path = "../crawfish-types" }
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyperlocal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -25,6 +30,7 @@ tracing-subscriber.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 
 [[bin]]
 name = "crawfish"
@@ -33,4 +39,3 @@ path = "src/bin/crawfish.rs"
 [[bin]]
 name = "crawfishd"
 path = "src/bin/crawfishd.rs"
-

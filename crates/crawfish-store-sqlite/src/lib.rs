@@ -1,10 +1,14 @@
 use async_trait::async_trait;
-use crawfish_core::{ActionStore, CheckpointStore};
+use crawfish_core::{ActionStore, CheckpointStore, QueueSummary};
 use crawfish_types::{Action, AgentManifest, AuditReceipt, EncounterRecord, LifecycleRecord};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, Pool, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+
+const ADMIN_MODE_KEY: &str = "admin_mode";
+const ADMIN_MODE_ACTIVE: &str = "active";
+const ADMIN_MODE_DRAINING: &str = "draining";
 
 pub struct SqliteStore {
     pool: SqlitePool,
@@ -29,6 +33,7 @@ impl SqliteStore {
             checkpoint_dir: state_dir.join("checkpoints"),
         };
         store.migrate().await?;
+        store.ensure_runtime_state().await?;
         Ok(store)
     }
 
@@ -187,16 +192,14 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub async fn get_latest_encounter_for_agent(
+    pub async fn get_encounter(
         &self,
-        agent_id: &str,
+        encounter_id: &str,
     ) -> anyhow::Result<Option<EncounterRecord>> {
-        let row = sqlx::query(
-            "SELECT encounter_json FROM encounters WHERE target_agent_id = ?1 ORDER BY rowid DESC LIMIT 1",
-        )
-        .bind(agent_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT encounter_json FROM encounters WHERE id = ?1")
+            .bind(encounter_id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(|row| {
             let payload: String = row.try_get("encounter_json")?;
             Ok(serde_json::from_str(&payload)?)
@@ -225,12 +228,12 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub async fn get_audit_receipt_by_encounter(
+    pub async fn get_audit_receipt(
         &self,
-        encounter_ref: &str,
+        receipt_id: &str,
     ) -> anyhow::Result<Option<AuditReceipt>> {
-        let row = sqlx::query("SELECT audit_json FROM audit_receipts WHERE encounter_ref = ?1")
-            .bind(encounter_ref)
+        let row = sqlx::query("SELECT audit_json FROM audit_receipts WHERE id = ?1")
+            .bind(receipt_id)
             .fetch_optional(&self.pool)
             .await?;
         row.map(|row| {
@@ -238,6 +241,53 @@ impl SqliteStore {
             Ok(serde_json::from_str(&payload)?)
         })
         .transpose()
+    }
+
+    pub async fn set_admin_mode_draining(&self, draining: bool) -> anyhow::Result<()> {
+        let value = if draining {
+            ADMIN_MODE_DRAINING
+        } else {
+            ADMIN_MODE_ACTIVE
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO runtime_state (key, value)
+            VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+        )
+        .bind(ADMIN_MODE_KEY)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn is_draining(&self) -> anyhow::Result<bool> {
+        let row = sqlx::query("SELECT value FROM runtime_state WHERE key = ?1")
+            .bind(ADMIN_MODE_KEY)
+            .fetch_optional(&self.pool)
+            .await?;
+        let value = row
+            .map(|row| row.try_get::<String, _>("value"))
+            .transpose()?
+            .unwrap_or_else(|| ADMIN_MODE_ACTIVE.to_string());
+        Ok(value == ADMIN_MODE_DRAINING)
+    }
+
+    async fn ensure_runtime_state(&self) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO runtime_state (key, value)
+            VALUES (?1, ?2)
+            ON CONFLICT(key) DO NOTHING
+            "#,
+        )
+        .bind(ADMIN_MODE_KEY)
+        .bind(ADMIN_MODE_ACTIVE)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -247,19 +297,52 @@ impl ActionStore for SqliteStore {
         let payload = serde_json::to_string(action)?;
         sqlx::query(
             r#"
-            INSERT INTO actions (id, capability, phase, checkpoint_ref, action_json)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO actions (
+              id,
+              target_agent_id,
+              capability,
+              phase,
+              encounter_ref,
+              audit_receipt_ref,
+              checkpoint_ref,
+              continuity_mode,
+              failure_reason,
+              created_at,
+              claimed_at,
+              started_at,
+              finished_at,
+              action_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(id) DO UPDATE SET
+              target_agent_id = excluded.target_agent_id,
               capability = excluded.capability,
               phase = excluded.phase,
+              encounter_ref = excluded.encounter_ref,
+              audit_receipt_ref = excluded.audit_receipt_ref,
               checkpoint_ref = excluded.checkpoint_ref,
+              continuity_mode = excluded.continuity_mode,
+              failure_reason = excluded.failure_reason,
+              created_at = excluded.created_at,
+              claimed_at = excluded.claimed_at,
+              started_at = excluded.started_at,
+              finished_at = excluded.finished_at,
               action_json = excluded.action_json
             "#,
         )
         .bind(&action.id)
+        .bind(&action.target_agent_id)
         .bind(&action.capability)
         .bind(format!("{:?}", action.phase).to_lowercase())
+        .bind(&action.encounter_ref)
+        .bind(&action.audit_receipt_ref)
         .bind(&action.checkpoint_ref)
+        .bind(action.continuity_mode.as_ref().map(enum_to_snake))
+        .bind(&action.failure_reason)
+        .bind(&action.created_at)
+        .bind(&action.started_at)
+        .bind(&action.started_at)
+        .bind(&action.finished_at)
         .bind(payload)
         .execute(&self.pool)
         .await?;
@@ -293,6 +376,58 @@ impl ActionStore for SqliteStore {
             Ok(serde_json::from_str(&payload)?)
         })
         .transpose()
+    }
+
+    async fn claim_next_accepted_action(&self) -> anyhow::Result<Option<Action>> {
+        let row = sqlx::query(
+            "SELECT action_json FROM actions WHERE phase = 'accepted' ORDER BY created_at ASC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let mut action = match row {
+            Some(row) => {
+                let payload: String = row.try_get("action_json")?;
+                serde_json::from_str::<Action>(&payload)?
+            }
+            None => return Ok(None),
+        };
+
+        action.phase = crawfish_types::ActionPhase::Running;
+        let now = current_timestamp();
+        action.started_at = Some(now.clone());
+        self.upsert_action(&action).await?;
+        self.append_action_event(
+            &action.id,
+            "running",
+            serde_json::json!({"phase": "running", "started_at": now}),
+        )
+        .await?;
+        Ok(Some(action))
+    }
+
+    async fn queue_summary(&self) -> anyhow::Result<QueueSummary> {
+        let rows = sqlx::query("SELECT phase, COUNT(*) AS count FROM actions GROUP BY phase")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut summary = QueueSummary::default();
+        for row in rows {
+            let phase: String = row.try_get("phase")?;
+            let count: i64 = row.try_get("count")?;
+            match phase.as_str() {
+                "accepted" => summary.accepted = count as u64,
+                "running" => summary.running = count as u64,
+                "blocked" => summary.blocked = count as u64,
+                "awaiting_approval" => summary.awaiting_approval = count as u64,
+                "completed" => summary.completed = count as u64,
+                "failed" => summary.failed = count as u64,
+                "expired" => summary.expired = count as u64,
+                _ => {}
+            }
+        }
+
+        Ok(summary)
     }
 }
 
@@ -341,6 +476,14 @@ impl CheckpointStore for SqliteStore {
             None => Ok(None),
         }
     }
+}
+
+fn current_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
 }
 
 fn enum_to_snake<T: std::fmt::Debug>(value: &T) -> String {
@@ -397,6 +540,7 @@ mod tests {
     fn action(id: &str) -> Action {
         Action {
             id: id.to_string(),
+            target_agent_id: "repo_reviewer".to_string(),
             requester: RequesterRef {
                 kind: RequesterKind::User,
                 id: "user-1".to_string(),
@@ -413,10 +557,18 @@ mod tests {
             execution_strategy: None,
             grant_refs: Vec::new(),
             lease_ref: None,
+            encounter_ref: Some("enc-1".to_string()),
+            audit_receipt_ref: Some("audit-1".to_string()),
             data_boundary: "owner_local".to_string(),
             schedule: Default::default(),
             phase: ActionPhase::Accepted,
+            created_at: now_timestamp(),
+            started_at: None,
+            finished_at: None,
             checkpoint_ref: None,
+            continuity_mode: None,
+            degradation_profile: None,
+            failure_reason: None,
             outputs: ActionOutputs::default(),
         }
     }
@@ -452,7 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn action_and_checkpoint_round_trip() {
+    async fn action_claim_and_checkpoint_round_trip() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("control.db");
         let state_dir = dir.path().join("state");
@@ -467,6 +619,8 @@ mod tests {
             )
             .await
             .unwrap();
+        let claimed = store.claim_next_accepted_action().await.unwrap().unwrap();
+        assert_eq!(claimed.phase, ActionPhase::Running);
         store
             .put_checkpoint("action-1", "ckpt-1", b"checkpoint")
             .await
@@ -489,10 +643,11 @@ mod tests {
                 .expect("checkpoint"),
             b"checkpoint"
         );
+        assert_eq!(store.queue_summary().await.unwrap().running, 1);
     }
 
     #[tokio::test]
-    async fn encounter_and_audit_round_trip() {
+    async fn encounter_audit_and_runtime_state_round_trip() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("control.db");
         let state_dir = dir.path().join("state");
@@ -530,10 +685,11 @@ mod tests {
 
         store.insert_encounter(&encounter).await.unwrap();
         store.insert_audit_receipt(&receipt).await.unwrap();
+        store.set_admin_mode_draining(true).await.unwrap();
 
         assert_eq!(
             store
-                .get_latest_encounter_for_agent("repo_reviewer")
+                .get_encounter("enc-1")
                 .await
                 .unwrap()
                 .expect("encounter")
@@ -542,12 +698,13 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_audit_receipt_by_encounter("enc-1")
+                .get_audit_receipt("audit-1")
                 .await
                 .unwrap()
                 .expect("receipt")
                 .id,
             "audit-1"
         );
+        assert!(store.is_draining().await.unwrap());
     }
 }

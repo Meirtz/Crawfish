@@ -11,13 +11,23 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
 crawfish-core = { path = "../crawfish-core" }
 crawfish-mcp = { path = "../crawfish-mcp" }
 crawfish-store-sqlite = { path = "../crawfish-store-sqlite" }
 crawfish-types = { path = "../crawfish-types" }
+http-body-util.workspace = true
+hyper.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+hyper-util.workspace = true
+hyperlocal.workspace = true
+tempfile.workspace = true

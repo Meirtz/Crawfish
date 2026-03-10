@@ -2,9 +2,10 @@ use crawfish_types::{
     ContinuityModeName, DeadLetterPolicy, DeliveryContract, ExecutionContract, ExecutionPolicy,
     ExecutionStrategy, HumanHandoffPolicy, QualityPolicy, RecoveryPolicy, SafetyPolicy,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryContractPatch {
     pub deadline_ms: Option<u64>,
     pub freshness_ttl_ms: Option<u64>,
@@ -12,7 +13,7 @@ pub struct DeliveryContractPatch {
     pub liveliness_window_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionPolicyPatch {
     pub max_cost_usd: Option<f64>,
     pub max_tokens: Option<u64>,
@@ -22,7 +23,7 @@ pub struct ExecutionPolicyPatch {
     pub retry_budget: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SafetyPolicyPatch {
     pub tool_scope: Option<Vec<String>>,
     pub approval_policy: Option<crawfish_types::ApprovalPolicy>,
@@ -31,7 +32,7 @@ pub struct SafetyPolicyPatch {
     pub secret_policy: Option<crawfish_types::SecretPolicy>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QualityPolicyPatch {
     pub quality_class: Option<String>,
     pub evaluation_hook: Option<Option<String>>,
@@ -39,7 +40,7 @@ pub struct QualityPolicyPatch {
     pub human_review_rule: Option<Option<String>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RecoveryPolicyPatch {
     pub checkpoint_interval: Option<crawfish_types::CheckpointInterval>,
     pub resumability: Option<crawfish_types::Resumability>,
@@ -50,7 +51,7 @@ pub struct RecoveryPolicyPatch {
     pub dead_letter_policy: Option<DeadLetterPolicy>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionContractPatch {
     pub delivery: DeliveryContractPatch,
     pub execution: ExecutionPolicyPatch,
@@ -85,8 +86,14 @@ pub fn compile_execution_plan(
     Ok(CompiledExecutionPlan { contract, strategy })
 }
 
-fn merge_contracts(_base: &ExecutionContract, override_: &ExecutionContract) -> ExecutionContract {
-    override_.clone()
+fn merge_contracts(base: &ExecutionContract, override_: &ExecutionContract) -> ExecutionContract {
+    let mut merged = base.clone();
+    merged.delivery = override_.delivery.clone();
+    merged.execution = override_.execution.clone();
+    merged.safety = override_.safety.clone();
+    merged.quality = override_.quality.clone();
+    merged.recovery = override_.recovery.clone();
+    merged
 }
 
 fn apply_patch(contract: &mut ExecutionContract, patch: &ExecutionContractPatch) {
