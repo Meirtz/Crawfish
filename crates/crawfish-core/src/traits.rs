@@ -71,7 +71,7 @@ pub trait DeterministicExecutor: Send + Sync {
 
 #[async_trait]
 pub trait SupervisorControl: Send + Sync {
-    async fn list_status(&self) -> anyhow::Result<crate::FleetStatusResponse>;
+    async fn list_status(&self) -> anyhow::Result<crate::SwarmStatusResponse>;
     async fn list_actions(&self, phase: Option<&str>) -> anyhow::Result<crate::ActionListResponse>;
     async fn list_action_events(
         &self,

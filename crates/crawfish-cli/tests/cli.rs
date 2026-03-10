@@ -31,6 +31,7 @@ fn init_creates_workspace_files() {
         .unwrap()
         .contains("[openclaw.inbound]"));
     assert!(dir.path().join("agents/repo_reviewer.toml").exists());
+    assert!(dir.path().join("agents/task_planner.toml").exists());
     assert!(dir.path().join("agents/workspace_editor.toml").exists());
 }
 
@@ -52,7 +53,7 @@ fn daemon_backed_cli_supports_status_health_and_submit() {
 sqlite_path = ".crawfish/state/control.db"
 state_dir = ".crawfish/state"
 
-[fleet]
+[swarm]
 manifests_dir = "agents"
 
 [api]
@@ -68,12 +69,13 @@ reconcile_interval_ms = 100
         "repo_reviewer",
         "ci_triage",
         "incident_enricher",
+        "task_planner",
         "workspace_editor",
     ] {
         fs::write(
             dir.path().join(format!("agents/{agent}.toml")),
             fs::read_to_string(format!(
-                "{}/../../examples/hero-fleet/agents/{agent}.toml",
+                "{}/../../examples/hero-swarm/agents/{agent}.toml",
                 env!("CARGO_MANIFEST_DIR")
             ))
             .unwrap(),
@@ -168,7 +170,7 @@ fn daemon_backed_cli_supports_action_list_and_operator_controls() {
 sqlite_path = ".crawfish/state/control.db"
 state_dir = ".crawfish/state"
 
-[fleet]
+[swarm]
 manifests_dir = "agents"
 
 [api]
@@ -184,12 +186,13 @@ reconcile_interval_ms = 100
         "repo_reviewer",
         "ci_triage",
         "incident_enricher",
+        "task_planner",
         "workspace_editor",
     ] {
         fs::write(
             dir.path().join(format!("agents/{agent}.toml")),
             fs::read_to_string(format!(
-                "{}/../../examples/hero-fleet/agents/{agent}.toml",
+                "{}/../../examples/hero-swarm/agents/{agent}.toml",
                 env!("CARGO_MANIFEST_DIR")
             ))
             .unwrap(),

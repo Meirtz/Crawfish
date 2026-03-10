@@ -1276,17 +1276,17 @@ pub struct IncidentEnrichmentArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PatchPlanStep {
+pub struct TaskPlanStep {
     pub title: String,
     pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PatchPlanArtifact {
+pub struct TaskPlanArtifact {
     #[serde(default)]
     pub target_files: Vec<String>,
     #[serde(default)]
-    pub ordered_steps: Vec<PatchPlanStep>,
+    pub ordered_steps: Vec<TaskPlanStep>,
     #[serde(default)]
     pub risks: Vec<String>,
     #[serde(default)]
@@ -1295,6 +1295,9 @@ pub struct PatchPlanArtifact {
     pub test_suggestions: Vec<String>,
     pub confidence_summary: String,
 }
+
+pub type PatchPlanStep = TaskPlanStep;
+pub type PatchPlanArtifact = TaskPlanArtifact;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncounterRecord {

@@ -2,9 +2,9 @@ use bytes::Bytes;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crawfish_core::{
     ActionDetail, ActionEventsResponse, ActionListResponse, AdminActionResponse, AgentDetail,
-    ApproveActionRequest, CrawfishConfig, ExecutionContractPatch, FleetStatusResponse,
-    PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest, RevokeLeaseRequest,
-    SubmitActionRequest, SubmittedAction,
+    ApproveActionRequest, CrawfishConfig, ExecutionContractPatch, PolicyValidationRequest,
+    PolicyValidationResponse, RejectActionRequest, RevokeLeaseRequest, SubmitActionRequest,
+    SubmittedAction, SwarmStatusResponse,
 };
 use crawfish_runtime::Supervisor;
 use crawfish_types::{
@@ -313,23 +313,27 @@ fn init_workspace(path: &Path) -> anyhow::Result<()> {
     write_if_missing(&path.join("Crawfish.toml"), ROOT_CONFIG_TEMPLATE)?;
     write_if_missing(
         &path.join("agents/repo_indexer.toml"),
-        include_str!("../../../examples/hero-fleet/agents/repo_indexer.toml"),
+        include_str!("../../../examples/hero-swarm/agents/repo_indexer.toml"),
     )?;
     write_if_missing(
         &path.join("agents/repo_reviewer.toml"),
-        include_str!("../../../examples/hero-fleet/agents/repo_reviewer.toml"),
+        include_str!("../../../examples/hero-swarm/agents/repo_reviewer.toml"),
     )?;
     write_if_missing(
         &path.join("agents/ci_triage.toml"),
-        include_str!("../../../examples/hero-fleet/agents/ci_triage.toml"),
+        include_str!("../../../examples/hero-swarm/agents/ci_triage.toml"),
     )?;
     write_if_missing(
         &path.join("agents/incident_enricher.toml"),
-        include_str!("../../../examples/hero-fleet/agents/incident_enricher.toml"),
+        include_str!("../../../examples/hero-swarm/agents/incident_enricher.toml"),
+    )?;
+    write_if_missing(
+        &path.join("agents/task_planner.toml"),
+        include_str!("../../../examples/hero-swarm/agents/task_planner.toml"),
     )?;
     write_if_missing(
         &path.join("agents/workspace_editor.toml"),
-        include_str!("../../../examples/hero-fleet/agents/workspace_editor.toml"),
+        include_str!("../../../examples/hero-swarm/agents/workspace_editor.toml"),
     )?;
     println!("initialized Crawfish workspace at {}", path.display());
     Ok(())
@@ -341,7 +345,7 @@ async fn run_command(command: RunCommand) -> anyhow::Result<()> {
 
 async fn status_command(command: StatusCommand) -> anyhow::Result<()> {
     let client = DaemonClient::from_config(&command.config)?;
-    let status: FleetStatusResponse = client.get_json("/v1/agents").await?;
+    let status: SwarmStatusResponse = client.get_json("/v1/agents").await?;
     if command.json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
@@ -649,7 +653,7 @@ const ROOT_CONFIG_TEMPLATE: &str = r#"[storage]
 sqlite_path = ".crawfish/state/control.db"
 state_dir = ".crawfish/state"
 
-[fleet]
+[swarm]
 manifests_dir = "agents"
 
 [api]

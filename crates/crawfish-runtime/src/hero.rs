@@ -3,9 +3,9 @@ use async_trait::async_trait;
 use crawfish_core::DeterministicExecutor;
 use crawfish_types::{
     Action, ActionOutputs, ArtifactRef, CiFailureFamily, CiTriageArtifact,
-    IncidentEnrichmentArtifact, PatchPlanArtifact, PatchPlanStep, RepoIndexArtifact, ReviewFinding,
-    ReviewFindingsArtifact, ReviewRiskLevel, WorkspaceApplyResult, WorkspaceEdit, WorkspaceEditOp,
-    WorkspaceRejectedEdit,
+    IncidentEnrichmentArtifact, RepoIndexArtifact, ReviewFinding, ReviewFindingsArtifact,
+    ReviewRiskLevel, TaskPlanArtifact, TaskPlanStep, WorkspaceApplyResult, WorkspaceEdit,
+    WorkspaceEditOp, WorkspaceRejectedEdit,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -31,7 +31,7 @@ pub struct IncidentEnricherDeterministicExecutor {
     state_dir: PathBuf,
 }
 
-pub struct CodingPatchPlannerDeterministicExecutor {
+pub struct TaskPlannerDeterministicExecutor {
     state_dir: PathBuf,
 }
 
@@ -71,7 +71,7 @@ impl IncidentEnricherDeterministicExecutor {
     }
 }
 
-impl CodingPatchPlannerDeterministicExecutor {
+impl TaskPlannerDeterministicExecutor {
     pub fn new(state_dir: PathBuf) -> Self {
         Self { state_dir }
     }
@@ -376,44 +376,52 @@ impl DeterministicExecutor for IncidentEnricherDeterministicExecutor {
 }
 
 #[async_trait]
-impl DeterministicExecutor for CodingPatchPlannerDeterministicExecutor {
+impl DeterministicExecutor for TaskPlannerDeterministicExecutor {
     async fn execute(&self, action: &Action) -> anyhow::Result<ActionOutputs> {
-        let workspace_root = required_input_string(action, "workspace_root")?;
-        let workspace_path = PathBuf::from(&workspace_root);
-        if !workspace_path.is_dir() {
-            return Err(anyhow!(
-                "workspace_root must point to an existing directory: {workspace_root}"
-            ));
-        }
+        let workspace_root = optional_input_string(action, "workspace_root");
+        let repo_files = if let Some(workspace_root) = &workspace_root {
+            let workspace_path = PathBuf::from(workspace_root);
+            if !workspace_path.is_dir() {
+                return Err(anyhow!(
+                    "workspace_root must point to an existing directory: {workspace_root}"
+                ));
+            }
+            collect_repo_files(&workspace_path)
+        } else {
+            Vec::new()
+        };
 
-        let brief = patch_plan_brief_from_action(action)?;
+        let objective = task_plan_objective_from_action(action)?;
         let files_of_interest = input_string_array(action, "files_of_interest");
         let constraints = input_string_array(action, "constraints");
-        let repo_files = collect_repo_files(&workspace_path);
-        let target_files =
-            select_patch_plan_target_files(&repo_files, &brief, &files_of_interest, &constraints);
-        let risks = patch_plan_risks(&target_files, &constraints);
-        let assumptions = patch_plan_assumptions(action, &target_files);
-        let test_suggestions = patch_plan_test_suggestions(&target_files);
+        let target_files = select_task_plan_target_files(
+            &repo_files,
+            &objective,
+            &files_of_interest,
+            &constraints,
+        );
+        let risks = task_plan_risks(&target_files, &constraints);
+        let assumptions = task_plan_assumptions(action, &target_files);
+        let test_suggestions = task_plan_test_suggestions(&target_files);
 
-        let artifact = PatchPlanArtifact {
+        let artifact = TaskPlanArtifact {
             target_files: target_files.clone(),
-            ordered_steps: patch_plan_steps(&brief, &target_files, &constraints),
+            ordered_steps: task_plan_steps(&objective, &target_files, &constraints),
             risks,
             assumptions,
             test_suggestions,
-            confidence_summary: patch_plan_confidence_summary(&target_files, &constraints),
+            confidence_summary: task_plan_confidence_summary(&target_files, &constraints),
         };
 
         let json_ref =
-            write_json_artifact(&self.state_dir, &action.id, "patch_plan.json", &artifact).await?;
-        let markdown = build_patch_plan_markdown(&artifact, action, &brief);
+            write_json_artifact(&self.state_dir, &action.id, "task_plan.json", &artifact).await?;
+        let markdown = build_task_plan_markdown(&artifact, action, &objective);
         let markdown_ref =
-            write_text_artifact(&self.state_dir, &action.id, "patch_plan.md", &markdown).await?;
+            write_text_artifact(&self.state_dir, &action.id, "task_plan.md", &markdown).await?;
 
         Ok(ActionOutputs {
             summary: Some(format!(
-                "Generated a patch plan for {} target files",
+                "Generated a task plan for {} target files",
                 artifact.target_files.len()
             )),
             artifacts: vec![json_ref, markdown_ref],
@@ -425,6 +433,10 @@ impl DeterministicExecutor for CodingPatchPlannerDeterministicExecutor {
                 (
                     "target_file_count".to_string(),
                     serde_json::json!(artifact.target_files.len()),
+                ),
+                (
+                    "workspace_bound".to_string(),
+                    serde_json::json!(workspace_root.is_some()),
                 ),
             ]),
         })
@@ -863,8 +875,9 @@ fn input_string_array(action: &Action, key: &str) -> Vec<String> {
         .collect()
 }
 
-fn patch_plan_brief_from_action(action: &Action) -> anyhow::Result<String> {
+fn task_plan_objective_from_action(action: &Action) -> anyhow::Result<String> {
     [
+        optional_input_string(action, "objective"),
         optional_input_string(action, "task"),
         optional_input_string(action, "spec_text"),
         optional_input_string(action, "problem_statement"),
@@ -872,12 +885,12 @@ fn patch_plan_brief_from_action(action: &Action) -> anyhow::Result<String> {
     .into_iter()
     .flatten()
     .find(|value| !value.trim().is_empty())
-    .ok_or_else(|| anyhow!("coding.patch.plan requires task, spec_text, or problem_statement"))
+    .ok_or_else(|| anyhow!("task.plan requires objective, task, spec_text, or problem_statement"))
 }
 
-fn select_patch_plan_target_files(
+fn select_task_plan_target_files(
     repo_files: &[String],
-    brief: &str,
+    objective: &str,
     files_of_interest: &[String],
     constraints: &[String],
 ) -> Vec<String> {
@@ -885,7 +898,7 @@ fn select_patch_plan_target_files(
         return files_of_interest.to_vec();
     }
 
-    let lowered = format!("{brief} {}", constraints.join(" ")).to_lowercase();
+    let lowered = format!("{objective} {}", constraints.join(" ")).to_lowercase();
     let tokens = lowered
         .split(|char: char| !char.is_ascii_alphanumeric())
         .filter(|token| token.len() >= 3)
@@ -935,11 +948,11 @@ fn select_patch_plan_target_files(
     selected
 }
 
-fn patch_plan_steps(
-    brief: &str,
+fn task_plan_steps(
+    objective: &str,
     target_files: &[String],
     constraints: &[String],
-) -> Vec<PatchPlanStep> {
+) -> Vec<TaskPlanStep> {
     let target_files_summary = if target_files.is_empty() {
         "the current workspace".to_string()
     } else {
@@ -952,30 +965,30 @@ fn patch_plan_steps(
     };
 
     vec![
-        PatchPlanStep {
+        TaskPlanStep {
             title: "Confirm scope".to_string(),
             detail: format!(
-                "Review the request and anchor on this objective: {brief}. {constraint_summary}"
+                "Review the request and anchor on this objective: {objective}. {constraint_summary}"
             ),
         },
-        PatchPlanStep {
+        TaskPlanStep {
             title: "Inspect likely touch points".to_string(),
             detail: format!(
                 "Start with these files or modules: {target_files_summary}."
             ),
         },
-        PatchPlanStep {
+        TaskPlanStep {
             title: "Draft the proposal".to_string(),
-            detail: "Describe the intended code changes, why they are needed, and what should stay unchanged.".to_string(),
+            detail: "Describe the intended changes, why they are needed, and what should stay unchanged.".to_string(),
         },
-        PatchPlanStep {
+        TaskPlanStep {
             title: "Plan validation".to_string(),
             detail: "List deterministic checks, tests, and edge cases that should confirm the patch is safe before any mutation path is used.".to_string(),
         },
     ]
 }
 
-fn patch_plan_risks(target_files: &[String], constraints: &[String]) -> Vec<String> {
+fn task_plan_risks(target_files: &[String], constraints: &[String]) -> Vec<String> {
     let mut risks = Vec::new();
     if target_files.is_empty() {
         risks.push("Target file selection is heuristic because the request did not include files_of_interest.".to_string());
@@ -995,7 +1008,7 @@ fn patch_plan_risks(target_files: &[String], constraints: &[String]) -> Vec<Stri
     risks
 }
 
-fn patch_plan_assumptions(action: &Action, target_files: &[String]) -> Vec<String> {
+fn task_plan_assumptions(action: &Action, target_files: &[String]) -> Vec<String> {
     let mut assumptions = Vec::new();
     if target_files.is_empty() {
         assumptions.push(
@@ -1014,7 +1027,7 @@ fn patch_plan_assumptions(action: &Action, target_files: &[String]) -> Vec<Strin
     assumptions
 }
 
-fn patch_plan_test_suggestions(target_files: &[String]) -> Vec<String> {
+fn task_plan_test_suggestions(target_files: &[String]) -> Vec<String> {
     let mut suggestions = vec![
         "Run the narrowest existing test target that covers the changed modules.".to_string(),
         "Add or update deterministic tests for the intended behavior delta.".to_string(),
@@ -1034,7 +1047,7 @@ fn patch_plan_test_suggestions(target_files: &[String]) -> Vec<String> {
     suggestions
 }
 
-fn patch_plan_confidence_summary(target_files: &[String], constraints: &[String]) -> String {
+fn task_plan_confidence_summary(target_files: &[String], constraints: &[String]) -> String {
     match (target_files.is_empty(), constraints.is_empty()) {
         (false, false) => "medium confidence: likely target files and constraints are both available".to_string(),
         (false, true) => "medium-low confidence: target files are available, but the request lacks explicit constraints".to_string(),
@@ -1043,12 +1056,16 @@ fn patch_plan_confidence_summary(target_files: &[String], constraints: &[String]
     }
 }
 
-fn build_patch_plan_markdown(artifact: &PatchPlanArtifact, action: &Action, brief: &str) -> String {
+fn build_task_plan_markdown(
+    artifact: &TaskPlanArtifact,
+    action: &Action,
+    objective: &str,
+) -> String {
     let mut markdown = vec![
-        "# Patch Plan".to_string(),
+        "# Task Plan".to_string(),
         String::new(),
         format!("Request: {}", action.goal.summary),
-        format!("Brief: {brief}"),
+        format!("Objective: {objective}"),
         String::new(),
         "## Target Files".to_string(),
     ];
@@ -1709,7 +1726,7 @@ mod tests {
     use crawfish_core::now_timestamp;
     use crawfish_types::{
         Action, ActionPhase, ExecutionContract, GoalSpec, IncidentEnrichmentArtifact, OwnerKind,
-        OwnerRef, PatchPlanArtifact, RequesterKind, RequesterRef, ScheduleSpec,
+        OwnerRef, RequesterKind, RequesterRef, ScheduleSpec, TaskPlanArtifact,
         WorkspaceApplyResult,
     };
     use tempfile::tempdir;
@@ -1734,7 +1751,7 @@ mod tests {
                 "repo.review" => "repo_reviewer".to_string(),
                 "ci.triage" => "ci_triage".to_string(),
                 "incident.enrich" => "incident_enricher".to_string(),
-                "coding.patch.plan" => "coding_planner".to_string(),
+                "task.plan" | "coding.patch.plan" => "task_planner".to_string(),
                 "workspace.patch.apply" => "workspace_editor".to_string(),
                 _ => "repo_indexer".to_string(),
             },
@@ -1962,7 +1979,7 @@ depends_on = []
     }
 
     #[tokio::test]
-    async fn coding_patch_planner_emits_patch_plan_artifacts() {
+    async fn task_planner_emits_task_plan_artifacts() {
         let dir = tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         fs::create_dir_all(workspace.join("src")).await.unwrap();
@@ -1980,18 +1997,17 @@ depends_on = []
         .await
         .unwrap();
 
-        let executor =
-            CodingPatchPlannerDeterministicExecutor::new(dir.path().join(".crawfish/state"));
+        let executor = TaskPlannerDeterministicExecutor::new(dir.path().join(".crawfish/state"));
         let outputs = executor
             .execute(&action_with_capability(
-                "coding.patch.plan",
+                "task.plan",
                 BTreeMap::from([
                     (
                         "workspace_root".to_string(),
                         serde_json::json!(workspace.display().to_string()),
                     ),
                     (
-                        "task".to_string(),
+                        "objective".to_string(),
                         serde_json::json!("Add validation to compute and update related tests"),
                     ),
                     (
@@ -2004,13 +2020,13 @@ depends_on = []
             .unwrap();
 
         assert_eq!(outputs.artifacts.len(), 2);
-        let plan: PatchPlanArtifact = load_json_artifact(&outputs.artifacts[0]).await.unwrap();
+        let plan: TaskPlanArtifact = load_json_artifact(&outputs.artifacts[0]).await.unwrap();
         assert!(plan.target_files.contains(&"src/lib.rs".to_string()));
         assert!(!plan.ordered_steps.is_empty());
         let summary = fs::read_to_string(&outputs.artifacts[1].path)
             .await
             .unwrap();
-        assert!(summary.contains("# Patch Plan"));
+        assert!(summary.contains("# Task Plan"));
         assert!(summary.contains("src/lib.rs"));
     }
 

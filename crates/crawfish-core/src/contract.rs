@@ -249,7 +249,7 @@ mod tests {
     fn explicit_strategy_wins() {
         let mut defaults = BTreeMap::new();
         defaults.insert(
-            "coding.patch.plan".to_string(),
+            "task.plan".to_string(),
             ExecutionStrategy {
                 mode: ExecutionStrategyMode::VerifyLoop,
                 verification_spec: Some(VerificationSpec {
@@ -267,7 +267,7 @@ mod tests {
             &ExecutionContract::default(),
             &ExecutionContractPatch::default(),
             &defaults,
-            "coding.patch.plan",
+            "task.plan",
             Some(ExecutionStrategy {
                 mode: ExecutionStrategyMode::SinglePass,
                 verification_spec: None,

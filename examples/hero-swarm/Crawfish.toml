@@ -2,7 +2,7 @@
 sqlite_path = ".crawfish/state/control.db"
 state_dir = ".crawfish/state"
 
-[fleet]
+[swarm]
 manifests_dir = "agents"
 
 [api]

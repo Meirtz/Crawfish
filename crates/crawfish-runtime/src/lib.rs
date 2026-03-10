@@ -13,11 +13,10 @@ use crawfish_core::{
     ActionSummary, AdminActionResponse, AgentDetail, ApproveActionRequest, CheckpointStore,
     CompiledExecutionPlan, CrawfishConfig, DeterministicExecutor, EncounterDecision,
     EncounterDisposition, EncounterRequest, ExecutionContractPatch, ExecutionSurface,
-    FleetStatusResponse, GovernanceContext, HealthResponse, OpenClawAgentStatusResponse,
-    OpenClawCallerContext, OpenClawInboundActionRequest, OpenClawInboundActionResponse,
-    OpenClawInspectionContext, PolicyValidationRequest, PolicyValidationResponse,
-    RejectActionRequest, RevokeLeaseRequest, SubmitActionRequest, SubmittedAction,
-    SupervisorControl,
+    GovernanceContext, HealthResponse, OpenClawAgentStatusResponse, OpenClawCallerContext,
+    OpenClawInboundActionRequest, OpenClawInboundActionResponse, OpenClawInspectionContext,
+    PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest, RevokeLeaseRequest,
+    SubmitActionRequest, SubmittedAction, SupervisorControl, SwarmStatusResponse,
 };
 use crawfish_mcp::McpAdapter;
 use crawfish_openclaw::OpenClawAdapter;
@@ -31,11 +30,12 @@ use crawfish_types::{
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
-    CodingPatchPlannerDeterministicExecutor, IncidentEnricherDeterministicExecutor,
-    RepoIndexerDeterministicExecutor, RepoReviewerDeterministicExecutor,
+    IncidentEnricherDeterministicExecutor, RepoIndexerDeterministicExecutor,
+    RepoReviewerDeterministicExecutor, TaskPlannerDeterministicExecutor,
     WorkspacePatchApplyDeterministicExecutor,
 };
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -43,7 +43,7 @@ use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::time::{sleep, Duration};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub struct Supervisor {
@@ -75,6 +75,56 @@ struct OpenClawResolvedCaller {
     counterparty: CounterpartyRef,
     requester_id: String,
     effective_scopes: Vec<String>,
+}
+
+fn is_task_plan_capability(capability: &str) -> bool {
+    matches!(capability, "task.plan" | "coding.patch.plan")
+}
+
+fn normalize_task_plan_inputs(inputs: &mut BTreeMap<String, Value>) -> bool {
+    if inputs
+        .get("objective")
+        .and_then(Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    for legacy_key in ["task", "spec_text", "problem_statement"] {
+        if let Some(value) = inputs.get(legacy_key).cloned() {
+            if value
+                .as_str()
+                .map(|text| !text.trim().is_empty())
+                .unwrap_or(false)
+            {
+                inputs.insert("objective".to_string(), value);
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn normalize_submit_request(mut request: SubmitActionRequest) -> SubmitActionRequest {
+    let mut normalized_capability = None;
+    if request.capability == "coding.patch.plan" {
+        normalized_capability = Some("task.plan".to_string());
+        request.capability = "task.plan".to_string();
+    }
+
+    if is_task_plan_capability(&request.capability)
+        && normalize_task_plan_inputs(&mut request.inputs)
+    {
+        warn!("normalized deprecated task planning input keys to objective");
+    }
+
+    if normalized_capability.is_some() {
+        warn!("normalized deprecated capability coding.patch.plan to task.plan");
+    }
+
+    request
 }
 
 impl IntoResponse for RuntimeError {
@@ -434,22 +484,23 @@ impl Supervisor {
                     );
                 }
             }
-            "coding.patch.plan" => {
-                let workspace_root = request
-                    .inputs
-                    .get("workspace_root")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "invalid action request: coding.patch.plan requires workspace_root"
-                        )
-                    })?;
-                if !Path::new(workspace_root).is_dir() {
-                    anyhow::bail!(
-                        "invalid action request: workspace_root must be an existing directory"
-                    );
+            capability if is_task_plan_capability(capability) => {
+                if let Some(workspace_root) =
+                    request.inputs.get("workspace_root").and_then(Value::as_str)
+                {
+                    if !Path::new(workspace_root).is_dir() {
+                        anyhow::bail!(
+                            "invalid action request: workspace_root must be an existing directory"
+                        );
+                    }
                 }
 
+                let has_objective = request
+                    .inputs
+                    .get("objective")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
                 let has_task = request
                     .inputs
                     .get("task")
@@ -469,9 +520,9 @@ impl Supervisor {
                     .map(|value| !value.trim().is_empty())
                     .unwrap_or(false);
 
-                if !(has_task || has_spec_text || has_problem_statement) {
+                if !(has_objective || has_task || has_spec_text || has_problem_statement) {
                     anyhow::bail!(
-                        "invalid action request: coding.patch.plan requires task, spec_text, or problem_statement"
+                        "invalid action request: task.plan requires objective, task, spec_text, or problem_statement"
                     );
                 }
             }
@@ -1333,7 +1384,7 @@ impl Supervisor {
                 .await;
         }
 
-        if action.capability == "coding.patch.plan" {
+        if is_task_plan_capability(&action.capability) {
             let deterministic_fallback = action
                 .contract
                 .execution
@@ -1374,11 +1425,11 @@ impl Supervisor {
                                 .await?;
                             if deterministic_fallback {
                                 let executor =
-                                    CodingPatchPlannerDeterministicExecutor::new(self.state_dir());
+                                    TaskPlannerDeterministicExecutor::new(self.state_dir());
                                 let mut outcome = self
                                     .run_deterministic_executor(
                                         action,
-                                        "deterministic.coding_patch_plan",
+                                        "deterministic.task_plan",
                                         "planning",
                                         base_refs,
                                         &executor,
@@ -1414,7 +1465,7 @@ impl Supervisor {
                                     "route_degraded",
                                     serde_json::json!({
                                         "selected_surface": "openclaw",
-                                        "reason": "no OpenClaw binding is configured for coding.patch.plan",
+                                        "reason": "no OpenClaw binding is configured for task.plan",
                                         "code": failure_code_route_unavailable(),
                                         "fallback": "deterministic",
                                     }),
@@ -1423,7 +1474,7 @@ impl Supervisor {
                         } else {
                             return Ok(self.continuity_blocked_outcome(
                                 action,
-                                "no OpenClaw binding is configured for coding.patch.plan",
+                                "no OpenClaw binding is configured for task.plan",
                                 false,
                                 Vec::new(),
                             ));
@@ -1432,11 +1483,11 @@ impl Supervisor {
                 }
             }
 
-            let executor = CodingPatchPlannerDeterministicExecutor::new(self.state_dir());
+            let executor = TaskPlannerDeterministicExecutor::new(self.state_dir());
             return self
                 .run_deterministic_executor(
                     action,
-                    "deterministic.coding_patch_plan",
+                    "deterministic.task_plan",
                     "planning",
                     Vec::new(),
                     &executor,
@@ -2075,7 +2126,7 @@ impl Supervisor {
                 .or_insert_with(|| Value::String(workspace_root.clone()));
         }
 
-        let submit_request = SubmitActionRequest {
+        let submit_request = normalize_submit_request(SubmitActionRequest {
             target_agent_id: request.target_agent_id,
             requester: crawfish_types::RequesterRef {
                 kind: crawfish_types::RequesterKind::Session,
@@ -2093,7 +2144,7 @@ impl Supervisor {
             workspace_write: request.workspace_write,
             secret_access: request.secret_access,
             mutating: request.mutating,
-        };
+        });
 
         let (_, _, _, decision, _) = self
             .preflight_submission(&submit_request)
@@ -2510,8 +2561,8 @@ fn continuity_mode_name(mode: &ContinuityModeName) -> &'static str {
 
 #[async_trait::async_trait]
 impl SupervisorControl for Supervisor {
-    async fn list_status(&self) -> anyhow::Result<FleetStatusResponse> {
-        Ok(FleetStatusResponse {
+    async fn list_status(&self) -> anyhow::Result<SwarmStatusResponse> {
+        Ok(SwarmStatusResponse {
             agents: self.store.list_lifecycle_records().await?,
             queue: self.store.queue_summary().await?,
         })
@@ -2596,6 +2647,7 @@ impl SupervisorControl for Supervisor {
     }
 
     async fn submit_action(&self, request: SubmitActionRequest) -> anyhow::Result<SubmittedAction> {
+        let request = normalize_submit_request(request);
         let (manifest, compiled, encounter_request, decision, requires_approval) =
             self.preflight_submission(&request).await?;
         let encounter_state = if matches!(decision.disposition, EncounterDisposition::Deny) {
@@ -3071,7 +3123,7 @@ async fn health_handler(
 
 async fn list_agents_handler(
     State(supervisor): State<Arc<Supervisor>>,
-) -> Result<Json<FleetStatusResponse>, RuntimeError> {
+) -> Result<Json<SwarmStatusResponse>, RuntimeError> {
     Ok(Json(
         supervisor
             .list_status()
@@ -3349,14 +3401,14 @@ mod tests {
             "repo_reviewer",
             "ci_triage",
             "incident_enricher",
-            "coding_planner",
+            "task_planner",
             "workspace_editor",
         ] {
             let mut manifest = std::fs::read_to_string(format!(
-                "{}/../../examples/hero-fleet/agents/{agent}.toml",
+                "{}/../../examples/hero-swarm/agents/{agent}.toml",
                 env!("CARGO_MANIFEST_DIR")
             ))?;
-            if agent == "coding_planner" {
+            if agent == "task_planner" {
                 if let Some(gateway_url) = openclaw_gateway_url {
                     manifest = manifest.replace("ws://127.0.0.1:9988/gateway", gateway_url);
                 }
@@ -3371,7 +3423,7 @@ mod tests {
     async fn build_supervisor(dir: &Path) -> anyhow::Result<Arc<Supervisor>> {
         build_supervisor_with_config(
             dir,
-            include_str!("../../../examples/hero-fleet/Crawfish.toml").to_string(),
+            include_str!("../../../examples/hero-swarm/Crawfish.toml").to_string(),
         )
         .await
     }
@@ -3380,7 +3432,7 @@ mod tests {
         dir: &Path,
         mcp_url: &str,
     ) -> anyhow::Result<Arc<Supervisor>> {
-        let config = include_str!("../../../examples/hero-fleet/Crawfish.toml")
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
             .replace("http://127.0.0.1:8877/sse", mcp_url);
         build_supervisor_with_config(dir, config).await
     }
@@ -3388,7 +3440,7 @@ mod tests {
     async fn build_supervisor_with_openclaw(dir: &Path) -> anyhow::Result<Arc<Supervisor>> {
         build_supervisor_with_config(
             dir,
-            include_str!("../../../examples/hero-fleet/Crawfish.toml").to_string(),
+            include_str!("../../../examples/hero-swarm/Crawfish.toml").to_string(),
         )
         .await
     }
@@ -3399,7 +3451,7 @@ mod tests {
     ) -> anyhow::Result<Arc<Supervisor>> {
         build_supervisor_with_config_and_openclaw_gateway(
             dir,
-            include_str!("../../../examples/hero-fleet/Crawfish.toml").to_string(),
+            include_str!("../../../examples/hero-swarm/Crawfish.toml").to_string(),
             Some(gateway_url),
         )
         .await
@@ -3689,7 +3741,7 @@ mod tests {
                                 "ok": true,
                                 "result": {
                                     "status":"completed",
-                                    "text":"# Patch Plan\n1. Inspect `src/lib.rs`\n2. Add validation checks\n3. Update tests\nRisks: config drift\nTest: cargo test --workspace"
+                                    "text":"# Task Plan\n1. Inspect `src/lib.rs`\n2. Add validation checks\n3. Update tests\nRisks: config drift\nTest: cargo test --workspace"
                                 }
                             })
                             .to_string()
@@ -3769,7 +3821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coding_patch_plan_routes_to_openclaw_and_streams_events() {
+    async fn task_plan_routes_to_openclaw_and_streams_events() {
         let dir = tempdir().unwrap();
         let gateway_url = spawn_mock_openclaw_gateway().await;
         std::env::set_var("OPENCLAW_GATEWAY_TOKEN", "test-token");
@@ -3779,7 +3831,7 @@ mod tests {
 
         let submitted = supervisor
             .submit_action(SubmitActionRequest {
-                target_agent_id: "coding_planner".to_string(),
+                target_agent_id: "task_planner".to_string(),
                 requester: RequesterRef {
                     kind: RequesterKind::User,
                     id: "operator".to_string(),
@@ -3789,9 +3841,9 @@ mod tests {
                     id: "local-dev".to_string(),
                     display_name: None,
                 },
-                capability: "coding.patch.plan".to_string(),
+                capability: "task.plan".to_string(),
                 goal: crawfish_types::GoalSpec {
-                    summary: "plan a patch".to_string(),
+                    summary: "plan a task".to_string(),
                     details: None,
                 },
                 inputs: std::collections::BTreeMap::from([
@@ -3800,7 +3852,7 @@ mod tests {
                         serde_json::json!(dir.path().display().to_string()),
                     ),
                     (
-                        "task".to_string(),
+                        "objective".to_string(),
                         serde_json::json!("Add validation checks around the repo indexing path"),
                     ),
                     (
@@ -3829,7 +3881,7 @@ mod tests {
         assert_eq!(detail.action.phase, ActionPhase::Completed);
         assert_eq!(
             detail.selected_executor.as_deref(),
-            Some("openclaw.coding-planner")
+            Some("openclaw.task-planner")
         );
         assert!(detail
             .external_refs
@@ -3854,7 +3906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coding_patch_plan_falls_back_to_deterministic_when_gateway_is_unavailable() {
+    async fn task_plan_falls_back_to_deterministic_when_gateway_is_unavailable() {
         let dir = tempdir().unwrap();
         std::env::set_var("OPENCLAW_GATEWAY_TOKEN", "test-token");
         let supervisor =
@@ -3864,7 +3916,7 @@ mod tests {
 
         let submitted = supervisor
             .submit_action(SubmitActionRequest {
-                target_agent_id: "coding_planner".to_string(),
+                target_agent_id: "task_planner".to_string(),
                 requester: RequesterRef {
                     kind: RequesterKind::User,
                     id: "operator".to_string(),
@@ -3874,9 +3926,9 @@ mod tests {
                     id: "local-dev".to_string(),
                     display_name: None,
                 },
-                capability: "coding.patch.plan".to_string(),
+                capability: "task.plan".to_string(),
                 goal: crawfish_types::GoalSpec {
-                    summary: "plan a patch".to_string(),
+                    summary: "plan a task".to_string(),
                     details: None,
                 },
                 inputs: std::collections::BTreeMap::from([
@@ -3885,8 +3937,8 @@ mod tests {
                         serde_json::json!(dir.path().display().to_string()),
                     ),
                     (
-                        "task".to_string(),
-                        serde_json::json!("Plan a safe fallback-only patch flow"),
+                        "objective".to_string(),
+                        serde_json::json!("Plan a safe fallback-only task flow"),
                     ),
                 ]),
                 contract_overrides: None,
@@ -3910,7 +3962,7 @@ mod tests {
         assert_eq!(detail.action.phase, ActionPhase::Completed);
         assert_eq!(
             detail.selected_executor.as_deref(),
-            Some("deterministic.coding_patch_plan")
+            Some("deterministic.task_plan")
         );
         let events = supervisor
             .list_action_events(&submitted.action_id)
@@ -4254,7 +4306,7 @@ depends_on = []
 
         let action = Action {
             id: "openclaw-running-action".to_string(),
-            target_agent_id: "coding_planner".to_string(),
+            target_agent_id: "task_planner".to_string(),
             requester: RequesterRef {
                 kind: RequesterKind::User,
                 id: "operator".to_string(),
@@ -4266,16 +4318,16 @@ depends_on = []
             },
             counterparty_refs: Vec::new(),
             goal: crawfish_types::GoalSpec {
-                summary: "plan patch".to_string(),
+                summary: "plan task".to_string(),
                 details: None,
             },
-            capability: "coding.patch.plan".to_string(),
+            capability: "task.plan".to_string(),
             inputs: std::collections::BTreeMap::from([
                 (
                     "workspace_root".to_string(),
                     serde_json::json!(dir.path().display().to_string()),
                 ),
-                ("task".to_string(), serde_json::json!("Plan a patch")),
+                ("objective".to_string(), serde_json::json!("Plan a task")),
             ]),
             contract: supervisor.config().contracts.org_defaults.clone(),
             execution_strategy: None,
@@ -4294,7 +4346,7 @@ depends_on = []
             degradation_profile: None,
             failure_reason: None,
             failure_code: None,
-            selected_executor: Some("openclaw.coding-planner".to_string()),
+            selected_executor: Some("openclaw.task-planner".to_string()),
             recovery_stage: None,
             lock_detail: None,
             external_refs: vec![ExternalRef {

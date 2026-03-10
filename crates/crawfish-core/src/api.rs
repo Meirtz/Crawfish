@@ -25,10 +25,12 @@ pub struct QueueSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FleetStatusResponse {
+pub struct SwarmStatusResponse {
     pub agents: Vec<LifecycleRecord>,
     pub queue: QueueSummary,
 }
+
+pub type FleetStatusResponse = SwarmStatusResponse;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentDetail {

@@ -80,9 +80,11 @@ pub struct GovernanceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FleetConfig {
+pub struct SwarmConfig {
     pub manifests_dir: PathBuf,
 }
+
+pub type FleetConfig = SwarmConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -93,7 +95,8 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CrawfishConfig {
     pub storage: StorageConfig,
-    pub fleet: FleetConfig,
+    #[serde(alias = "fleet")]
+    pub swarm: SwarmConfig,
     #[serde(default)]
     pub api: ApiConfig,
     #[serde(default)]
@@ -159,11 +162,20 @@ fn default_system_encounter_policy() -> EncounterPolicy {
 impl CrawfishConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let contents = fs::read_to_string(path)?;
-        Ok(toml::from_str(&contents)?)
+        let value: toml::Value = toml::from_str(&contents)?;
+        let has_swarm = value.get("swarm").is_some();
+        let has_fleet = value.get("fleet").is_some();
+        if has_swarm && has_fleet {
+            anyhow::bail!("config cannot define both [swarm] and deprecated [fleet]");
+        }
+        if has_fleet && !has_swarm {
+            eprintln!("warning: [fleet] is deprecated; rename it to [swarm]");
+        }
+        Ok(value.try_into()?)
     }
 
     pub fn manifest_dir(&self, root: &Path) -> PathBuf {
-        root.join(&self.fleet.manifests_dir)
+        root.join(&self.swarm.manifests_dir)
     }
 
     pub fn sqlite_path(&self, root: &Path) -> PathBuf {
@@ -190,7 +202,7 @@ mod tests {
                 sqlite_path: PathBuf::from(".crawfish/state/control.db"),
                 state_dir: PathBuf::from(".crawfish/state"),
             },
-            fleet: FleetConfig {
+            swarm: SwarmConfig {
                 manifests_dir: PathBuf::from("agents"),
             },
             api: ApiConfig {
@@ -216,5 +228,22 @@ mod tests {
             config.socket_path(&root),
             PathBuf::from("/tmp/example/.crawfish/run/crawfishd.sock")
         );
+    }
+
+    #[test]
+    fn deprecated_fleet_alias_still_parses() {
+        let config: CrawfishConfig = toml::from_str(
+            r#"
+[storage]
+sqlite_path = ".crawfish/state/control.db"
+state_dir = ".crawfish/state"
+
+[fleet]
+manifests_dir = "agents"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.swarm.manifests_dir, PathBuf::from("agents"));
     }
 }

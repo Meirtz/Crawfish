@@ -3,7 +3,7 @@ use crawfish_core::{now_timestamp, ExecutionSurface, SurfaceActionEvent, Surface
 use crawfish_types::{
     Action, ActionOutputs, ArtifactRef, CapabilityDescriptor, CostClass, ExecutorClass,
     ExternalRef, LatencyClass, Mutability, OpenClawBinding, OpenClawSessionMode,
-    OpenClawWorkspacePolicy, PatchPlanArtifact, PatchPlanStep, RiskClass,
+    OpenClawWorkspacePolicy, RiskClass, TaskPlanArtifact, TaskPlanStep,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -140,11 +140,11 @@ impl OpenClawAdapter {
             .await?;
 
         let final_text = extract_final_text(&wait_result);
-        let final_artifact = patch_plan_artifact_from_result(action, &final_text, &wait_result);
+        let final_artifact = task_plan_artifact_from_result(action, &final_text, &wait_result);
         let json_ref = write_json_artifact(
             &self.state_dir,
             &action.id,
-            "patch_plan.json",
+            "task_plan.json",
             &final_artifact,
         )
         .await
@@ -152,8 +152,8 @@ impl OpenClawAdapter {
         let markdown_ref = write_text_artifact(
             &self.state_dir,
             &action.id,
-            "patch_plan.md",
-            &build_patch_plan_markdown(&final_artifact, action, &final_text),
+            "task_plan.md",
+            &build_task_plan_markdown(&final_artifact, action, &final_text),
         )
         .await
         .map_err(|error| OpenClawError::Protocol(error.to_string()))?;
@@ -186,7 +186,7 @@ impl OpenClawAdapter {
         Ok(SurfaceExecutionResult {
             outputs: ActionOutputs {
                 summary: Some(format!(
-                    "OpenClaw produced a proposal plan for {} target files",
+                    "OpenClaw produced a task plan for {} target files",
                     final_artifact.target_files.len()
                 )),
                 artifacts: vec![json_ref, markdown_ref],
@@ -429,9 +429,10 @@ fn extract_final_text(value: &Value) -> String {
 }
 
 fn build_agent_prompt(action: &Action) -> String {
-    let brief = action
+    let objective = action
         .inputs
-        .get("task")
+        .get("objective")
+        .or_else(|| action.inputs.get("task"))
         .or_else(|| action.inputs.get("spec_text"))
         .or_else(|| action.inputs.get("problem_statement"))
         .and_then(Value::as_str)
@@ -450,10 +451,10 @@ fn build_agent_prompt(action: &Action) -> String {
         .unwrap_or_default();
 
     let mut lines = vec![
-        "Produce a proposal-only patch plan.".to_string(),
+        "Produce a proposal-only task plan.".to_string(),
         "Do not apply changes, run mutating tools, or edit files.".to_string(),
         format!("Goal: {}", action.goal.summary),
-        format!("Brief: {brief}"),
+        format!("Objective: {objective}"),
     ];
     if !files.is_empty() {
         lines.push(format!("Files of interest: {files}"));
@@ -467,11 +468,7 @@ fn build_agent_prompt(action: &Action) -> String {
     lines.join("\n")
 }
 
-fn patch_plan_artifact_from_result(
-    action: &Action,
-    text: &str,
-    result: &Value,
-) -> PatchPlanArtifact {
+fn task_plan_artifact_from_result(action: &Action, text: &str, result: &Value) -> TaskPlanArtifact {
     let target_files = action
         .inputs
         .get("files_of_interest")
@@ -500,10 +497,10 @@ fn patch_plan_artifact_from_result(
         })
         .unwrap_or_else(|| "medium confidence: OpenClaw returned a proposal plan without an explicit confidence field".to_string());
 
-    PatchPlanArtifact {
+    TaskPlanArtifact {
         target_files,
         ordered_steps: if ordered_steps.is_empty() {
-            vec![PatchPlanStep {
+            vec![TaskPlanStep {
                 title: "Review the returned proposal".to_string(),
                 detail: text.lines().take(3).collect::<Vec<_>>().join(" "),
             }]
@@ -524,7 +521,7 @@ fn patch_plan_artifact_from_result(
             assumptions
         },
         test_suggestions: if test_suggestions.is_empty() {
-            vec!["Run deterministic checks and the narrowest relevant tests before applying any patch.".to_string()]
+            vec!["Run deterministic checks and the narrowest relevant validation before acting on the proposal.".to_string()]
         } else {
             test_suggestions
         },
@@ -546,7 +543,7 @@ fn extract_file_candidates(text: &str) -> Vec<String> {
     files
 }
 
-fn extract_steps(text: &str) -> Vec<PatchPlanStep> {
+fn extract_steps(text: &str) -> Vec<TaskPlanStep> {
     text.lines()
         .filter_map(|line| {
             let trimmed = line.trim();
@@ -558,7 +555,7 @@ fn extract_steps(text: &str) -> Vec<PatchPlanStep> {
             if step.is_empty() {
                 return None;
             }
-            Some(PatchPlanStep {
+            Some(TaskPlanStep {
                 title: step.chars().take(48).collect(),
                 detail: step.to_string(),
             })
@@ -576,9 +573,9 @@ fn extract_section_lines(text: &str, keyword: &str) -> Vec<String> {
         .collect()
 }
 
-fn build_patch_plan_markdown(artifact: &PatchPlanArtifact, action: &Action, text: &str) -> String {
+fn build_task_plan_markdown(artifact: &TaskPlanArtifact, action: &Action, text: &str) -> String {
     let mut lines = vec![
-        "# Patch Plan".to_string(),
+        "# Task Plan".to_string(),
         String::new(),
         format!("Request: {}", action.goal.summary),
         String::new(),
@@ -681,7 +678,7 @@ mod tests {
     fn planning_action(workspace_root: &Path) -> Action {
         Action {
             id: "action-1".to_string(),
-            target_agent_id: "coding_planner".to_string(),
+            target_agent_id: "task_planner".to_string(),
             requester: crawfish_types::RequesterRef {
                 kind: crawfish_types::RequesterKind::User,
                 id: "cli".to_string(),
@@ -693,16 +690,19 @@ mod tests {
             },
             counterparty_refs: Vec::new(),
             goal: crawfish_types::GoalSpec {
-                summary: "plan a patch".to_string(),
+                summary: "plan a task".to_string(),
                 details: None,
             },
-            capability: "coding.patch.plan".to_string(),
+            capability: "task.plan".to_string(),
             inputs: BTreeMap::from([
                 (
                     "workspace_root".to_string(),
                     json!(workspace_root.display().to_string()),
                 ),
-                ("task".to_string(), json!("Plan a safe validation patch")),
+                (
+                    "objective".to_string(),
+                    json!("Plan a safe validation change"),
+                ),
                 ("files_of_interest".to_string(), json!(["src/lib.rs"])),
             ]),
             contract: crawfish_types::ExecutionContract::default(),
@@ -821,7 +821,7 @@ mod tests {
             OpenClawBinding {
                 gateway_url: format!("ws://{address}"),
                 auth_ref: "OPENCLAW_TEST_TOKEN".to_string(),
-                target_agent: "coding-planner".to_string(),
+                target_agent: "task-planner".to_string(),
                 session_mode: OpenClawSessionMode::Ephemeral,
                 caller_owner_mapping: crawfish_types::CallerOwnerMapping::Required,
                 default_trust_domain: crawfish_types::TrustDomain::SameDeviceForeignOwner,
@@ -855,7 +855,7 @@ mod tests {
         let binding = OpenClawBinding {
             gateway_url: "ws://127.0.0.1:1".to_string(),
             auth_ref: "OPENCLAW_TEST_TOKEN".to_string(),
-            target_agent: "coding-planner".to_string(),
+            target_agent: "task-planner".to_string(),
             session_mode: OpenClawSessionMode::Sticky,
             caller_owner_mapping: crawfish_types::CallerOwnerMapping::Required,
             default_trust_domain: crawfish_types::TrustDomain::SameDeviceForeignOwner,

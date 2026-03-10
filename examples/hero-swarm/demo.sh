@@ -13,8 +13,8 @@ trap cleanup EXIT
 
 pushd "${REPO_ROOT}" >/dev/null
 cargo run -p crawfish-cli --bin crawfish -- init "${WORKDIR}"
-cp "${REPO_ROOT}/examples/hero-fleet/Crawfish.toml" "${WORKDIR}/Crawfish.toml"
-cp "${REPO_ROOT}"/examples/hero-fleet/agents/*.toml "${WORKDIR}/agents/"
+cp "${REPO_ROOT}/examples/hero-swarm/Crawfish.toml" "${WORKDIR}/Crawfish.toml"
+cp "${REPO_ROOT}"/examples/hero-swarm/agents/*.toml "${WORKDIR}/agents/"
 mkdir -p "${WORKDIR}/src" "${WORKDIR}/tests" "${WORKDIR}/incident"
 cat > "${WORKDIR}/src/lib.rs" <<'EOF'
 pub fn value() -> u32 { 42 } // TODO tighten checks
@@ -25,14 +25,14 @@ fn smoke() {
     assert_eq!(crate::value(), 42);
 }
 EOF
-cp "${REPO_ROOT}/examples/hero-fleet/data/sample-incident.log" "${WORKDIR}/incident/sample-incident.log"
-cp "${REPO_ROOT}/examples/hero-fleet/data/service-manifest.toml" "${WORKDIR}/incident/service-manifest.toml"
+cp "${REPO_ROOT}/examples/hero-swarm/data/sample-incident.log" "${WORKDIR}/incident/sample-incident.log"
+cp "${REPO_ROOT}/examples/hero-swarm/data/service-manifest.toml" "${WORKDIR}/incident/service-manifest.toml"
 
 cargo run -p crawfish-cli --bin crawfish -- run --config "${WORKDIR}/Crawfish.toml" &
 CRAWFISH_PID=$!
 sleep 1
 
-echo "== Fleet status =="
+echo "== Swarm status =="
 cargo run -p crawfish-cli --bin crawfish -- status --config "${WORKDIR}/Crawfish.toml" --json
 
 echo "== Submit review action =="
@@ -59,7 +59,7 @@ INCIDENT_ID="$(cargo run -p crawfish-cli --bin crawfish -- action submit \
 cargo run -p crawfish-cli --bin crawfish -- inspect "${INCIDENT_ID}" --config "${WORKDIR}/Crawfish.toml" --json
 
 if [[ -n "${OPENCLAW_GATEWAY_URL:-}" ]] && [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
-  python3 - "${WORKDIR}/agents/coding_planner.toml" "${OPENCLAW_GATEWAY_URL}" <<'PY'
+  python3 - "${WORKDIR}/agents/task_planner.toml" "${OPENCLAW_GATEWAY_URL}" <<'PY'
 from pathlib import Path
 import sys
 
@@ -72,11 +72,11 @@ PY
   echo "== Submit OpenClaw outbound planning action =="
   PLAN_ID="$(cargo run -p crawfish-cli --bin crawfish -- action submit \
     --config "${WORKDIR}/Crawfish.toml" \
-    --target-agent coding_planner \
-    --capability coding.patch.plan \
-    --goal "plan a safe patch" \
+    --target-agent task_planner \
+    --capability task.plan \
+    --goal "plan a safe task" \
     --caller-owner local-dev \
-    --inputs-json "{\"workspace_root\":\"${WORKDIR}\",\"task\":\"Add validation checks around the repo indexing path\",\"files_of_interest\":[\"src/lib.rs\"]}" \
+    --inputs-json "{\"workspace_root\":\"${WORKDIR}\",\"objective\":\"Add validation checks around the repo indexing path\",\"files_of_interest\":[\"src/lib.rs\"]}" \
     --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["action_id"])')"
   cargo run -p crawfish-cli --bin crawfish -- inspect "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
   cargo run -p crawfish-cli --bin crawfish -- action events "${PLAN_ID}" --config "${WORKDIR}/Crawfish.toml" --json
