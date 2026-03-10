@@ -1,0 +1,11 @@
+[services.api]
+depends_on = ["db"]
+
+[services.web]
+depends_on = ["api"]
+
+[services.worker]
+depends_on = ["api"]
+
+[services.db]
+depends_on = []

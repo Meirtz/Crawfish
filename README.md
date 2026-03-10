@@ -214,13 +214,17 @@ The current Rust alpha already covers one runnable Hero P0 slice:
 - `repo.index` scans a local workspace and emits `repo_index.json`.
 - `repo.review` runs deterministic review checks and reuses or bootstraps the latest repo index.
 - `ci.triage` classifies CI failures from direct logs or from an SSE MCP tool route.
+- `incident.enrich` turns local logs plus service topology into deterministic blast-radius and next-step artifacts.
 - `workspace.patch.apply` performs deterministic local file edits under explicit approval, grant, and lease control.
 - `inspect` surfaces artifact refs, checkpoint refs, recovery stage, continuity mode, encounter metadata, and external refs.
-- `action list`, `action approve`, `action reject`, and `lease revoke` expose the operator control path over the local UDS API.
+- `action list`, `action events`, `action approve`, `action reject`, and `lease revoke` expose the operator control path over the local UDS API.
 - restart recovery requeues `running` actions and resumes deterministic work from checkpoint metadata.
 - same-owner local read-only actions can be leased automatically, while same-device foreign-owner mutation remains denied by default.
+- `workspace_editor` now enforces workspace-scoped file locks and surfaces lock conflict and lease-expiry failures as stable operator-visible metadata.
 
 The first external tool transport implemented in code is `MCP over SSE`. `repo_reviewer` remains deterministic-first, while `ci_triage` can fetch remote log material through MCP and then complete the actual classification locally.
+
+With this `alpha.3` slice in place, the next planned milestone is `P1a OpenClaw inbound`.
 
 ## Quickstart
 
@@ -256,6 +260,13 @@ cargo run -p crawfish-cli --bin crawfish -- action submit \
   --caller-owner local-dev \
   --inputs-json "{\"log_text\":\"error: test failed, to rerun pass \`cargo test\`\"}" \
   --json
+cargo run -p crawfish-cli --bin crawfish -- action submit \
+  --target-agent incident_enricher \
+  --capability incident.enrich \
+  --goal "enrich local incident" \
+  --caller-owner local-dev \
+  --inputs-json "{\"service_name\":\"api\",\"log_text\":\"ERROR api timeout contacting db\\nWARN web received 503 service unavailable from api\\n\"}" \
+  --json
 MUTATION_ID=$(cargo run -p crawfish-cli --bin crawfish -- action submit \
   --target-agent workspace_editor \
   --capability workspace.patch.apply \
@@ -268,7 +279,9 @@ MUTATION_ID=$(cargo run -p crawfish-cli --bin crawfish -- action submit \
 cargo run -p crawfish-cli --bin crawfish -- action list --phase awaiting_approval --json
 cargo run -p crawfish-cli --bin crawfish -- action approve "$MUTATION_ID" --approver local-dev --json
 cargo run -p crawfish-cli --bin crawfish -- inspect "$MUTATION_ID" --json
+cargo run -p crawfish-cli --bin crawfish -- action events "$MUTATION_ID" --json
 kill $CRAWFISH_PID
 ```
 
 For a full sample configuration, start from [`examples/hero-fleet/Crawfish.toml`](examples/hero-fleet/Crawfish.toml) and the agent manifests under [`examples/hero-fleet/agents/`](examples/hero-fleet/agents/).
+For a repeatable local demo that exercises review, incident enrichment, approval-gated mutation, and operator event inspection, run [`examples/hero-fleet/demo.sh`](examples/hero-fleet/demo.sh).

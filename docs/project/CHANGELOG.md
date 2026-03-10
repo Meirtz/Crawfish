@@ -7,6 +7,7 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 ### Added
 
 - Rust-first Hero P0 slice with deterministic `repo.index`, deterministic-first `repo.review`, and `ci.triage`
+- deterministic `incident.enrich` with typed enrichment and summary artifacts
 - SSE MCP client support for remote tool-backed inputs
 - restart recovery with deterministic checkpoint metadata
 - local operator inspection for artifact refs, checkpoint refs, recovery stage, encounter metadata, and external refs
@@ -14,6 +15,8 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - approval-gated `workspace.patch.apply` via the new `workspace_editor` agent
 - operator control commands for `action list`, `action approve`, `action reject`, and `lease revoke`
 - runtime persistence and inspection for consent grants, capability leases, and audit receipts
+- `action events` over the local UDS API for operator timeline inspection
+- reference hero demo assets plus `examples/hero-fleet/demo.sh`
 
 ### Changed
 
@@ -21,6 +24,7 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - the runnable example under `examples/hero-fleet/` is now the reference public example, not a loose demo
 - `policy validate` is now a strict dry-run with no runtime persistence side effects
 - action phase persistence now uses canonical snake_case values such as `awaiting_approval`
+- workspace mutation now enforces workspace-scoped file locking and stable failure codes for lock, lease, approval, route, executor, and restart states
 
 ### Security
 
