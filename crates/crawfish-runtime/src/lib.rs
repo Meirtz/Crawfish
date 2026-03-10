@@ -11,9 +11,11 @@ use crawfish_core::{
     authorize_encounter, compile_execution_plan, neutral_policy, now_timestamp,
     owner_policy_for_manifest, ActionDetail, ActionEventsResponse, ActionListResponse, ActionStore,
     ActionSummary, AdminActionResponse, AgentDetail, ApproveActionRequest, CheckpointStore,
-    CrawfishConfig, DeterministicExecutor, EncounterDecision, EncounterDisposition,
-    EncounterRequest, ExecutionContractPatch, ExecutionSurface, FleetStatusResponse,
-    GovernanceContext, HealthResponse, PolicyValidationRequest, PolicyValidationResponse,
+    CompiledExecutionPlan, CrawfishConfig, DeterministicExecutor, EncounterDecision,
+    EncounterDisposition, EncounterRequest, ExecutionContractPatch, ExecutionSurface,
+    FleetStatusResponse, GovernanceContext, HealthResponse, OpenClawAgentStatusResponse,
+    OpenClawCallerContext, OpenClawInboundActionRequest, OpenClawInboundActionResponse,
+    OpenClawInspectionContext, PolicyValidationRequest, PolicyValidationResponse,
     RejectActionRequest, RevokeLeaseRequest, SubmitActionRequest, SubmittedAction,
     SupervisorControl,
 };
@@ -21,10 +23,10 @@ use crawfish_mcp::McpAdapter;
 use crawfish_store_sqlite::SqliteStore;
 use crawfish_types::{
     Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, ApprovalPolicy,
-    AuditOutcome, AuditReceipt, CapabilityDescriptor, CapabilityLease, ConsentGrant,
-    ContinuityModeName, CounterpartyRef, DegradedProfileName, DeterministicCheckpoint,
-    EncounterRecord, EncounterState, ExternalRef, HealthStatus, LifecycleRecord, Mutability,
-    TrustDomain, WorkspaceEdit, WorkspaceEditOp,
+    AuditOutcome, AuditReceipt, CallerOwnerMapping, CapabilityDescriptor, CapabilityLease,
+    CapabilityVisibility, ConsentGrant, ContinuityModeName, CounterpartyRef, DegradedProfileName,
+    DeterministicCheckpoint, EncounterRecord, EncounterState, ExternalRef, HealthStatus,
+    LifecycleRecord, Mutability, OwnerKind, OwnerRef, TrustDomain, WorkspaceEdit, WorkspaceEditOp,
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
@@ -63,6 +65,14 @@ enum RuntimeError {
 #[derive(Debug, serde::Deserialize)]
 struct ActionListQuery {
     phase: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OpenClawResolvedCaller {
+    caller_id: String,
+    counterparty: CounterpartyRef,
+    requester_id: String,
+    effective_scopes: Vec<String>,
 }
 
 impl IntoResponse for RuntimeError {
@@ -1271,6 +1281,224 @@ impl Supervisor {
         )
     }
 
+    fn resolve_openclaw_caller(
+        &self,
+        target_owner: &OwnerRef,
+        caller: &OpenClawCallerContext,
+    ) -> Result<OpenClawResolvedCaller, RuntimeError> {
+        let inbound = &self.config.openclaw.inbound;
+        if !inbound.enabled {
+            return Err(RuntimeError::Forbidden(
+                "openclaw inbound is disabled".to_string(),
+            ));
+        }
+
+        let allowed = inbound.allowed_callers.get(&caller.caller_id);
+        let (owner, trust_domain, allowed_scopes) = match (allowed, &inbound.caller_owner_mapping) {
+            (Some(configured), _) => {
+                let owner = OwnerRef {
+                    kind: configured.owner_kind.clone(),
+                    id: configured.owner_id.clone(),
+                    display_name: configured.display_name.clone(),
+                };
+                let trust_domain = configured.trust_domain.clone().unwrap_or_else(|| {
+                    if owner == *target_owner {
+                        TrustDomain::SameOwnerLocal
+                    } else {
+                        inbound.default_trust_domain.clone()
+                    }
+                });
+                (owner, trust_domain, configured.allowed_scopes.clone())
+            }
+            (None, CallerOwnerMapping::Required) => {
+                return Err(RuntimeError::Forbidden(format!(
+                    "openclaw caller is not mapped: {}",
+                    caller.caller_id
+                )));
+            }
+            (None, CallerOwnerMapping::BestEffort) => (
+                OwnerRef {
+                    kind: OwnerKind::ServiceAccount,
+                    id: caller.caller_id.clone(),
+                    display_name: caller.display_name.clone(),
+                },
+                inbound.default_trust_domain.clone(),
+                Vec::new(),
+            ),
+        };
+
+        if !allowed_scopes.is_empty()
+            && caller
+                .scopes
+                .iter()
+                .any(|scope| !allowed_scopes.iter().any(|allowed| allowed == scope))
+        {
+            return Err(RuntimeError::Forbidden(format!(
+                "openclaw caller requested scopes outside its allowlist: {}",
+                caller.caller_id
+            )));
+        }
+
+        Ok(OpenClawResolvedCaller {
+            caller_id: caller.caller_id.clone(),
+            counterparty: CounterpartyRef {
+                agent_id: None,
+                session_id: Some(caller.session_id.clone()),
+                owner,
+                trust_domain,
+            },
+            requester_id: caller.session_id.clone(),
+            effective_scopes: caller.scopes.clone(),
+        })
+    }
+
+    fn openclaw_external_refs(
+        &self,
+        caller: &OpenClawCallerContext,
+        effective_scopes: &[String],
+    ) -> Vec<ExternalRef> {
+        let mut refs = vec![
+            ExternalRef {
+                kind: "openclaw.caller_id".to_string(),
+                value: caller.caller_id.clone(),
+                endpoint: None,
+            },
+            ExternalRef {
+                kind: "openclaw.session_id".to_string(),
+                value: caller.session_id.clone(),
+                endpoint: None,
+            },
+            ExternalRef {
+                kind: "openclaw.channel_id".to_string(),
+                value: caller.channel_id.clone(),
+                endpoint: None,
+            },
+        ];
+
+        if let Some(workspace_root) = &caller.workspace_root {
+            refs.push(ExternalRef {
+                kind: "openclaw.workspace_root".to_string(),
+                value: workspace_root.clone(),
+                endpoint: None,
+            });
+        }
+
+        refs.extend(effective_scopes.iter().cloned().map(|scope| ExternalRef {
+            kind: "openclaw.scope".to_string(),
+            value: scope,
+            endpoint: None,
+        }));
+
+        refs.extend(caller.trace_ids.iter().map(|(key, value)| ExternalRef {
+            kind: format!("openclaw.trace.{key}"),
+            value: value.to_string(),
+            endpoint: None,
+        }));
+
+        refs
+    }
+
+    fn action_visible_to_openclaw(&self, caller: &OpenClawResolvedCaller, action: &Action) -> bool {
+        if action.initiator_owner == caller.counterparty.owner {
+            return true;
+        }
+
+        if action.requester.id == caller.requester_id {
+            return true;
+        }
+
+        if action.counterparty_refs.iter().any(|counterparty| {
+            counterparty.owner == caller.counterparty.owner
+                && counterparty.session_id.as_deref() == caller.counterparty.session_id.as_deref()
+        }) {
+            return true;
+        }
+
+        action.external_refs.iter().any(|reference| {
+            (reference.kind == "openclaw.caller_id" && reference.value == caller.caller_id)
+                || (reference.kind == "openclaw.session_id"
+                    && Some(reference.value.as_str()) == caller.counterparty.session_id.as_deref())
+        })
+    }
+
+    fn agent_visible_to_openclaw(
+        &self,
+        caller: &OpenClawResolvedCaller,
+        manifest: &AgentManifest,
+    ) -> bool {
+        if manifest.owner == caller.counterparty.owner {
+            return true;
+        }
+
+        !matches!(
+            owner_policy_for_manifest(manifest).capability_visibility,
+            CapabilityVisibility::Private | CapabilityVisibility::OwnerOnly
+        )
+    }
+
+    async fn preflight_submission(
+        &self,
+        request: &SubmitActionRequest,
+    ) -> anyhow::Result<(
+        AgentManifest,
+        CompiledExecutionPlan,
+        EncounterRequest,
+        EncounterDecision,
+        bool,
+    )> {
+        let manifest = self
+            .store
+            .get_agent_manifest(&request.target_agent_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("agent not found: {}", request.target_agent_id))?;
+        self.validate_submit_action_request(&manifest, request)?;
+
+        let compiled = compile_execution_plan(
+            &self.config.contracts.org_defaults,
+            &manifest.contract_defaults,
+            &request.contract_overrides.clone().unwrap_or_default(),
+            &manifest.strategy_defaults,
+            &request.capability,
+            request.execution_strategy.clone(),
+        )
+        .map_err(|error| anyhow::anyhow!("invalid action request: {error}"))?;
+
+        let caller = request
+            .counterparty_refs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| CounterpartyRef {
+                agent_id: None,
+                session_id: Some("local".to_string()),
+                owner: request.initiator_owner.clone(),
+                trust_domain: TrustDomain::SameOwnerLocal,
+            });
+        let encounter_request = EncounterRequest {
+            caller,
+            target_agent_id: request.target_agent_id.clone(),
+            target_owner: manifest.owner.clone(),
+            requested_capabilities: vec![request.capability.clone()],
+            requests_workspace_write: request.workspace_write,
+            requests_secret_access: request.secret_access,
+            requests_mutating_capability: request.mutating,
+        };
+        let decision = self.authorize(&manifest, &encounter_request);
+        let requires_approval = self.action_requires_approval(
+            request,
+            &manifest,
+            &request.capability,
+            &compiled.contract.safety.approval_policy,
+        );
+
+        Ok((
+            manifest,
+            compiled,
+            encounter_request,
+            decision,
+            requires_approval,
+        ))
+    }
+
     fn action_requires_approval(
         &self,
         request: &SubmitActionRequest,
@@ -1595,6 +1823,175 @@ impl Supervisor {
         }
         Ok(())
     }
+
+    async fn submit_openclaw_action(
+        &self,
+        request: OpenClawInboundActionRequest,
+    ) -> Result<OpenClawInboundActionResponse, RuntimeError> {
+        let manifest = self
+            .store
+            .get_agent_manifest(&request.target_agent_id)
+            .await
+            .map_err(RuntimeError::Internal)?
+            .ok_or_else(|| {
+                RuntimeError::NotFound(format!("agent not found: {}", request.target_agent_id))
+            })?;
+        let caller = self.resolve_openclaw_caller(&manifest.owner, &request.caller)?;
+
+        let mut inputs = request.inputs;
+        if let Some(workspace_root) = &request.caller.workspace_root {
+            inputs
+                .entry("workspace_root".to_string())
+                .or_insert_with(|| Value::String(workspace_root.clone()));
+        }
+
+        let submit_request = SubmitActionRequest {
+            target_agent_id: request.target_agent_id,
+            requester: crawfish_types::RequesterRef {
+                kind: crawfish_types::RequesterKind::Session,
+                id: caller.requester_id.clone(),
+            },
+            initiator_owner: caller.counterparty.owner.clone(),
+            capability: request.capability,
+            goal: request.goal,
+            inputs,
+            contract_overrides: request.contract_overrides,
+            execution_strategy: request.execution_strategy,
+            schedule: request.schedule,
+            counterparty_refs: vec![caller.counterparty.clone()],
+            data_boundary: request.data_boundary,
+            workspace_write: request.workspace_write,
+            secret_access: request.secret_access,
+            mutating: request.mutating,
+        };
+
+        let (_, _, _, decision, _) = self
+            .preflight_submission(&submit_request)
+            .await
+            .map_err(map_submit_error)?;
+        if matches!(decision.disposition, EncounterDisposition::Deny) {
+            return Err(RuntimeError::Forbidden(decision.reason));
+        }
+
+        let submitted = self
+            .submit_action(submit_request)
+            .await
+            .map_err(map_submit_error)?;
+        let mut action = self
+            .store
+            .get_action(&submitted.action_id)
+            .await
+            .map_err(RuntimeError::Internal)?
+            .ok_or_else(|| {
+                RuntimeError::NotFound(format!("action not found: {}", submitted.action_id))
+            })?;
+        let trace_refs = self.openclaw_external_refs(&request.caller, &caller.effective_scopes);
+        action.external_refs.extend(trace_refs.clone());
+        self.store
+            .upsert_action(&action)
+            .await
+            .map_err(RuntimeError::Internal)?;
+        self.store
+            .append_action_event(
+                &action.id,
+                "openclaw_inbound",
+                serde_json::json!({
+                    "caller_id": request.caller.caller_id,
+                    "session_id": request.caller.session_id,
+                    "channel_id": request.caller.channel_id,
+                    "scopes": caller.effective_scopes,
+                    "trace_ids": request.caller.trace_ids,
+                }),
+            )
+            .await
+            .map_err(RuntimeError::Internal)?;
+
+        Ok(OpenClawInboundActionResponse {
+            action_id: action.id,
+            phase: submitted.phase,
+            requester_id: caller.requester_id,
+            trace_refs,
+        })
+    }
+
+    async fn inspect_openclaw_action(
+        &self,
+        action_id: &str,
+        context: OpenClawInspectionContext,
+    ) -> Result<ActionDetail, RuntimeError> {
+        let action = self
+            .store
+            .get_action(action_id)
+            .await
+            .map_err(RuntimeError::Internal)?
+            .ok_or_else(|| RuntimeError::NotFound(format!("action not found: {action_id}")))?;
+        let caller = self.resolve_openclaw_caller(&action.initiator_owner, &context.caller)?;
+        if !self.action_visible_to_openclaw(&caller, &action) {
+            return Err(RuntimeError::Forbidden(format!(
+                "openclaw caller cannot inspect action: {action_id}"
+            )));
+        }
+
+        self.inspect_action(action_id)
+            .await
+            .map_err(RuntimeError::Internal)?
+            .ok_or_else(|| RuntimeError::NotFound(format!("action not found: {action_id}")))
+    }
+
+    async fn list_openclaw_action_events(
+        &self,
+        action_id: &str,
+        context: OpenClawInspectionContext,
+    ) -> Result<ActionEventsResponse, RuntimeError> {
+        self.inspect_openclaw_action(action_id, context).await?;
+        self.list_action_events(action_id)
+            .await
+            .map_err(RuntimeError::Internal)
+    }
+
+    async fn inspect_openclaw_agent_status(
+        &self,
+        agent_id: &str,
+        context: OpenClawInspectionContext,
+    ) -> Result<OpenClawAgentStatusResponse, RuntimeError> {
+        let manifest = self
+            .store
+            .get_agent_manifest(agent_id)
+            .await
+            .map_err(RuntimeError::Internal)?
+            .ok_or_else(|| RuntimeError::NotFound(format!("agent not found: {agent_id}")))?;
+        let caller = self.resolve_openclaw_caller(&manifest.owner, &context.caller)?;
+        if !self.agent_visible_to_openclaw(&caller, &manifest) {
+            return Err(RuntimeError::Forbidden(format!(
+                "openclaw caller cannot inspect agent: {agent_id}"
+            )));
+        }
+        let detail = self
+            .inspect_agent(agent_id)
+            .await
+            .map_err(RuntimeError::Internal)?
+            .ok_or_else(|| RuntimeError::NotFound(format!("agent not found: {agent_id}")))?;
+        Ok(OpenClawAgentStatusResponse {
+            agent_id: detail.lifecycle.agent_id,
+            desired_state: agent_state_name(&detail.lifecycle.desired_state).to_string(),
+            observed_state: agent_state_name(&detail.lifecycle.observed_state).to_string(),
+            health: health_status_name(&detail.lifecycle.health).to_string(),
+            transition_reason: detail.lifecycle.transition_reason,
+            last_transition_at: detail.lifecycle.last_transition_at,
+            degradation_profile: detail
+                .lifecycle
+                .degradation_profile
+                .as_ref()
+                .map(degraded_profile_name)
+                .map(str::to_string),
+            continuity_mode: detail
+                .lifecycle
+                .continuity_mode
+                .as_ref()
+                .map(continuity_mode_name)
+                .map(str::to_string),
+        })
+    }
 }
 
 fn build_checkpoint(
@@ -1840,6 +2237,47 @@ fn action_phase_name(phase: &ActionPhase) -> &'static str {
     }
 }
 
+fn agent_state_name(state: &AgentState) -> &'static str {
+    match state {
+        AgentState::Unconfigured => "unconfigured",
+        AgentState::Configuring => "configuring",
+        AgentState::Inactive => "inactive",
+        AgentState::Activating => "activating",
+        AgentState::Active => "active",
+        AgentState::Degraded => "degraded",
+        AgentState::Draining => "draining",
+        AgentState::Failed => "failed",
+        AgentState::Finalized => "finalized",
+    }
+}
+
+fn health_status_name(status: &HealthStatus) -> &'static str {
+    match status {
+        HealthStatus::Unknown => "unknown",
+        HealthStatus::Healthy => "healthy",
+        HealthStatus::Degraded => "degraded",
+        HealthStatus::Unhealthy => "unhealthy",
+    }
+}
+
+fn degraded_profile_name(profile: &DegradedProfileName) -> &'static str {
+    match profile {
+        DegradedProfileName::ReadOnly => "read_only",
+        DegradedProfileName::DependencyIsolation => "dependency_isolation",
+        DegradedProfileName::BudgetGuard => "budget_guard",
+        DegradedProfileName::ProviderFailover => "provider_failover",
+    }
+}
+
+fn continuity_mode_name(mode: &ContinuityModeName) -> &'static str {
+    match mode {
+        ContinuityModeName::DeterministicOnly => "deterministic_only",
+        ContinuityModeName::StoreAndForward => "store_and_forward",
+        ContinuityModeName::HumanHandoff => "human_handoff",
+        ContinuityModeName::Suspended => "suspended",
+    }
+}
+
 #[async_trait::async_trait]
 impl SupervisorControl for Supervisor {
     async fn list_status(&self) -> anyhow::Result<FleetStatusResponse> {
@@ -1928,49 +2366,8 @@ impl SupervisorControl for Supervisor {
     }
 
     async fn submit_action(&self, request: SubmitActionRequest) -> anyhow::Result<SubmittedAction> {
-        let manifest = self
-            .store
-            .get_agent_manifest(&request.target_agent_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("agent not found: {}", request.target_agent_id))?;
-        self.validate_submit_action_request(&manifest, &request)?;
-
-        let compiled = compile_execution_plan(
-            &self.config.contracts.org_defaults,
-            &manifest.contract_defaults,
-            &request.contract_overrides.clone().unwrap_or_default(),
-            &manifest.strategy_defaults,
-            &request.capability,
-            request.execution_strategy.clone(),
-        )
-        .map_err(|error| anyhow::anyhow!("invalid action request: {error}"))?;
-
-        let caller = request
-            .counterparty_refs
-            .first()
-            .cloned()
-            .unwrap_or_else(|| CounterpartyRef {
-                agent_id: None,
-                session_id: Some("local".to_string()),
-                owner: request.initiator_owner.clone(),
-                trust_domain: TrustDomain::SameOwnerLocal,
-            });
-        let encounter_request = EncounterRequest {
-            caller,
-            target_agent_id: request.target_agent_id.clone(),
-            target_owner: manifest.owner.clone(),
-            requested_capabilities: vec![request.capability.clone()],
-            requests_workspace_write: request.workspace_write,
-            requests_secret_access: request.secret_access,
-            requests_mutating_capability: request.mutating,
-        };
-        let decision = self.authorize(&manifest, &encounter_request);
-        let requires_approval = self.action_requires_approval(
-            &request,
-            &manifest,
-            &request.capability,
-            &compiled.contract.safety.approval_policy,
-        );
+        let (manifest, compiled, encounter_request, decision, requires_approval) =
+            self.preflight_submission(&request).await?;
         let encounter_state = if matches!(decision.disposition, EncounterDisposition::Deny) {
             EncounterState::Denied
         } else if requires_approval
@@ -1980,23 +2377,12 @@ impl SupervisorControl for Supervisor {
         } else {
             EncounterState::Leased
         };
+        if matches!(decision.disposition, EncounterDisposition::Deny) {
+            anyhow::bail!(decision.reason);
+        }
         let mut encounter = self
             .create_encounter(&manifest, &encounter_request, &decision, encounter_state)
             .await?;
-        if matches!(decision.disposition, EncounterDisposition::Deny) {
-            let receipt = self
-                .emit_audit_receipt(
-                    &encounter.id,
-                    Vec::new(),
-                    None,
-                    AuditOutcome::Denied,
-                    decision.reason.clone(),
-                    None,
-                )
-                .await?;
-            let _ = receipt;
-            anyhow::bail!(decision.reason);
-        }
 
         let created_at = now_timestamp();
         let encounter_id = encounter.id.clone();
@@ -2404,6 +2790,22 @@ fn api_router(supervisor: Arc<Supervisor>) -> Router {
         .route("/v1/actions/{id}/approve", post(approve_action_handler))
         .route("/v1/actions/{id}/reject", post(reject_action_handler))
         .route("/v1/leases/{id}/revoke", post(revoke_lease_handler))
+        .route(
+            "/v1/inbound/openclaw/actions",
+            post(openclaw_submit_action_handler),
+        )
+        .route(
+            "/v1/inbound/openclaw/actions/{id}/inspect",
+            post(openclaw_action_detail_handler),
+        )
+        .route(
+            "/v1/inbound/openclaw/actions/{id}/events",
+            post(openclaw_action_events_handler),
+        )
+        .route(
+            "/v1/inbound/openclaw/agents/{id}/status",
+            post(openclaw_agent_status_handler),
+        )
         .route("/v1/admin/drain", post(drain_handler))
         .route("/v1/admin/resume", post(resume_handler))
         .route("/v1/policy/validate", post(policy_validate_handler))
@@ -2498,19 +2900,48 @@ async fn submit_action_handler(
 ) -> Result<Json<SubmittedAction>, RuntimeError> {
     match supervisor.submit_action(request).await {
         Ok(submitted) => Ok(Json(submitted)),
-        Err(error) => {
-            let message = error.to_string();
-            if message.starts_with("agent not found:") {
-                Err(RuntimeError::NotFound(message))
-            } else if message.starts_with("invalid action request:") {
-                Err(RuntimeError::BadRequest(message))
-            } else if message.contains("denied") || message.contains("consent") {
-                Err(RuntimeError::Forbidden(message))
-            } else {
-                Err(RuntimeError::Internal(error))
-            }
-        }
+        Err(error) => Err(map_submit_error(error)),
     }
+}
+
+async fn openclaw_submit_action_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    Json(request): Json<OpenClawInboundActionRequest>,
+) -> Result<Json<OpenClawInboundActionResponse>, RuntimeError> {
+    supervisor.submit_openclaw_action(request).await.map(Json)
+}
+
+async fn openclaw_action_detail_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+    Json(context): Json<OpenClawInspectionContext>,
+) -> Result<Json<ActionDetail>, RuntimeError> {
+    supervisor
+        .inspect_openclaw_action(&id, context)
+        .await
+        .map(Json)
+}
+
+async fn openclaw_action_events_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+    Json(context): Json<OpenClawInspectionContext>,
+) -> Result<Json<ActionEventsResponse>, RuntimeError> {
+    supervisor
+        .list_openclaw_action_events(&id, context)
+        .await
+        .map(Json)
+}
+
+async fn openclaw_agent_status_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+    Json(context): Json<OpenClawInspectionContext>,
+) -> Result<Json<OpenClawAgentStatusResponse>, RuntimeError> {
+    supervisor
+        .inspect_openclaw_agent_status(&id, context)
+        .await
+        .map(Json)
 }
 
 async fn approve_action_handler(
@@ -2601,6 +3032,19 @@ fn error_body(message: String) -> serde_json::Value {
     serde_json::json!({ "error": message })
 }
 
+fn map_submit_error(error: anyhow::Error) -> RuntimeError {
+    let message = error.to_string();
+    if message.starts_with("agent not found:") {
+        RuntimeError::NotFound(message)
+    } else if message.starts_with("invalid action request:") {
+        RuntimeError::BadRequest(message)
+    } else if message.contains("denied") || message.contains("consent") {
+        RuntimeError::Forbidden(message)
+    } else {
+        RuntimeError::Internal(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2679,6 +3123,14 @@ mod tests {
         build_supervisor_with_config(dir, config).await
     }
 
+    async fn build_supervisor_with_openclaw(dir: &Path) -> anyhow::Result<Arc<Supervisor>> {
+        let config = format!(
+            "{}\n[openclaw.inbound]\nenabled = true\ncaller_owner_mapping = \"required\"\ndefault_trust_domain = \"same_device_foreign_owner\"\n\n[openclaw.inbound.allowed_callers.local_gateway]\nowner_kind = \"human\"\nowner_id = \"local-dev\"\ndisplay_name = \"Local Gateway\"\nallowed_scopes = [\"crawfish.read\", \"crawfish.submit\"]\n\n[openclaw.inbound.allowed_callers.foreign_gateway]\nowner_kind = \"human\"\nowner_id = \"foreign-owner\"\ndisplay_name = \"Foreign Gateway\"\nallowed_scopes = [\"crawfish.read\", \"crawfish.submit\"]\n",
+            include_str!("../../../examples/hero-fleet/Crawfish.toml"),
+        );
+        build_supervisor_with_config(dir, config).await
+    }
+
     fn local_owner(id: &str) -> crawfish_types::OwnerRef {
         crawfish_types::OwnerRef {
             kind: crawfish_types::OwnerKind::Human,
@@ -2728,6 +3180,56 @@ mod tests {
             secret_access: false,
             mutating: true,
         }
+    }
+
+    fn openclaw_caller(caller_id: &str) -> OpenClawCallerContext {
+        OpenClawCallerContext {
+            caller_id: caller_id.to_string(),
+            session_id: format!("{caller_id}-session"),
+            channel_id: "gateway".to_string(),
+            workspace_root: None,
+            scopes: vec!["crawfish.read".to_string(), "crawfish.submit".to_string()],
+            display_name: None,
+            trace_ids: crawfish_types::Metadata::default(),
+        }
+    }
+
+    async fn spawn_api_server(
+        supervisor: Arc<Supervisor>,
+    ) -> (tokio::task::JoinHandle<()>, PathBuf) {
+        let socket_path = supervisor.config().socket_path(supervisor.root());
+        if let Some(parent) = socket_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        if socket_path.exists() {
+            tokio::fs::remove_file(&socket_path).await.unwrap();
+        }
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let app = api_router(Arc::clone(&supervisor));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (handle, socket_path)
+    }
+
+    async fn post_uds_json<T: serde::Serialize>(
+        socket_path: &Path,
+        endpoint: &str,
+        payload: &T,
+    ) -> (StatusCode, Value) {
+        let client: Client<hyperlocal::UnixConnector, Full<Bytes>> = Client::unix();
+        let uri: Uri = hyperlocal::Uri::new(socket_path, endpoint).into();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(serde_json::to_vec(payload).unwrap())))
+            .unwrap();
+        let response = client.request(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&body).unwrap();
+        (status, json)
     }
 
     #[derive(Clone)]
@@ -3837,6 +4339,249 @@ depends_on = []
         assert_eq!(detail.action.phase, ActionPhase::Failed);
         assert_eq!(detail.terminal_code.as_deref(), Some("lease_expired"));
         assert!(!dir.path().join("expired-lease.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn openclaw_inbound_submit_inspect_and_events_work_for_mapped_caller() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor_with_openclaw(dir.path()).await.unwrap();
+        let (handle, socket_path) = spawn_api_server(Arc::clone(&supervisor)).await;
+
+        let submit_request = OpenClawInboundActionRequest {
+            caller: OpenClawCallerContext {
+                workspace_root: Some(dir.path().display().to_string()),
+                ..openclaw_caller("local_gateway")
+            },
+            target_agent_id: "repo_reviewer".to_string(),
+            capability: "repo.review".to_string(),
+            goal: crawfish_types::GoalSpec {
+                summary: "review from openclaw".to_string(),
+                details: None,
+            },
+            inputs: std::collections::BTreeMap::from([(
+                "changed_files".to_string(),
+                serde_json::json!(["src/lib.rs"]),
+            )]),
+            contract_overrides: None,
+            execution_strategy: None,
+            schedule: None,
+            data_boundary: None,
+            workspace_write: false,
+            secret_access: false,
+            mutating: false,
+        };
+
+        let (status, submitted) = post_uds_json(
+            &socket_path,
+            "/v1/inbound/openclaw/actions",
+            &submit_request,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let action_id = submitted["action_id"].as_str().unwrap().to_string();
+
+        let (status, inspected) = post_uds_json(
+            &socket_path,
+            &format!("/v1/inbound/openclaw/actions/{action_id}/inspect"),
+            &OpenClawInspectionContext {
+                caller: openclaw_caller("local_gateway"),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(inspected["action"]["id"], action_id);
+        assert!(inspected["external_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reference| reference["kind"] == "openclaw.session_id"));
+
+        let (status, events) = post_uds_json(
+            &socket_path,
+            &format!("/v1/inbound/openclaw/actions/{action_id}/events"),
+            &OpenClawInspectionContext {
+                caller: openclaw_caller("local_gateway"),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_type"] == "openclaw_inbound"));
+
+        let (status, agent_status) = post_uds_json(
+            &socket_path,
+            "/v1/inbound/openclaw/agents/repo_reviewer/status",
+            &OpenClawInspectionContext {
+                caller: openclaw_caller("local_gateway"),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(agent_status["agent_id"], "repo_reviewer");
+        assert_eq!(agent_status["observed_state"], "active");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn openclaw_inbound_rejects_unmapped_caller_before_action_creation() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor_with_openclaw(dir.path()).await.unwrap();
+        let (handle, socket_path) = spawn_api_server(Arc::clone(&supervisor)).await;
+
+        let submit_request = OpenClawInboundActionRequest {
+            caller: OpenClawCallerContext {
+                workspace_root: Some(dir.path().display().to_string()),
+                ..openclaw_caller("unknown_gateway")
+            },
+            target_agent_id: "repo_reviewer".to_string(),
+            capability: "repo.review".to_string(),
+            goal: crawfish_types::GoalSpec {
+                summary: "review from unknown gateway".to_string(),
+                details: None,
+            },
+            inputs: std::collections::BTreeMap::from([(
+                "changed_files".to_string(),
+                serde_json::json!(["src/lib.rs"]),
+            )]),
+            contract_overrides: None,
+            execution_strategy: None,
+            schedule: None,
+            data_boundary: None,
+            workspace_write: false,
+            secret_access: false,
+            mutating: false,
+        };
+
+        let (status, body) = post_uds_json(
+            &socket_path,
+            "/v1/inbound/openclaw/actions",
+            &submit_request,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("not mapped"));
+        assert!(supervisor
+            .store()
+            .list_actions_by_phase(None)
+            .await
+            .unwrap()
+            .is_empty());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn openclaw_inbound_denies_foreign_owner_mutation() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor_with_openclaw(dir.path()).await.unwrap();
+        let (handle, socket_path) = spawn_api_server(Arc::clone(&supervisor)).await;
+
+        let submit_request = OpenClawInboundActionRequest {
+            caller: OpenClawCallerContext {
+                workspace_root: Some(dir.path().display().to_string()),
+                ..openclaw_caller("foreign_gateway")
+            },
+            target_agent_id: "workspace_editor".to_string(),
+            capability: "workspace.patch.apply".to_string(),
+            goal: crawfish_types::GoalSpec {
+                summary: "foreign patch attempt".to_string(),
+                details: None,
+            },
+            inputs: std::collections::BTreeMap::from([(
+                "edits".to_string(),
+                serde_json::json!([{ "path": "denied.txt", "op": "create", "contents": "nope\n" }]),
+            )]),
+            contract_overrides: None,
+            execution_strategy: None,
+            schedule: None,
+            data_boundary: None,
+            workspace_write: true,
+            secret_access: false,
+            mutating: true,
+        };
+
+        let (status, body) = post_uds_json(
+            &socket_path,
+            "/v1/inbound/openclaw/actions",
+            &submit_request,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("denied"));
+        assert!(supervisor
+            .store()
+            .list_actions_by_phase(None)
+            .await
+            .unwrap()
+            .is_empty());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn openclaw_inbound_blocks_foreign_action_inspection() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor_with_openclaw(dir.path()).await.unwrap();
+        let submitted = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "repo_reviewer".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: local_owner("local-dev"),
+                capability: "repo.review".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "local review".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([
+                    (
+                        "workspace_root".to_string(),
+                        serde_json::json!(dir.path().display().to_string()),
+                    ),
+                    (
+                        "changed_files".to_string(),
+                        serde_json::json!(["src/lib.rs"]),
+                    ),
+                ]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: vec![CounterpartyRef {
+                    agent_id: None,
+                    session_id: Some("local-session".to_string()),
+                    owner: local_owner("local-dev"),
+                    trust_domain: TrustDomain::SameOwnerLocal,
+                }],
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .unwrap();
+        let (handle, socket_path) = spawn_api_server(Arc::clone(&supervisor)).await;
+
+        let (status, body) = post_uds_json(
+            &socket_path,
+            &format!(
+                "/v1/inbound/openclaw/actions/{}/inspect",
+                submitted.action_id
+            ),
+            &OpenClawInspectionContext {
+                caller: openclaw_caller("foreign_gateway"),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("cannot inspect"));
+
+        handle.abort();
     }
 
     #[tokio::test]

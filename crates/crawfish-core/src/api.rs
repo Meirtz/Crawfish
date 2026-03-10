@@ -131,6 +131,74 @@ pub struct SubmittedAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenClawCallerContext {
+    pub caller_id: String,
+    pub session_id: String,
+    pub channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub trace_ids: Metadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenClawInboundActionRequest {
+    pub caller: OpenClawCallerContext,
+    pub target_agent_id: String,
+    pub capability: String,
+    pub goal: GoalSpec,
+    #[serde(default)]
+    pub inputs: Metadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_overrides: Option<ExecutionContractPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_strategy: Option<ExecutionStrategy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_boundary: Option<String>,
+    #[serde(default)]
+    pub workspace_write: bool,
+    #[serde(default)]
+    pub secret_access: bool,
+    #[serde(default)]
+    pub mutating: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenClawInboundActionResponse {
+    pub action_id: String,
+    pub phase: String,
+    pub requester_id: String,
+    #[serde(default)]
+    pub trace_refs: Vec<ExternalRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenClawInspectionContext {
+    pub caller: OpenClawCallerContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenClawAgentStatusResponse {
+    pub agent_id: String,
+    pub desired_state: String,
+    pub observed_state: String,
+    pub health: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_reason: Option<String>,
+    pub last_transition_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApproveActionRequest {
     pub approver_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

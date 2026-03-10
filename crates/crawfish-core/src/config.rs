@@ -1,7 +1,7 @@
 use crawfish_types::{
-    CapabilityVisibility, DataBoundaryPolicy, DefaultDisposition, EncounterPolicy,
-    ExecutionContract, McpServerConfig, NetworkBoundaryPolicy, ToolBoundaryPolicy,
-    WorkspaceBoundaryPolicy,
+    CallerOwnerMapping, CapabilityVisibility, DataBoundaryPolicy, DefaultDisposition,
+    EncounterPolicy, ExecutionContract, McpServerConfig, NetworkBoundaryPolicy, OwnerKind,
+    ToolBoundaryPolicy, TrustDomain, WorkspaceBoundaryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -33,6 +33,47 @@ pub struct McpConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenClawAllowedCallerConfig {
+    pub owner_kind: OwnerKind,
+    pub owner_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_domain: Option<TrustDomain>,
+    #[serde(default)]
+    pub allowed_scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenClawInboundConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub caller_owner_mapping: CallerOwnerMapping,
+    #[serde(default = "default_openclaw_trust_domain")]
+    pub default_trust_domain: TrustDomain,
+    #[serde(default)]
+    pub allowed_callers: BTreeMap<String, OpenClawAllowedCallerConfig>,
+}
+
+impl Default for OpenClawInboundConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            caller_owner_mapping: CallerOwnerMapping::Required,
+            default_trust_domain: default_openclaw_trust_domain(),
+            allowed_callers: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct OpenClawConfig {
+    #[serde(default)]
+    pub inbound: OpenClawInboundConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GovernanceConfig {
     #[serde(default = "default_system_encounter_policy")]
     pub system_defaults: EncounterPolicy,
@@ -57,6 +98,8 @@ pub struct CrawfishConfig {
     pub api: ApiConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub openclaw: OpenClawConfig,
     #[serde(default)]
     pub contracts: ContractDefaultsConfig,
     #[serde(default)]
@@ -95,6 +138,10 @@ fn default_reconcile_interval_ms() -> u64 {
 
 fn default_socket_path() -> PathBuf {
     PathBuf::from(".crawfish/run/crawfishd.sock")
+}
+
+fn default_openclaw_trust_domain() -> TrustDomain {
+    TrustDomain::SameDeviceForeignOwner
 }
 
 fn default_system_encounter_policy() -> EncounterPolicy {
@@ -150,6 +197,7 @@ mod tests {
                 socket_path: PathBuf::from(".crawfish/run/crawfishd.sock"),
             },
             mcp: McpConfig::default(),
+            openclaw: OpenClawConfig::default(),
             contracts: ContractDefaultsConfig::default(),
             governance: GovernanceConfig::default(),
             runtime: RuntimeConfig::default(),
