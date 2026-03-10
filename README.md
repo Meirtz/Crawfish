@@ -83,10 +83,11 @@ The current alpha is not a mock architecture. It runs.
 
 ### Harness Paths
 
+- **Local-first harness routing**: `task.plan` now prefers local Claude Code and Codex wrappers before any remote harness route
 - **OpenClaw inbound**: a thin Gateway RPC bridge can submit and inspect Crawfish work without becoming a second policy engine
-- **OpenClaw outbound**: `task.plan` can route out through OpenClaw as a proposal-only execution surface
-- **Deterministic fallback**: if OpenClaw is unavailable, `task.plan` can degrade into local planning when the compiled contract allows it
-- **Verified execution strategy**: `task.plan` now supports `verify_loop`, so OpenClaw and deterministic fallback are both forced through the same deterministic verifier
+- **OpenClaw outbound**: `task.plan` can still route out through OpenClaw as a proposal-only execution surface when local harnesses are absent or unsuitable
+- **Deterministic fallback**: if no approved harness route is available, `task.plan` can degrade into local planning when the compiled contract allows it
+- **Verified execution strategy**: local wrappers, OpenClaw, and deterministic fallback are all forced through the same deterministic verifier
 
 ## Verified Execution Strategies
 
@@ -99,6 +100,13 @@ For `task.plan`, Crawfish now does this:
 3. Deterministically verify the result.
 4. Feed structured verification failures back into the next attempt.
 5. Stop on success, human handoff, or budget exhaustion.
+
+Today that surface can be:
+
+- a local Claude Code process
+- a local Codex process
+- an OpenClaw outbound run
+- a deterministic fallback planner
 
 This is where the project starts to look beyond the current generation of agent demos.  
 Reasoning quality will keep changing. Verification and control have to outlive that churn.
@@ -144,13 +152,15 @@ cargo run -p crawfish-cli --bin crawfish -- action submit \
   --inputs-json '{
     "workspace_root": ".",
     "objective": "Plan a safe rollout for repo indexing validation",
-    "files_of_interest": ["src/lib.rs"],
+    "context_files": ["src/lib.rs"],
     "desired_outputs": ["rollout checklist"]
   }' \
   --json
 ```
 
 For the full reference walkthrough, run [`examples/hero-swarm/demo.sh`](examples/hero-swarm/demo.sh).
+
+If `claude` or `codex` is installed locally, `task_planner` will prefer those harnesses first. If neither local wrapper is available, Crawfish falls back to OpenClaw when configured, then to deterministic planning when the contract allows it.
 
 ## Public Status
 

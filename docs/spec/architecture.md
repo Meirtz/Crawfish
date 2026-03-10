@@ -221,6 +221,7 @@ type LifecyclePolicy = {
 
 type AdapterBinding =
   | McpToolBinding
+  | LocalHarnessBinding
   | OpenClawBinding
   | AcpHarnessBinding
   | A2ARemoteAgentBinding;
@@ -229,6 +230,19 @@ type McpToolBinding = {
   adapter: "mcp";
   capability: string;
   default_scope: string[];
+};
+
+type LocalHarnessBinding = {
+  adapter: "local_harness";
+  capability: string;
+  harness: "claude_code" | "codex";
+  command: string;
+  args: string[];
+  required_scopes: string[];
+  lease_required: boolean;
+  workspace_policy: "inherit" | "crawfish_managed";
+  env_allowlist: string[];
+  timeout_seconds: number;
 };
 
 type OpenClawBinding = {
@@ -615,6 +629,7 @@ Every execution surface must produce or map to a `CapabilityDescriptor`. Crawfis
 - `executor_class` indicates whether the capability can survive major reasoning outages
 - exposed capability does not mean ambient accessibility; encounter policy still governs discoverability and leaseability
 - OpenClaw gateway agents are treated as harness execution surfaces rather than as control-plane peers
+- local CLI-backed wrappers such as Claude Code and Codex are also treated as harness execution surfaces rather than privileged runtime components
 - ACP-compatible harnesses are normalized as execution surfaces, not as generic tools; they may expose session semantics, permission prompts, and richer cancellation behavior than MCP tools
 
 ## Protocol Planes
@@ -623,6 +638,8 @@ Every execution surface must produce or map to a `CapabilityDescriptor`. Crawfis
 | --- | --- | --- |
 | tool plane | MCP | connect tools and services into the runtime |
 | harness plane | OpenClaw Gateway plus ACP-compatible adapters | invoke specialized execution harnesses for planning, research, operations, investigation, or coding |
+
+`P1e` adds a native local harness sub-surface inside the harness plane. Claude Code and Codex are wrapped as per-action ephemeral subprocesses under Rust control, with allowlisted environment propagation, workspace inheritance rules, and normalized event and failure reporting.
 | agent plane | A2A | delegate work to remote agent systems |
 
 The harness plane matters because a specialized agent harness is neither just a tool nor just a remote agent. It has richer session semantics, permission prompts, workspace expectations, and cancellation behavior. Crawfish should treat that difference explicitly. See [OpenClaw's Agent Loop](https://docs.openclaw.ai/concepts/agent-loop), [OpenClaw Gateway protocol](https://docs.openclaw.ai/gateway/protocol), [ACP at Zed](https://zed.dev/acp), and the [Agent Client Protocol specification](https://github.com/agentclientprotocol/agent-client-protocol) for the protocol layers Crawfish should sit above.

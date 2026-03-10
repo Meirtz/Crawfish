@@ -27,6 +27,9 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - `verify_loop` as a real runtime execution strategy for `task.plan`
 - deterministic verification feedback, iteration lineage, and strategy-aware checkpoint recovery
 - a new `docs/spec/philosophy.md` manifesto and a rebuilt public README with repo-tracked hero art
+- native Rust local harness adapters for Claude Code and Codex under `crawfish-harness-local`
+- local-first `task.plan` routing across Claude Code, Codex, OpenClaw, and deterministic fallback
+- normalized local harness failure taxonomy and process event lineage for `task.plan`
 
 ### Changed
 
@@ -40,6 +43,8 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - `ExecutionSurface` now returns structured outputs plus external refs and surface event batches, so harness adapters can attach run lineage without bypassing runtime inspection
 - the public project language now explicitly treats OpenClaw, Codex, Claude Code, Gemini CLI, and future adapters as specialized general-purpose harnesses rather than coding-only surfaces
 - `task_planner` now defaults `task.plan` to `verify_loop` with deterministic proof rather than plain single-pass completion
+- `task_planner` now prefers local harnesses before OpenClaw, and the public example/demo reflects that local-first route order
+- `task.plan` now normalizes `context_files` as the primary contextual file input while still accepting the alpha-era `files_of_interest` alias
 - the public implementation boundary is now documented as Rust-first, not Rust-only
 
 ### Security

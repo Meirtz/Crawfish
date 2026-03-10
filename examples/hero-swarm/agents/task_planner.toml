@@ -11,7 +11,7 @@ id = "local-dev"
 display_name = "Local Developer"
 
 [contract_defaults.execution]
-preferred_harnesses = ["openclaw"]
+preferred_harnesses = ["claude_code", "codex", "openclaw"]
 fallback_chain = ["deterministic"]
 
 [contract_defaults.safety]
@@ -29,6 +29,30 @@ checks = []
 
 [strategy_defaults."task.plan".stop_budget]
 max_iterations = 3
+
+[[adapters]]
+adapter = "local_harness"
+capability = "task.plan"
+harness = "claude_code"
+command = "claude"
+args = ["-p"]
+required_scopes = ["planning:read", "planning:propose"]
+lease_required = false
+workspace_policy = "crawfish_managed"
+env_allowlist = ["PATH", "HOME", "XDG_CONFIG_HOME", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+timeout_seconds = 90
+
+[[adapters]]
+adapter = "local_harness"
+capability = "task.plan"
+harness = "codex"
+command = "codex"
+args = ["exec", "--skip-git-repo-check"]
+required_scopes = ["planning:read", "planning:propose"]
+lease_required = false
+workspace_policy = "crawfish_managed"
+env_allowlist = ["PATH", "HOME", "XDG_CONFIG_HOME", "CODEX_HOME", "OPENAI_API_KEY"]
+timeout_seconds = 90
 
 [[adapters]]
 adapter = "openclaw"
