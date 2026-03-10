@@ -10,23 +10,26 @@ use axum::{
 use crawfish_core::{
     authorize_encounter, compile_execution_plan, neutral_policy, now_timestamp,
     owner_policy_for_manifest, ActionDetail, ActionStore, AdminActionResponse, AgentDetail,
-    CrawfishConfig, DeterministicExecutor, EncounterDecision, EncounterDisposition,
-    EncounterRequest, ExecutionContractPatch, ExecutionSurface, FleetStatusResponse,
-    GovernanceContext, HealthResponse, PolicyValidationRequest, PolicyValidationResponse,
-    SubmitActionRequest, SubmittedAction, SupervisorControl,
+    CheckpointStore, CrawfishConfig, DeterministicExecutor, EncounterDecision,
+    EncounterDisposition, EncounterRequest, ExecutionContractPatch, ExecutionSurface,
+    FleetStatusResponse, GovernanceContext, HealthResponse, PolicyValidationRequest,
+    PolicyValidationResponse, SubmitActionRequest, SubmittedAction, SupervisorControl,
 };
 use crawfish_mcp::McpAdapter;
 use crawfish_store_sqlite::SqliteStore;
 use crawfish_types::{
-    Action, ActionOutputs, ActionPhase, AgentManifest, AgentState, AuditOutcome, AuditReceipt,
-    CapabilityDescriptor, ContinuityModeName, CounterpartyRef, DegradedProfileName,
-    EncounterRecord, EncounterState, HealthStatus, LifecycleRecord, Mutability, TrustDomain,
+    Action, ActionOutputs, ActionPhase, AdapterBinding, AgentManifest, AgentState, AuditOutcome,
+    AuditReceipt, CapabilityDescriptor, ContinuityModeName, CounterpartyRef, DegradedProfileName,
+    DeterministicCheckpoint, EncounterRecord, EncounterState, ExternalRef, HealthStatus,
+    LifecycleRecord, Mutability, TrustDomain,
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
     RepoIndexerDeterministicExecutor, RepoReviewerDeterministicExecutor,
 };
+use serde_json::Value;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -45,6 +48,8 @@ enum RuntimeError {
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
+    BadRequest(String),
+    #[error("{0}")]
     Forbidden(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -55,6 +60,9 @@ impl IntoResponse for RuntimeError {
         match self {
             Self::NotFound(message) => {
                 (StatusCode::NOT_FOUND, Json(error_body(message))).into_response()
+            }
+            Self::BadRequest(message) => {
+                (StatusCode::BAD_REQUEST, Json(error_body(message))).into_response()
             }
             Self::Forbidden(message) => {
                 (StatusCode::FORBIDDEN, Json(error_body(message))).into_response()
@@ -76,11 +84,14 @@ enum ExecutionOutcome {
     Completed {
         outputs: ActionOutputs,
         selected_executor: String,
+        checkpoint: Option<DeterministicCheckpoint>,
+        external_refs: Vec<ExternalRef>,
     },
     Blocked {
         reason: String,
         continuity_mode: ContinuityModeName,
         outputs: ActionOutputs,
+        external_refs: Vec<ExternalRef>,
     },
 }
 
@@ -108,6 +119,7 @@ impl Supervisor {
             self.store.upsert_lifecycle_record(&record).await?;
         }
 
+        self.recover_running_actions().await?;
         self.process_action_queue_once().await?;
         info!("reconciled manifests and processed local action queue");
         Ok(())
@@ -166,6 +178,314 @@ impl Supervisor {
 
     fn state_dir(&self) -> PathBuf {
         self.config.state_dir(&self.root)
+    }
+
+    async fn recover_running_actions(&self) -> anyhow::Result<()> {
+        for mut action in self.store.list_actions_by_phase("running").await? {
+            let recovery_stage = match self.load_deterministic_checkpoint(&action).await? {
+                Some(checkpoint) => {
+                    action.checkpoint_ref =
+                        Some(checkpoint_ref_for_executor(&checkpoint.executor_kind));
+                    Some(checkpoint.stage)
+                }
+                None => Some("requeued_after_restart".to_string()),
+            };
+            action.phase = ActionPhase::Accepted;
+            action.started_at = None;
+            action.finished_at = None;
+            action.recovery_stage = recovery_stage.clone();
+            self.store.upsert_action(&action).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "recovered",
+                    serde_json::json!({
+                        "phase": "accepted",
+                        "recovery_stage": recovery_stage,
+                        "reason": "daemon restart requeued running action",
+                    }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn validate_submit_action_request(
+        &self,
+        manifest: &AgentManifest,
+        request: &SubmitActionRequest,
+    ) -> anyhow::Result<()> {
+        if !manifest
+            .capabilities
+            .iter()
+            .any(|cap| cap == &request.capability)
+        {
+            anyhow::bail!(
+                "invalid action request: capability {} is not exposed by {}",
+                request.capability,
+                manifest.id
+            );
+        }
+
+        match request.capability.as_str() {
+            "repo.index" => {
+                let workspace_root = request
+                    .inputs
+                    .get("workspace_root")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid action request: repo.index requires workspace_root"
+                        )
+                    })?;
+                let workspace_path = Path::new(workspace_root);
+                if !workspace_path.is_dir() {
+                    anyhow::bail!(
+                        "invalid action request: workspace_root must be an existing directory"
+                    );
+                }
+            }
+            "repo.review" => {
+                let workspace_root = request
+                    .inputs
+                    .get("workspace_root")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid action request: repo.review requires workspace_root"
+                        )
+                    })?;
+                if !Path::new(workspace_root).is_dir() {
+                    anyhow::bail!(
+                        "invalid action request: workspace_root must be an existing directory"
+                    );
+                }
+
+                let has_diff_text = request
+                    .inputs
+                    .get("diff_text")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                let has_diff_file = request
+                    .inputs
+                    .get("diff_file")
+                    .and_then(Value::as_str)
+                    .map(|path| Path::new(path).is_file())
+                    .unwrap_or(false);
+                let has_changed_files = request
+                    .inputs
+                    .get("changed_files")
+                    .and_then(Value::as_array)
+                    .map(|files| !files.is_empty())
+                    .unwrap_or(false);
+
+                if !(has_diff_text || has_diff_file || has_changed_files) {
+                    anyhow::bail!(
+                        "invalid action request: repo.review requires diff_text, diff_file, or changed_files"
+                    );
+                }
+            }
+            "ci.triage" => {
+                let has_log_text = request
+                    .inputs
+                    .get("log_text")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                let has_log_file = request
+                    .inputs
+                    .get("log_file")
+                    .and_then(Value::as_str)
+                    .map(|path| Path::new(path).is_file())
+                    .unwrap_or(false);
+                let has_mcp_resource_ref = request
+                    .inputs
+                    .get("mcp_resource_ref")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+
+                if !(has_log_text || has_log_file || has_mcp_resource_ref) {
+                    anyhow::bail!(
+                        "invalid action request: ci.triage requires log_text, log_file, or mcp_resource_ref"
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    async fn write_checkpoint_for_action(
+        &self,
+        action: &mut Action,
+        checkpoint: &DeterministicCheckpoint,
+    ) -> anyhow::Result<()> {
+        let checkpoint_ref = checkpoint_ref_for_executor(&checkpoint.executor_kind);
+        let payload = serde_json::to_vec_pretty(checkpoint)?;
+        self.store
+            .put_checkpoint(&action.id, &checkpoint_ref, &payload)
+            .await?;
+        action.checkpoint_ref = Some(checkpoint_ref);
+        action.recovery_stage = Some(checkpoint.stage.clone());
+        self.store.upsert_action(action).await?;
+        Ok(())
+    }
+
+    async fn load_deterministic_checkpoint(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<Option<DeterministicCheckpoint>> {
+        let Some(bytes) = self.store.get_checkpoint(&action.id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    async fn run_deterministic_executor<E>(
+        &self,
+        action: &mut Action,
+        executor_kind: &str,
+        running_stage: &str,
+        external_refs: Vec<ExternalRef>,
+        executor: &E,
+    ) -> anyhow::Result<ExecutionOutcome>
+    where
+        E: DeterministicExecutor,
+    {
+        let digest = input_digest(&action.inputs)?;
+        if let Some(checkpoint) = self.load_deterministic_checkpoint(action).await? {
+            if checkpoint.executor_kind == executor_kind
+                && checkpoint.input_digest == digest
+                && checkpoint.stage == "completed"
+                && artifact_refs_exist(&checkpoint.artifact_refs)
+            {
+                action.selected_executor = Some(executor_kind.to_string());
+                action.recovery_stage = Some(checkpoint.stage.clone());
+                action.external_refs = external_refs.clone();
+                return Ok(ExecutionOutcome::Completed {
+                    outputs: recovered_outputs_from_checkpoint(&checkpoint),
+                    selected_executor: executor_kind.to_string(),
+                    checkpoint: Some(checkpoint),
+                    external_refs,
+                });
+            }
+        }
+
+        let running_checkpoint =
+            build_checkpoint(action, executor_kind, running_stage, Vec::new())?;
+        self.write_checkpoint_for_action(action, &running_checkpoint)
+            .await?;
+        self.store
+            .append_action_event(
+                &action.id,
+                "checkpointed",
+                serde_json::json!({
+                    "stage": running_checkpoint.stage,
+                    "checkpoint_ref": action.checkpoint_ref,
+                }),
+            )
+            .await?;
+
+        let outputs = executor.execute(action).await?;
+        let completed_checkpoint = build_checkpoint(
+            action,
+            executor_kind,
+            "completed",
+            outputs.artifacts.clone(),
+        )?;
+
+        Ok(ExecutionOutcome::Completed {
+            outputs,
+            selected_executor: executor_kind.to_string(),
+            checkpoint: Some(completed_checkpoint),
+            external_refs,
+        })
+    }
+
+    fn resolve_mcp_adapter(
+        &self,
+        manifest: &AgentManifest,
+        action: &Action,
+    ) -> anyhow::Result<Option<(McpAdapter, Vec<ExternalRef>)>> {
+        let binding = manifest.adapters.iter().find_map(|binding| match binding {
+            AdapterBinding::Mcp(binding) => Some(binding.clone()),
+            _ => None,
+        });
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+
+        let server = self
+            .config
+            .mcp
+            .servers
+            .get(&binding.server)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("mcp server {} is not configured", binding.server))?;
+        let adapter =
+            McpAdapter::configured(binding.server.clone(), server.clone(), binding.clone())?;
+        let mut external_refs = vec![
+            ExternalRef {
+                kind: "mcp_server".to_string(),
+                value: binding.server.clone(),
+                endpoint: Some(server.url),
+            },
+            ExternalRef {
+                kind: "mcp_tool".to_string(),
+                value: binding.tool,
+                endpoint: None,
+            },
+        ];
+        if let Some(resource_ref) = action
+            .inputs
+            .get("mcp_resource_ref")
+            .and_then(Value::as_str)
+        {
+            external_refs.push(ExternalRef {
+                kind: "mcp_resource".to_string(),
+                value: resource_ref.to_string(),
+                endpoint: None,
+            });
+        }
+        Ok(Some((adapter, external_refs)))
+    }
+
+    fn continuity_blocked_outcome(
+        &self,
+        action: &Action,
+        reason: impl Into<String>,
+        deterministic_available: bool,
+        external_refs: Vec<ExternalRef>,
+    ) -> ExecutionOutcome {
+        let reason = reason.into();
+        let continuity_mode = select_continuity_mode(
+            &action.contract.recovery.continuity_preference,
+            deterministic_available,
+        );
+        let mut outputs = ActionOutputs {
+            summary: Some(format!(
+                "Action {} entered continuity mode {:?}: {}",
+                action.id, continuity_mode, reason
+            )),
+            ..ActionOutputs::default()
+        };
+        outputs.metadata.insert(
+            "continuity_mode".to_string(),
+            serde_json::json!(format!("{continuity_mode:?}").to_lowercase()),
+        );
+        outputs.metadata.insert(
+            "route_failure".to_string(),
+            serde_json::json!(reason.clone()),
+        );
+        ExecutionOutcome::Blocked {
+            reason,
+            continuity_mode,
+            outputs,
+            external_refs,
+        }
     }
 
     async fn ensure_repo_index_for_workspace(
@@ -373,22 +693,33 @@ impl Supervisor {
             return Ok(());
         }
 
-        match self.execute_action(&action, &manifest).await {
+        match self.execute_action(&mut action, &manifest).await {
             Ok(ExecutionOutcome::Completed {
                 outputs,
                 selected_executor,
+                checkpoint,
+                external_refs,
             }) => {
                 action.phase = ActionPhase::Completed;
                 action.outputs = outputs;
                 action.finished_at = Some(now_timestamp());
                 action.failure_reason = None;
                 action.selected_executor = Some(selected_executor);
+                action.external_refs = external_refs;
+                if let Some(checkpoint) = checkpoint {
+                    self.write_checkpoint_for_action(&mut action, &checkpoint)
+                        .await?;
+                }
                 self.store.upsert_action(&action).await?;
                 self.store
                     .append_action_event(
                         &action.id,
                         "completed",
-                        serde_json::json!({"finished_at": action.finished_at}),
+                        serde_json::json!({
+                            "finished_at": action.finished_at,
+                            "checkpoint_ref": action.checkpoint_ref,
+                            "recovery_stage": action.recovery_stage,
+                        }),
                     )
                     .await?;
             }
@@ -396,11 +727,13 @@ impl Supervisor {
                 reason,
                 continuity_mode,
                 outputs,
+                external_refs,
             }) => {
                 action.phase = ActionPhase::Blocked;
                 action.continuity_mode = Some(continuity_mode);
                 action.failure_reason = Some(reason.clone());
                 action.outputs = outputs;
+                action.external_refs = external_refs;
                 self.store.upsert_action(&action).await?;
                 self.store
                     .append_action_event(
@@ -434,16 +767,20 @@ impl Supervisor {
 
     async fn execute_action(
         &self,
-        action: &Action,
+        action: &mut Action,
         manifest: &AgentManifest,
     ) -> anyhow::Result<ExecutionOutcome> {
         if action.capability == "repo.index" {
             let executor = RepoIndexerDeterministicExecutor::new(self.state_dir());
-            let outputs = executor.execute(action).await?;
-            return Ok(ExecutionOutcome::Completed {
-                outputs,
-                selected_executor: "deterministic.repo_index".to_string(),
-            });
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.repo_index",
+                    "scanning",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
         }
 
         if action.capability == "repo.review" {
@@ -456,58 +793,136 @@ impl Supervisor {
                 repo_index,
                 Some(repo_index_ref),
             );
-            let outputs = executor.execute(action).await?;
-            return Ok(ExecutionOutcome::Completed {
-                outputs,
-                selected_executor: "deterministic.repo_review".to_string(),
-            });
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.repo_review",
+                    "reviewing",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
         }
 
         if action.capability == "ci.triage" {
+            if !has_log_input(action) && action.inputs.contains_key("mcp_resource_ref") {
+                let (adapter, external_refs) = match self.resolve_mcp_adapter(manifest, action) {
+                    Ok(Some(binding)) => binding,
+                    Ok(None) => {
+                        return Ok(self.continuity_blocked_outcome(
+                            action,
+                            "no MCP adapter is configured for ci.triage",
+                            false,
+                            mcp_input_external_refs(action),
+                        ));
+                    }
+                    Err(error) => {
+                        return Ok(self.continuity_blocked_outcome(
+                            action,
+                            error.to_string(),
+                            false,
+                            mcp_input_external_refs(action),
+                        ));
+                    }
+                };
+
+                match adapter.run(action).await {
+                    Ok(remote_outputs) => {
+                        let mut derived_action = action.clone();
+                        let log_text = extract_mcp_log_text(&remote_outputs).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "mcp result did not contain log_text, log_excerpt, or textual content"
+                            )
+                        })?;
+                        derived_action
+                            .inputs
+                            .insert("log_text".to_string(), serde_json::json!(log_text));
+                        let executor = CiTriageDeterministicExecutor::new(self.state_dir());
+                        let mut outcome = self
+                            .run_deterministic_executor(
+                                &mut derived_action,
+                                "deterministic.ci_triage",
+                                "classifying",
+                                external_refs.clone(),
+                                &executor,
+                            )
+                            .await?;
+                        if let ExecutionOutcome::Completed {
+                            outputs,
+                            checkpoint,
+                            external_refs: refs,
+                            ..
+                        } = &mut outcome
+                        {
+                            outputs.metadata.insert(
+                                "mcp_summary".to_string(),
+                                serde_json::json!(remote_outputs.summary.clone()),
+                            );
+                            outputs.metadata.insert(
+                                "mcp_result".to_string(),
+                                remote_outputs
+                                    .metadata
+                                    .get("mcp_result")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                            );
+                            *refs = external_refs;
+                            if let Some(checkpoint) = checkpoint {
+                                checkpoint.last_updated_at = now_timestamp();
+                            }
+                        }
+                        return Ok(outcome);
+                    }
+                    Err(error) => {
+                        return Ok(self.continuity_blocked_outcome(
+                            action,
+                            error.to_string(),
+                            false,
+                            external_refs,
+                        ));
+                    }
+                }
+            }
+
             let executor = CiTriageDeterministicExecutor::new(self.state_dir());
-            let outputs = executor.execute(action).await?;
-            return Ok(ExecutionOutcome::Completed {
-                outputs,
-                selected_executor: "deterministic.ci_triage".to_string(),
-            });
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.ci_triage",
+                    "classifying",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
         }
 
-        if manifest
-            .adapters
-            .iter()
-            .any(|binding| matches!(binding, crawfish_types::AdapterBinding::Mcp(_)))
-        {
-            let adapter = McpAdapter::new("local-mcp-stub");
-            let outputs = adapter.run(action).await?;
-            return Ok(ExecutionOutcome::Completed {
-                outputs,
-                selected_executor: format!("mcp.{}", adapter.name()),
-            });
+        if let Some((adapter, external_refs)) = self.resolve_mcp_adapter(manifest, action)? {
+            match adapter.run(action).await {
+                Ok(outputs) => {
+                    return Ok(ExecutionOutcome::Completed {
+                        outputs,
+                        selected_executor: format!("mcp.{}", adapter.name()),
+                        checkpoint: None,
+                        external_refs,
+                    });
+                }
+                Err(error) => {
+                    return Ok(self.continuity_blocked_outcome(
+                        action,
+                        error.to_string(),
+                        false,
+                        external_refs,
+                    ));
+                }
+            }
         }
 
-        let mode = action
-            .contract
-            .recovery
-            .continuity_preference
-            .first()
-            .cloned()
-            .unwrap_or(ContinuityModeName::StoreAndForward);
-        let mut outputs = ActionOutputs {
-            summary: Some(format!(
-                "Action {} entered continuity mode {:?} because no execution surface was available",
-                action.id, mode
-            )),
-            ..ActionOutputs::default()
-        };
-        outputs.metadata.insert(
-            "continuity_mode".to_string(),
-            serde_json::json!(format!("{mode:?}").to_lowercase()),
-        );
-        Ok(ExecutionOutcome::Blocked {
-            reason: "no execution surface was available".to_string(),
-            continuity_mode: mode,
-            outputs,
-        })
+        Ok(self.continuity_blocked_outcome(
+            action,
+            "no execution surface was available",
+            false,
+            Vec::new(),
+        ))
     }
 
     fn load_manifests(&self) -> anyhow::Result<Vec<AgentManifest>> {
@@ -591,6 +1006,146 @@ impl Supervisor {
     }
 }
 
+fn build_checkpoint(
+    action: &Action,
+    executor_kind: &str,
+    stage: &str,
+    artifact_refs: Vec<crawfish_types::ArtifactRef>,
+) -> anyhow::Result<DeterministicCheckpoint> {
+    Ok(DeterministicCheckpoint {
+        executor_kind: executor_kind.to_string(),
+        stage: stage.to_string(),
+        workspace_root: action
+            .inputs
+            .get("workspace_root")
+            .and_then(Value::as_str)
+            .unwrap_or(".")
+            .to_string(),
+        input_digest: input_digest(&action.inputs)?,
+        artifact_refs,
+        last_updated_at: now_timestamp(),
+    })
+}
+
+fn checkpoint_ref_for_executor(executor_kind: &str) -> String {
+    format!("{}-checkpoint", executor_kind.replace('.', "-"))
+}
+
+fn input_digest(inputs: &crawfish_types::Metadata) -> anyhow::Result<String> {
+    let serialized = serde_json::to_string(inputs)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serialized.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn artifact_refs_exist(artifact_refs: &[crawfish_types::ArtifactRef]) -> bool {
+    !artifact_refs.is_empty()
+        && artifact_refs
+            .iter()
+            .all(|artifact| Path::new(&artifact.path).exists())
+}
+
+fn recovered_outputs_from_checkpoint(checkpoint: &DeterministicCheckpoint) -> ActionOutputs {
+    ActionOutputs {
+        summary: Some(format!(
+            "Recovered outputs from {} checkpoint at stage {}",
+            checkpoint.executor_kind, checkpoint.stage
+        )),
+        artifacts: checkpoint.artifact_refs.clone(),
+        metadata: std::collections::BTreeMap::from([
+            (
+                "recovered_from_checkpoint".to_string(),
+                serde_json::json!(true),
+            ),
+            (
+                "executor_kind".to_string(),
+                serde_json::json!(checkpoint.executor_kind),
+            ),
+            (
+                "input_digest".to_string(),
+                serde_json::json!(checkpoint.input_digest),
+            ),
+        ]),
+    }
+}
+
+fn has_log_input(action: &Action) -> bool {
+    action
+        .inputs
+        .get("log_text")
+        .and_then(Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || action
+            .inputs
+            .get("log_file")
+            .and_then(Value::as_str)
+            .map(|path| Path::new(path).is_file())
+            .unwrap_or(false)
+}
+
+fn mcp_input_external_refs(action: &Action) -> Vec<ExternalRef> {
+    action
+        .inputs
+        .get("mcp_resource_ref")
+        .and_then(Value::as_str)
+        .map(|value| {
+            vec![ExternalRef {
+                kind: "mcp_resource".to_string(),
+                value: value.to_string(),
+                endpoint: None,
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn extract_mcp_log_text(outputs: &ActionOutputs) -> Option<String> {
+    let result = outputs.metadata.get("mcp_result")?;
+    if let Some(log_text) = result
+        .get("structuredContent")
+        .and_then(|value| value.get("log_text"))
+        .and_then(Value::as_str)
+    {
+        return Some(log_text.to_string());
+    }
+    if let Some(log_text) = result
+        .get("structuredContent")
+        .and_then(|value| value.get("log_excerpt"))
+        .and_then(Value::as_str)
+    {
+        return Some(log_text.to_string());
+    }
+    if let Some(items) = result.get("content").and_then(Value::as_array) {
+        let text = items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    outputs.summary.clone()
+}
+
+fn select_continuity_mode(
+    preferences: &[ContinuityModeName],
+    deterministic_available: bool,
+) -> ContinuityModeName {
+    for mode in preferences {
+        match mode {
+            ContinuityModeName::DeterministicOnly if !deterministic_available => continue,
+            _ => return mode.clone(),
+        }
+    }
+
+    if deterministic_available {
+        ContinuityModeName::DeterministicOnly
+    } else {
+        ContinuityModeName::StoreAndForward
+    }
+}
+
 fn action_requester(id: &str) -> crawfish_types::RequesterRef {
     crawfish_types::RequesterRef {
         kind: crawfish_types::RequesterKind::System,
@@ -650,6 +1205,7 @@ impl SupervisorControl for Supervisor {
             .get_agent_manifest(&request.target_agent_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("agent not found: {}", request.target_agent_id))?;
+        self.validate_submit_action_request(&manifest, &request)?;
 
         let caller = request
             .counterparty_refs
@@ -686,7 +1242,8 @@ impl SupervisorControl for Supervisor {
             &manifest.strategy_defaults,
             &request.capability,
             request.execution_strategy.clone(),
-        )?;
+        )
+        .map_err(|error| anyhow::anyhow!("invalid action request: {error}"))?;
 
         let action = Action {
             id: Uuid::new_v4().to_string(),
@@ -930,6 +1487,8 @@ async fn submit_action_handler(
             let message = error.to_string();
             if message.starts_with("agent not found:") {
                 Err(RuntimeError::NotFound(message))
+            } else if message.starts_with("invalid action request:") {
+                Err(RuntimeError::BadRequest(message))
             } else if message.contains("denied") || message.contains("consent") {
                 Err(RuntimeError::Forbidden(message))
             } else {
@@ -977,6 +1536,7 @@ fn error_body(message: String) -> serde_json::Value {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use crawfish_core::CheckpointStore;
     use crawfish_types::{RequesterKind, RequesterRef};
     use http_body_util::{BodyExt, Full};
     use hyper::{Method, Request, Uri};
@@ -1072,6 +1632,124 @@ mod tests {
             .unwrap()
             .expect("action detail");
         assert_eq!(detail.action.phase, ActionPhase::Completed);
+    }
+
+    #[tokio::test]
+    async fn submit_action_rejects_invalid_inputs() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let error = supervisor
+            .submit_action(SubmitActionRequest {
+                target_agent_id: "repo_reviewer".to_string(),
+                requester: RequesterRef {
+                    kind: RequesterKind::User,
+                    id: "operator".to_string(),
+                },
+                initiator_owner: crawfish_types::OwnerRef {
+                    kind: crawfish_types::OwnerKind::Human,
+                    id: "local-dev".to_string(),
+                    display_name: None,
+                },
+                capability: "repo.review".to_string(),
+                goal: crawfish_types::GoalSpec {
+                    summary: "review pull request".to_string(),
+                    details: None,
+                },
+                inputs: std::collections::BTreeMap::from([(
+                    "workspace_root".to_string(),
+                    serde_json::json!(dir.path().display().to_string()),
+                )]),
+                contract_overrides: None,
+                execution_strategy: None,
+                schedule: None,
+                counterparty_refs: Vec::new(),
+                data_boundary: None,
+                workspace_write: false,
+                secret_access: false,
+                mutating: false,
+            })
+            .await
+            .expect_err("request should be rejected");
+
+        assert!(error
+            .to_string()
+            .starts_with("invalid action request: repo.review requires"));
+    }
+
+    #[tokio::test]
+    async fn running_action_is_requeued_after_restart() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let mut action = Action {
+            id: "running-action".to_string(),
+            target_agent_id: "repo_indexer".to_string(),
+            requester: RequesterRef {
+                kind: RequesterKind::User,
+                id: "operator".to_string(),
+            },
+            initiator_owner: crawfish_types::OwnerRef {
+                kind: crawfish_types::OwnerKind::Human,
+                id: "local-dev".to_string(),
+                display_name: None,
+            },
+            counterparty_refs: Vec::new(),
+            goal: crawfish_types::GoalSpec {
+                summary: "index repository".to_string(),
+                details: None,
+            },
+            capability: "repo.index".to_string(),
+            inputs: std::collections::BTreeMap::from([(
+                "workspace_root".to_string(),
+                serde_json::json!(dir.path().display().to_string()),
+            )]),
+            contract: supervisor.config().contracts.org_defaults.clone(),
+            execution_strategy: None,
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            encounter_ref: None,
+            audit_receipt_ref: None,
+            data_boundary: "owner_local".to_string(),
+            schedule: Default::default(),
+            phase: ActionPhase::Running,
+            created_at: now_timestamp(),
+            started_at: Some(now_timestamp()),
+            finished_at: None,
+            checkpoint_ref: None,
+            continuity_mode: None,
+            degradation_profile: None,
+            failure_reason: None,
+            selected_executor: Some("deterministic.repo_index".to_string()),
+            recovery_stage: None,
+            external_refs: Vec::new(),
+            outputs: ActionOutputs::default(),
+        };
+        let checkpoint =
+            build_checkpoint(&action, "deterministic.repo_index", "scanning", Vec::new()).unwrap();
+        let checkpoint_ref = checkpoint_ref_for_executor(&checkpoint.executor_kind);
+        supervisor
+            .store()
+            .put_checkpoint(
+                &action.id,
+                &checkpoint_ref,
+                &serde_json::to_vec_pretty(&checkpoint).unwrap(),
+            )
+            .await
+            .unwrap();
+        action.checkpoint_ref = Some(checkpoint_ref);
+        supervisor.store().upsert_action(&action).await.unwrap();
+
+        supervisor.run_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action("running-action")
+            .await
+            .unwrap()
+            .expect("action detail");
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(detail.recovery_stage.as_deref(), Some("completed"));
+        assert!(detail.action.checkpoint_ref.is_some());
     }
 
     #[tokio::test]

@@ -35,6 +35,12 @@ fn daemon_backed_cli_supports_status_health_and_submit() {
     fs::create_dir_all(dir.path().join("agents")).unwrap();
     fs::create_dir_all(dir.path().join(".crawfish/state")).unwrap();
     fs::create_dir_all(dir.path().join(".crawfish/run")).unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn value() -> u32 { 42 }\n",
+    )
+    .unwrap();
     fs::write(
         dir.path().join("Crawfish.toml"),
         r#"[storage]
@@ -110,6 +116,11 @@ reconcile_interval_ms = 100
             "review pull request",
             "--caller-owner",
             "local-dev",
+            "--inputs-json",
+            &format!(
+                "{{\"workspace_root\":\"{}\",\"changed_files\":[\"src/lib.rs\"]}}",
+                dir.path().display()
+            ),
             "--json",
         ])
         .assert()

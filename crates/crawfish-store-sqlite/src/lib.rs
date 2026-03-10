@@ -270,6 +270,27 @@ impl SqliteStore {
         .transpose()
     }
 
+    pub async fn list_actions_by_phase(&self, phase: &str) -> anyhow::Result<Vec<Action>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT action_json
+            FROM actions
+            WHERE phase = ?1
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(phase)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("action_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
     pub async fn set_admin_mode_draining(&self, draining: bool) -> anyhow::Result<()> {
         let value = if draining {
             ADMIN_MODE_DRAINING
