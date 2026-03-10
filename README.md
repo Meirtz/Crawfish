@@ -15,6 +15,7 @@ This repository is now **Rust-first for implementation** and **Markdown-first fo
 To regenerate the consolidated DOCX export from Markdown, run `python3 scripts/export_docset.py`.
 
 To compile and test the Rust workspace, run `cargo test --workspace`.
+To compile and test the OpenClaw inbound bridge, run `npm test --prefix integrations/openclaw-inbound`.
 
 ## Project Status
 
@@ -209,13 +210,15 @@ OpenClaw interoperability, `ACP`, and `A2A` remain important parts of the produc
 
 ## Current Alpha Slice
 
-The current Rust alpha already covers one runnable Hero P0 slice:
+The current Rust alpha now covers one runnable Hero P0 slice plus the first `P1a` OpenClaw inbound surface:
 
 - `repo.index` scans a local workspace and emits `repo_index.json`.
 - `repo.review` runs deterministic review checks and reuses or bootstraps the latest repo index.
 - `ci.triage` classifies CI failures from direct logs or from an SSE MCP tool route.
 - `incident.enrich` turns local logs plus service topology into deterministic blast-radius and next-step artifacts.
 - `workspace.patch.apply` performs deterministic local file edits under explicit approval, grant, and lease control.
+- `P1a` adds a thin OpenClaw inbound Gateway RPC bridge under [`integrations/openclaw-inbound/`](integrations/openclaw-inbound/) with `crawfish.action.submit`, `crawfish.action.inspect`, `crawfish.action.events`, and `crawfish.agent.status`.
+- OpenClaw inbound caller mapping is configured under `[openclaw.inbound]` in [`examples/hero-fleet/Crawfish.toml`](examples/hero-fleet/Crawfish.toml), and governance remains enforced in `crawfishd`, not in the bridge.
 - `inspect` surfaces artifact refs, checkpoint refs, recovery stage, continuity mode, encounter metadata, and external refs.
 - `action list`, `action events`, `action approve`, `action reject`, and `lease revoke` expose the operator control path over the local UDS API.
 - restart recovery requeues `running` actions and resumes deterministic work from checkpoint metadata.
@@ -224,7 +227,7 @@ The current Rust alpha already covers one runnable Hero P0 slice:
 
 The first external tool transport implemented in code is `MCP over SSE`. `repo_reviewer` remains deterministic-first, while `ci_triage` can fetch remote log material through MCP and then complete the actual classification locally.
 
-With this `alpha.3` slice in place, the next planned milestone is `P1a OpenClaw inbound`.
+With this `P1a` inbound slice in place, the next planned milestone is `P1b OpenClaw outbound`.
 
 ## Quickstart
 

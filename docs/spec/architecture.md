@@ -633,15 +633,14 @@ OpenClaw is the first-priority harness ecosystem integration because it spans bo
 
 ### Inbound: OpenClaw -> Crawfish
 
-An [OpenClaw plugin](https://docs.openclaw.ai/tools/plugin) should expose Crawfish as both an agent tool and a Gateway RPC surface for durable fleet work.
+`P1a` is Gateway-RPC-first. The implemented inbound surface is a thin bridge package under `integrations/openclaw-inbound/` that forwards OpenClaw RPC calls to `crawfishd` over the local Unix socket. It does not own policy, state, or retries.
 
-Minimum RPC surface:
+Current minimum RPC surface:
 
 - `crawfish.action.submit`
 - `crawfish.action.inspect`
+- `crawfish.action.events`
 - `crawfish.agent.status`
-- `crawfish.action.resume`
-- `crawfish.action.cancel`
 
 Inbound rules:
 
@@ -650,6 +649,7 @@ Inbound rules:
 - inbound calls must pass encounter policy before an action is created
 - OpenClaw session metadata is treated as requester and trace context, not as lifecycle authority
 - OpenClaw does not own Crawfish lifecycle state; it is an external caller
+- `P1a` keeps `cancel` and `resume` out of the OpenClaw surface until Crawfish exposes stable action-level operator semantics for them
 
 ### Outbound: Crawfish -> OpenClaw
 

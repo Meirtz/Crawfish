@@ -3124,11 +3124,11 @@ mod tests {
     }
 
     async fn build_supervisor_with_openclaw(dir: &Path) -> anyhow::Result<Arc<Supervisor>> {
-        let config = format!(
-            "{}\n[openclaw.inbound]\nenabled = true\ncaller_owner_mapping = \"required\"\ndefault_trust_domain = \"same_device_foreign_owner\"\n\n[openclaw.inbound.allowed_callers.local_gateway]\nowner_kind = \"human\"\nowner_id = \"local-dev\"\ndisplay_name = \"Local Gateway\"\nallowed_scopes = [\"crawfish.read\", \"crawfish.submit\"]\n\n[openclaw.inbound.allowed_callers.foreign_gateway]\nowner_kind = \"human\"\nowner_id = \"foreign-owner\"\ndisplay_name = \"Foreign Gateway\"\nallowed_scopes = [\"crawfish.read\", \"crawfish.submit\"]\n",
-            include_str!("../../../examples/hero-fleet/Crawfish.toml"),
-        );
-        build_supervisor_with_config(dir, config).await
+        build_supervisor_with_config(
+            dir,
+            include_str!("../../../examples/hero-fleet/Crawfish.toml").to_string(),
+        )
+        .await
     }
 
     fn local_owner(id: &str) -> crawfish_types::OwnerRef {

@@ -15,6 +15,23 @@ url = "http://127.0.0.1:8877/sse"
 connect_timeout_ms = 5000
 request_timeout_ms = 15000
 
+[openclaw.inbound]
+enabled = true
+caller_owner_mapping = "required"
+default_trust_domain = "same_device_foreign_owner"
+
+[openclaw.inbound.allowed_callers.local_gateway]
+owner_kind = "human"
+owner_id = "local-dev"
+display_name = "Local Gateway"
+allowed_scopes = ["crawfish.read", "crawfish.submit"]
+
+[openclaw.inbound.allowed_callers.foreign_gateway]
+owner_kind = "human"
+owner_id = "foreign-owner"
+display_name = "Foreign Gateway"
+allowed_scopes = ["crawfish.read", "crawfish.submit"]
+
 [runtime]
 reconcile_interval_ms = 5000
 

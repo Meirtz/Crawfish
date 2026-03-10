@@ -17,6 +17,8 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - runtime persistence and inspection for consent grants, capability leases, and audit receipts
 - `action events` over the local UDS API for operator timeline inspection
 - reference hero demo assets plus `examples/hero-fleet/demo.sh`
+- `P1a` OpenClaw inbound Gateway RPC bridge under `integrations/openclaw-inbound/`
+- OpenClaw inbound caller mapping, scoped action inspection, and scoped agent status over the local UDS API
 
 ### Changed
 
@@ -25,6 +27,7 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - `policy validate` is now a strict dry-run with no runtime persistence side effects
 - action phase persistence now uses canonical snake_case values such as `awaiting_approval`
 - workspace mutation now enforces workspace-scoped file locking and stable failure codes for lock, lease, approval, route, executor, and restart states
+- denied action admission now fails before encounter persistence when governance rejects the request at preflight
 
 ### Security
 
