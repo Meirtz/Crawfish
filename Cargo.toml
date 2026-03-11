@@ -8,6 +8,7 @@ members = [
   "crates/crawfish-mcp",
   "crates/crawfish-harness-local",
   "crates/crawfish-openclaw",
+  "crates/crawfish-a2a",
   "crates/crawfish-adapter-api",
 ]
 resolver = "2"

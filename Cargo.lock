@@ -353,6 +353,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "crawfish-a2a"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "crawfish-core",
+ "crawfish-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "crawfish-adapter-api"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -461,6 +479,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "crawfish-a2a",
  "crawfish-core",
  "crawfish-harness-local",
  "crawfish-mcp",

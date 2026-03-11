@@ -59,9 +59,11 @@ INCIDENT_ID="$(cargo run -p crawfish-cli --bin crawfish -- action submit \
 cargo run -p crawfish-cli --bin crawfish -- inspect "${INCIDENT_ID}" --config "${WORKDIR}/Crawfish.toml" --json
 
 if command -v claude >/dev/null 2>&1; then
-  echo "== task_planner route preference: local Claude Code -> Codex -> OpenClaw -> deterministic =="
+  echo "== task_planner route preference: local Claude Code -> Codex -> A2A remote agent -> OpenClaw -> deterministic =="
 elif command -v codex >/dev/null 2>&1; then
-  echo "== task_planner route preference: local Codex -> OpenClaw -> deterministic =="
+  echo "== task_planner route preference: local Codex -> A2A remote agent -> OpenClaw -> deterministic =="
+elif [[ -n "${A2A_AGENT_CARD_URL:-}" ]]; then
+  echo "== task_planner route preference: A2A remote agent -> OpenClaw -> deterministic =="
 elif [[ -n "${OPENCLAW_GATEWAY_URL:-}" ]] && [[ -n "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
   echo "== task_planner route preference: OpenClaw -> deterministic =="
 else
@@ -77,6 +79,23 @@ path = Path(sys.argv[1])
 gateway_url = sys.argv[2]
 contents = path.read_text()
 path.write_text(contents.replace("ws://127.0.0.1:9988/gateway", gateway_url))
+PY
+fi
+
+if [[ -n "${A2A_AGENT_CARD_URL:-}" ]]; then
+  python3 - "${WORKDIR}/agents/task_planner.toml" "${WORKDIR}/Crawfish.toml" "${A2A_AGENT_CARD_URL}" <<'PY'
+from pathlib import Path
+import sys
+
+manifest_path = Path(sys.argv[1])
+config_path = Path(sys.argv[2])
+agent_card_url = sys.argv[3]
+manifest_path.write_text(
+    manifest_path.read_text().replace("http://127.0.0.1:7788/agent-card.json", agent_card_url)
+)
+config_path.write_text(
+    config_path.read_text().replace("http://127.0.0.1:7788/agent-card.json", agent_card_url)
+)
 PY
 fi
 

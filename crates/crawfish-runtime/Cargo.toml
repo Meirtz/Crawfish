@@ -14,6 +14,7 @@ async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
 crawfish-core = { path = "../crawfish-core" }
+crawfish-a2a = { path = "../crawfish-a2a" }
 crawfish-harness-local = { path = "../crawfish-harness-local" }
 crawfish-mcp = { path = "../crawfish-mcp" }
 crawfish-openclaw = { path = "../crawfish-openclaw" }

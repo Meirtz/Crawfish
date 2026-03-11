@@ -11,7 +11,7 @@ id = "local-dev"
 display_name = "Local Developer"
 
 [contract_defaults.execution]
-preferred_harnesses = ["claude_code", "codex", "openclaw"]
+preferred_harnesses = ["claude_code", "codex", "a2a", "openclaw"]
 fallback_chain = ["deterministic"]
 
 [contract_defaults.safety]
@@ -68,3 +68,13 @@ default_trust_domain = "same_device_foreign_owner"
 required_scopes = ["planning:read", "planning:propose"]
 lease_required = false
 workspace_policy = "crawfish_managed"
+
+[[adapters]]
+adapter = "a2a"
+capability = "task.plan"
+agent_card_url = "http://127.0.0.1:7788/agent-card.json"
+auth_ref = "A2A_REMOTE_TOKEN"
+treaty_pack = "remote_task_planning"
+required_scopes = ["planning:read", "planning:propose"]
+streaming_mode = "prefer_streaming"
+allow_in_task_auth = false

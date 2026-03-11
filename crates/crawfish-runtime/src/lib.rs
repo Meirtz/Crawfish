@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use crawfish_a2a::{A2aAdapter, A2aError};
 use crawfish_core::{
     authorize_encounter, compile_execution_plan, neutral_policy, now_timestamp,
     owner_policy_for_manifest, AcknowledgeAlertRequest, AcknowledgeAlertResponse, ActionDetail,
@@ -1094,6 +1095,40 @@ impl Supervisor {
                 checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
                 created_at: now_timestamp(),
             });
+        }
+        if matches!(
+            interaction_model,
+            crawfish_types::InteractionModel::RemoteAgent
+        ) {
+            if external_ref_value(&action.external_refs, "a2a.treaty_pack").is_none() {
+                incidents.push(PolicyIncident {
+                    id: Uuid::new_v4().to_string(),
+                    action_id: action.id.clone(),
+                    doctrine_pack_id: doctrine.id.clone(),
+                    jurisdiction: doctrine.jurisdiction.clone(),
+                    reason_code: "frontier_gap_remote_treaty".to_string(),
+                    summary: "remote agent delegation executed without durable treaty evidence"
+                        .to_string(),
+                    severity: PolicyIncidentSeverity::Critical,
+                    checkpoint: Some(crawfish_types::OversightCheckpoint::PreDispatch),
+                    created_at: now_timestamp(),
+                });
+            }
+            if external_ref_value(&action.external_refs, "a2a.delegation_receipt").is_none() {
+                incidents.push(PolicyIncident {
+                    id: Uuid::new_v4().to_string(),
+                    action_id: action.id.clone(),
+                    doctrine_pack_id: doctrine.id.clone(),
+                    jurisdiction: doctrine.jurisdiction.clone(),
+                    reason_code: "frontier_gap_remote_delegation_receipt".to_string(),
+                    summary:
+                        "remote agent delegation completed without a durable delegation receipt"
+                            .to_string(),
+                    severity: PolicyIncidentSeverity::Critical,
+                    checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                    created_at: now_timestamp(),
+                });
+            }
         }
         if let Some(hook) = action.contract.quality.evaluation_hook.as_deref() {
             if legacy_evaluation_hook_profile_name(hook).is_none() {
@@ -2323,6 +2358,192 @@ impl Supervisor {
                         }
                     }
                 }
+                "a2a" => {
+                    attempted_agentic_route = true;
+                    match self.resolve_a2a_adapter(manifest) {
+                        Ok(Some((adapter, mut base_refs))) => {
+                            let mut receipt = crawfish_types::DelegationReceipt {
+                                id: Uuid::new_v4().to_string(),
+                                action_id: action.id.clone(),
+                                treaty_pack_id: adapter.treaty_pack().id.clone(),
+                                remote_principal: adapter.treaty_pack().remote_principal.clone(),
+                                capability: action.capability.clone(),
+                                requested_scopes: adapter.binding().required_scopes.clone(),
+                                decision: crawfish_types::DelegationDecision::Allowed,
+                                remote_agent_card_url: adapter.binding().agent_card_url.clone(),
+                                remote_task_ref: None,
+                                created_at: now_timestamp(),
+                            };
+                            self.store.insert_delegation_receipt(&receipt).await?;
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.treaty_pack".to_string(),
+                                value: adapter.treaty_pack().id.clone(),
+                                endpoint: None,
+                            });
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.delegation_receipt".to_string(),
+                                value: receipt.id.clone(),
+                                endpoint: None,
+                            });
+                            match adapter.run(action).await {
+                                Ok(result) => {
+                                    let merged_external_refs =
+                                        merge_external_refs(base_refs, result.external_refs);
+                                    receipt.remote_task_ref =
+                                        external_ref_value(&merged_external_refs, "a2a.task_id");
+                                    self.store.insert_delegation_receipt(&receipt).await?;
+                                    match result
+                                        .outputs
+                                        .metadata
+                                        .get("a2a_remote_state")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("completed")
+                                    {
+                                        "blocked" => {
+                                            return Ok(ExecutionOutcome::Blocked {
+                                                reason: result
+                                                    .outputs
+                                                    .summary
+                                                    .clone()
+                                                    .unwrap_or_else(|| {
+                                                        "remote A2A agent requested additional input"
+                                                            .to_string()
+                                                    }),
+                                                failure_code: "a2a_input_required".to_string(),
+                                                continuity_mode: None,
+                                                outputs: result.outputs,
+                                                external_refs: merged_external_refs,
+                                                surface_events: result.events,
+                                            });
+                                        }
+                                        "awaiting_approval" => {
+                                            return Ok(ExecutionOutcome::Blocked {
+                                                reason: result
+                                                    .outputs
+                                                    .summary
+                                                    .clone()
+                                                    .unwrap_or_else(|| {
+                                                        "remote A2A agent requested authorization"
+                                                            .to_string()
+                                                    }),
+                                                failure_code: "a2a_auth_required".to_string(),
+                                                continuity_mode: None,
+                                                outputs: result.outputs,
+                                                external_refs: merged_external_refs,
+                                                surface_events: result.events,
+                                            });
+                                        }
+                                        "failed" => {
+                                            return Ok(ExecutionOutcome::Failed {
+                                                reason: result
+                                                    .outputs
+                                                    .summary
+                                                    .clone()
+                                                    .unwrap_or_else(|| {
+                                                        "remote A2A task failed".to_string()
+                                                    }),
+                                                failure_code: failure_code_a2a_task_failed()
+                                                    .to_string(),
+                                                outputs: result.outputs,
+                                                checkpoint: None,
+                                                external_refs: merged_external_refs,
+                                                surface_events: result.events,
+                                            });
+                                        }
+                                        _ => {
+                                            return Ok(ExecutionOutcome::Completed {
+                                                outputs: result.outputs,
+                                                selected_executor: format!(
+                                                    "a2a.{}",
+                                                    adapter.name()
+                                                ),
+                                                checkpoint: None,
+                                                external_refs: merged_external_refs,
+                                                surface_events: result.events,
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    let code = a2a_failure_code(&error);
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "a2a",
+                                                "reason": reason,
+                                                "code": code,
+                                                "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                            }),
+                                        )
+                                        .await?;
+                                    if code == failure_code_treaty_denied() {
+                                        self.store
+                                            .insert_policy_incident(&PolicyIncident {
+                                                id: Uuid::new_v4().to_string(),
+                                                action_id: action.id.clone(),
+                                                doctrine_pack_id: "swarm_frontier_v1".to_string(),
+                                                jurisdiction: JurisdictionClass::ExternalUnknown,
+                                                reason_code: "treaty_denied".to_string(),
+                                                summary: error.to_string(),
+                                                severity: PolicyIncidentSeverity::Critical,
+                                                checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                                created_at: now_timestamp(),
+                                            })
+                                            .await?;
+                                    }
+                                    last_reason = Some(error.to_string());
+                                    last_external_refs = base_refs;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": "a2a",
+                                        "reason": "no A2A binding is configured for task.plan",
+                                        "code": failure_code_route_unavailable(),
+                                        "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                    }),
+                                )
+                                .await?;
+                        }
+                        Err(error) => {
+                            let code = failure_code_treaty_denied();
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": "a2a",
+                                        "reason": error.to_string(),
+                                        "code": code,
+                                        "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                    }),
+                                )
+                                .await?;
+                            self.store
+                                .insert_policy_incident(&PolicyIncident {
+                                    id: Uuid::new_v4().to_string(),
+                                    action_id: action.id.clone(),
+                                    doctrine_pack_id: "swarm_frontier_v1".to_string(),
+                                    jurisdiction: JurisdictionClass::ExternalUnknown,
+                                    reason_code: "treaty_denied".to_string(),
+                                    summary: error.to_string(),
+                                    severity: PolicyIncidentSeverity::Critical,
+                                    checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                    created_at: now_timestamp(),
+                                })
+                                .await?;
+                            last_reason = Some(error.to_string());
+                        }
+                    }
+                }
                 "openclaw" => {
                     attempted_agentic_route = true;
                     match self.resolve_openclaw_adapter(manifest)? {
@@ -2531,6 +2752,50 @@ impl Supervisor {
         ];
         Ok(Some((
             LocalHarnessAdapter::new(binding, self.state_dir()),
+            external_refs,
+        )))
+    }
+
+    fn resolve_a2a_adapter(
+        &self,
+        manifest: &AgentManifest,
+    ) -> anyhow::Result<Option<(A2aAdapter, Vec<ExternalRef>)>> {
+        let binding = manifest.adapters.iter().find_map(|binding| match binding {
+            AdapterBinding::A2a(binding) if binding.capability == "task.plan" => {
+                Some(binding.clone())
+            }
+            _ => None,
+        });
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+
+        let treaty_pack = self
+            .config
+            .treaties
+            .packs
+            .get(&binding.treaty_pack)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "treaty pack {} is not configured for remote delegation",
+                    binding.treaty_pack
+                )
+            })?;
+        let external_refs = vec![
+            ExternalRef {
+                kind: "a2a.agent_card_url".to_string(),
+                value: binding.agent_card_url.clone(),
+                endpoint: Some(binding.agent_card_url.clone()),
+            },
+            ExternalRef {
+                kind: "a2a.remote_principal".to_string(),
+                value: treaty_pack.remote_principal.id.clone(),
+                endpoint: None,
+            },
+        ];
+        Ok(Some((
+            A2aAdapter::new(binding, treaty_pack, self.state_dir()),
             external_refs,
         )))
     }
@@ -2889,6 +3154,7 @@ impl Supervisor {
                 set_action_blocked(&mut action, &failure_code, reason.clone());
                 action.continuity_mode = continuity_mode;
                 action.outputs = outputs;
+                action.selected_executor = selected_executor_from_external_refs(&external_refs);
                 action.external_refs = external_refs;
                 self.store.upsert_action(&action).await?;
                 for event in surface_events {
@@ -2919,6 +3185,7 @@ impl Supervisor {
             }) => {
                 set_action_failed(&mut action, &failure_code, reason.clone());
                 action.outputs = outputs;
+                action.selected_executor = selected_executor_from_external_refs(&external_refs);
                 action.external_refs = external_refs;
                 if let Some(checkpoint) = checkpoint {
                     self.write_checkpoint_for_action(&mut action, &checkpoint)
@@ -4226,6 +4493,26 @@ fn failure_code_openclaw_unsupported_session_mode() -> &'static str {
     "openclaw_unsupported_session_mode"
 }
 
+fn failure_code_a2a_auth_error() -> &'static str {
+    "a2a_auth_error"
+}
+
+fn failure_code_a2a_connect_error() -> &'static str {
+    "a2a_connect_error"
+}
+
+fn failure_code_a2a_protocol_error() -> &'static str {
+    "a2a_protocol_error"
+}
+
+fn failure_code_a2a_task_failed() -> &'static str {
+    "a2a_task_failed"
+}
+
+fn failure_code_treaty_denied() -> &'static str {
+    "treaty_denied"
+}
+
 fn failure_code_route_unavailable() -> &'static str {
     "route_unavailable"
 }
@@ -4419,6 +4706,19 @@ fn openclaw_failure_code(error: &anyhow::Error) -> &'static str {
     failure_code_route_unavailable()
 }
 
+fn a2a_failure_code(error: &anyhow::Error) -> &'static str {
+    if let Some(error) = error.downcast_ref::<A2aError>() {
+        return match error {
+            A2aError::MissingAuthEnv(_) => failure_code_a2a_auth_error(),
+            A2aError::TreatyDenied(_) => failure_code_treaty_denied(),
+            A2aError::AgentCard(_) | A2aError::Connect(_) => failure_code_a2a_connect_error(),
+            A2aError::Protocol(_) => failure_code_a2a_protocol_error(),
+            A2aError::TaskFailed(_) => failure_code_a2a_task_failed(),
+        };
+    }
+    failure_code_route_unavailable()
+}
+
 fn next_fallback_label(deterministic_fallback: bool, fallback: &'static str) -> &'static str {
     if deterministic_fallback {
         fallback
@@ -4435,10 +4735,27 @@ fn set_action_failed(action: &mut Action, code: &str, reason: String) {
 }
 
 fn set_action_blocked(action: &mut Action, code: &str, reason: String) {
-    action.phase = ActionPhase::Blocked;
+    action.phase = if code == "a2a_auth_required" {
+        ActionPhase::AwaitingApproval
+    } else {
+        ActionPhase::Blocked
+    };
     action.finished_at = None;
     action.failure_reason = Some(reason);
     action.failure_code = Some(code.to_string());
+}
+
+fn selected_executor_from_external_refs(external_refs: &[ExternalRef]) -> Option<String> {
+    external_ref_value(external_refs, "a2a.remote_principal")
+        .map(|principal| format!("a2a.{principal}"))
+        .or_else(|| {
+            external_ref_value(external_refs, "openclaw.target_agent")
+                .map(|agent| format!("openclaw.{agent}"))
+        })
+        .or_else(|| {
+            external_ref_value(external_refs, "local_harness.harness")
+                .map(|harness| format!("local_harness.{harness}"))
+        })
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4610,6 +4927,24 @@ fn default_doctrine_pack(
                 required_checkpoints: vec![crawfish_types::OversightCheckpoint::PreDispatch],
             },
         );
+        if matches!(
+            interaction_model,
+            crawfish_types::InteractionModel::RemoteAgent
+        ) {
+            rules.insert(
+                2,
+                crawfish_types::DoctrineRule {
+                    id: "treaty_before_remote_delegation".to_string(),
+                    title: "Remote delegation requires a treaty".to_string(),
+                    summary: "Remote agent delegation must prove treaty scope and delegation evidence before dispatch and after results return.".to_string(),
+                    required_checkpoints: vec![
+                        crawfish_types::OversightCheckpoint::Admission,
+                        crawfish_types::OversightCheckpoint::PreDispatch,
+                        crawfish_types::OversightCheckpoint::PostResult,
+                    ],
+                },
+            );
+        }
     } else {
         rules.insert(
             0,
@@ -4634,7 +4969,16 @@ fn default_doctrine_pack(
         });
     }
 
-    let (id, title, summary) = if interaction_model_is_frontier(interaction_model) {
+    let (id, title, summary) = if matches!(
+        interaction_model,
+        crawfish_types::InteractionModel::RemoteAgent
+    ) {
+        (
+            "remote_agent_treaty_v1",
+            "Remote agent treaty doctrine",
+            "Remote agents are not just another harness; delegation requires treaty scope, checkpoint evidence, and inspectable lineage.",
+        )
+    } else if interaction_model_is_frontier(interaction_model) {
         (
             "swarm_frontier_v1",
             "Swarm frontier doctrine",
@@ -4665,6 +5009,10 @@ fn checkpoint_status_for_action(
     profile_resolved: bool,
 ) -> Vec<CheckpointStatus> {
     use crawfish_types::{CheckpointOutcome, OversightCheckpoint};
+    let interaction_model = interaction_model_for_action(action, None);
+    let has_remote_treaty = external_ref_value(&action.external_refs, "a2a.treaty_pack").is_some();
+    let has_remote_receipt =
+        external_ref_value(&action.external_refs, "a2a.delegation_receipt").is_some();
 
     let requires = |checkpoint: OversightCheckpoint| {
         doctrine
@@ -4684,6 +5032,10 @@ fn checkpoint_status_for_action(
             checkpoint: OversightCheckpoint::PreDispatch,
             required: requires(OversightCheckpoint::PreDispatch),
             outcome: if action.selected_executor.is_some()
+                && (!matches!(
+                    interaction_model,
+                    crawfish_types::InteractionModel::RemoteAgent
+                ) || has_remote_treaty)
                 || matches!(
                     action.phase,
                     ActionPhase::Completed | ActionPhase::Failed | ActionPhase::Blocked
@@ -4729,6 +5081,10 @@ fn checkpoint_status_for_action(
             } else if has_trace_bundle
                 && (!evaluation_required_for_action(action)
                     || (profile_resolved && latest_evaluation.is_some()))
+                && (!matches!(
+                    interaction_model,
+                    crawfish_types::InteractionModel::RemoteAgent
+                ) || has_remote_receipt)
             {
                 CheckpointOutcome::Passed
             } else {
@@ -4740,6 +5096,12 @@ fn checkpoint_status_for_action(
                 Some("evaluation profile required but unresolved".to_string())
             } else if evaluation_required_for_action(action) && latest_evaluation.is_none() {
                 Some("evaluation required but missing".to_string())
+            } else if matches!(
+                interaction_model,
+                crawfish_types::InteractionModel::RemoteAgent
+            ) && !has_remote_receipt
+            {
+                Some("remote delegation receipt is missing".to_string())
             } else {
                 Some("terminal evidence present".to_string())
             },
@@ -6789,16 +7151,28 @@ mod tests {
         task_planner_manifest: String,
         openclaw_gateway_url: Option<&str>,
     ) -> anyhow::Result<Arc<Supervisor>> {
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml").to_string();
+        build_supervisor_with_task_planner_manifest_and_config(
+            dir,
+            task_planner_manifest,
+            config,
+            openclaw_gateway_url,
+        )
+        .await
+    }
+
+    async fn build_supervisor_with_task_planner_manifest_and_config(
+        dir: &Path,
+        task_planner_manifest: String,
+        config_contents: String,
+        openclaw_gateway_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Supervisor>> {
         tokio::fs::create_dir_all(dir.join("agents")).await?;
         tokio::fs::create_dir_all(dir.join(".crawfish/state")).await?;
         tokio::fs::create_dir_all(dir.join(".crawfish/run")).await?;
         tokio::fs::create_dir_all(dir.join("src")).await?;
         tokio::fs::create_dir_all(dir.join("tests")).await?;
-        tokio::fs::write(
-            dir.join("Crawfish.toml"),
-            include_str!("../../../examples/hero-swarm/Crawfish.toml"),
-        )
-        .await?;
+        tokio::fs::write(dir.join("Crawfish.toml"), config_contents).await?;
         tokio::fs::write(
             dir.join("src/lib.rs"),
             "pub fn value() -> u32 { 42 } // TODO follow up\n",
@@ -6992,7 +7366,7 @@ id = "local-dev"
 display_name = "Local Developer"
 
 [contract_defaults.execution]
-preferred_harnesses = ["claude_code", "codex", "openclaw"]
+preferred_harnesses = ["claude_code", "codex", "a2a", "openclaw"]
 fallback_chain = ["deterministic"]
 
 [contract_defaults.safety]
@@ -7046,6 +7420,16 @@ default_trust_domain = "same_device_foreign_owner"
 required_scopes = ["planning:read", "planning:propose"]
 lease_required = false
 workspace_policy = "crawfish_managed"
+
+[[adapters]]
+adapter = "a2a"
+capability = "task.plan"
+agent_card_url = "http://127.0.0.1:7788/agent-card.json"
+auth_ref = "A2A_REMOTE_TOKEN"
+treaty_pack = "remote_task_planning"
+required_scopes = ["planning:read", "planning:propose"]
+streaming_mode = "prefer_streaming"
+allow_in_task_auth = false
 "#
         )
     }
@@ -7338,6 +7722,143 @@ workspace_policy = "crawfish_managed"
             }
         });
         format!("ws://{address}")
+    }
+
+    #[derive(Clone, Copy)]
+    enum RuntimeA2aMode {
+        StreamingCompleted,
+        InputRequired,
+        AuthRequired,
+    }
+
+    #[derive(Clone)]
+    struct RuntimeA2aState {
+        mode: RuntimeA2aMode,
+    }
+
+    async fn spawn_runtime_a2a_server(mode: RuntimeA2aMode) -> String {
+        let app = Router::new()
+            .route("/agent-card.json", get(runtime_a2a_agent_card))
+            .route("/rpc", post(runtime_a2a_rpc))
+            .with_state(RuntimeA2aState { mode });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/agent-card.json")
+    }
+
+    async fn runtime_a2a_agent_card(
+        AxumState(_state): AxumState<RuntimeA2aState>,
+        request: Request<axum::body::Body>,
+    ) -> Json<Value> {
+        let host = request
+            .headers()
+            .get("host")
+            .and_then(|header| header.to_str().ok())
+            .unwrap_or("127.0.0.1:0");
+        Json(serde_json::json!({
+            "id": "remote-task-planner",
+            "name": "remote-task-planner",
+            "url": format!("http://{host}/rpc"),
+            "capabilities": ["task.plan"],
+            "skills": [{"id": "task.plan", "name": "task.plan", "tags": ["task.plan"]}]
+        }))
+    }
+
+    async fn runtime_a2a_rpc(
+        AxumState(state): AxumState<RuntimeA2aState>,
+        Json(payload): Json<Value>,
+    ) -> Json<Value> {
+        let method = payload
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let id = payload.get("id").cloned().unwrap_or(Value::Null);
+        let response = match (state.mode, method) {
+            (RuntimeA2aMode::StreamingCompleted, "message/stream") => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "task": {
+                        "id": "remote-task-1",
+                        "status": { "state": "completed" },
+                        "result": {
+                            "text": "# Task Plan\n1. Inspect the objective and the context files.\n2. Produce a proposal-only plan with ordered steps and rollout notes.\nRisks: remote coordination can drift from local assumptions.\nAssumptions: the plan remains proposal-only.\nTest: verify the proposal covers desired outputs."
+                        }
+                    },
+                    "events": [
+                        { "kind": "lifecycle", "state": "working" },
+                        { "kind": "assistant", "text": "Remote planner is preparing a task plan." }
+                    ]
+                }
+            }),
+            (RuntimeA2aMode::InputRequired | RuntimeA2aMode::AuthRequired, "message/stream") => {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "message": "stream unsupported" }
+                })
+            }
+            (_, "message/send") => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "task": {
+                        "id": "remote-task-1",
+                        "status": { "state": "submitted" }
+                    }
+                }
+            }),
+            (RuntimeA2aMode::InputRequired, "tasks/get") => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "task": {
+                        "id": "remote-task-1",
+                        "status": {
+                            "state": "input-required",
+                            "message": "Remote planner needs more input."
+                        }
+                    }
+                }
+            }),
+            (RuntimeA2aMode::AuthRequired, "tasks/get") => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "task": {
+                        "id": "remote-task-1",
+                        "status": {
+                            "state": "auth-required",
+                            "message": "Remote planner requires authorization."
+                        }
+                    }
+                }
+            }),
+            (_, "tasks/get") => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "task": {
+                        "id": "remote-task-1",
+                        "status": {
+                            "state": "completed"
+                        },
+                        "result": {
+                            "text": "# Task Plan\n1. Inspect the objective and the context files.\n2. Produce a proposal-only plan with ordered steps and rollout notes.\nRisks: remote coordination can drift from local assumptions.\nAssumptions: the plan remains proposal-only.\nTest: verify the proposal covers desired outputs."
+                        }
+                    }
+                }
+            }),
+            (_, other) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "message": format!("unexpected method: {other}") }
+            }),
+        };
+        Json(response)
     }
 
     #[tokio::test]
@@ -7821,6 +8342,268 @@ EOF
             .events
             .iter()
             .any(|event| event.event_type == "openclaw_run_started"));
+    }
+
+    #[tokio::test]
+    async fn task_plan_routes_to_a2a_and_surfaces_treaty_lineage() {
+        let dir = tempdir().unwrap();
+        let a2a_url = spawn_runtime_a2a_server(RuntimeA2aMode::StreamingCompleted).await;
+        std::env::set_var("A2A_REMOTE_TOKEN", "remote-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
+            .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Plan a treaty-governed remote task rollout",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Completed);
+        assert_eq!(
+            detail.selected_executor.as_deref(),
+            Some("a2a.remote-task-planner")
+        );
+        assert_eq!(
+            detail.interaction_model,
+            Some(crawfish_types::InteractionModel::RemoteAgent)
+        );
+        assert_eq!(detail.remote_task_ref.as_deref(), Some("remote-task-1"));
+        assert_eq!(
+            detail
+                .remote_principal
+                .as_ref()
+                .map(|principal| principal.id.as_str()),
+            Some("remote-task-planner")
+        );
+        assert_eq!(
+            detail
+                .treaty_summary
+                .as_ref()
+                .map(|treaty| treaty.id.as_str()),
+            Some("remote_task_planning")
+        );
+        assert!(detail.delegation_receipt_ref.is_some());
+        assert!(
+            detail
+                .external_refs
+                .iter()
+                .any(|reference| reference.kind == "a2a.task_id"
+                    && reference.value == "remote-task-1")
+        );
+        let trace = supervisor
+            .store()
+            .get_trace_bundle(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("trace bundle");
+        assert_eq!(
+            trace.interaction_model,
+            Some(crawfish_types::InteractionModel::RemoteAgent)
+        );
+        assert_eq!(
+            trace.treaty_pack_id.as_deref(),
+            Some("remote_task_planning")
+        );
+        assert_eq!(trace.remote_task_ref.as_deref(), Some("remote-task-1"));
+        let events = supervisor
+            .list_action_events(&submitted.action_id)
+            .await
+            .unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "a2a_run_started"));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "a2a_run_completed"));
+    }
+
+    #[tokio::test]
+    async fn task_plan_without_treaty_is_denied_before_remote_dispatch() {
+        let dir = tempdir().unwrap();
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace(
+            "preferred_harnesses = [\"claude_code\", \"codex\", \"a2a\", \"openclaw\"]",
+            "preferred_harnesses = [\"a2a\"]",
+        )
+        .replace(
+            "fallback_chain = [\"deterministic\"]",
+            "fallback_chain = []",
+        )
+        .replace(
+            "treaty_pack = \"remote_task_planning\"",
+            "treaty_pack = \"missing_treaty\"",
+        );
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml").to_string();
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Attempt remote delegation without a treaty",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Blocked);
+        assert!(detail.delegation_receipt_ref.is_none());
+        assert!(detail.remote_task_ref.is_none());
+        let events = supervisor
+            .list_action_events(&submitted.action_id)
+            .await
+            .unwrap();
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "route_degraded"
+                && event.payload.get("code").and_then(Value::as_str) == Some("treaty_denied")
+        }));
+        assert!(detail.policy_incidents.iter().any(|incident| {
+            incident.reason_code == "treaty_denied"
+                || incident.reason_code == "frontier_enforcement_gap"
+        }));
+    }
+
+    #[tokio::test]
+    async fn task_plan_a2a_input_required_maps_to_blocked() {
+        let dir = tempdir().unwrap();
+        let a2a_url = spawn_runtime_a2a_server(RuntimeA2aMode::InputRequired).await;
+        std::env::set_var("A2A_REMOTE_TOKEN", "remote-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace(
+            "preferred_harnesses = [\"claude_code\", \"codex\", \"a2a\", \"openclaw\"]",
+            "preferred_harnesses = [\"a2a\", \"openclaw\"]",
+        )
+        .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
+            .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Request input-required remote planning",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Blocked);
+        assert_eq!(
+            detail.selected_executor.as_deref(),
+            Some("a2a.remote-task-planner")
+        );
+        assert_eq!(detail.remote_task_ref.as_deref(), Some("remote-task-1"));
+        assert_eq!(
+            detail.action.failure_code.as_deref(),
+            Some("a2a_input_required")
+        );
+    }
+
+    #[tokio::test]
+    async fn task_plan_a2a_auth_required_maps_to_awaiting_approval() {
+        let dir = tempdir().unwrap();
+        let a2a_url = spawn_runtime_a2a_server(RuntimeA2aMode::AuthRequired).await;
+        std::env::set_var("A2A_REMOTE_TOKEN", "remote-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace(
+            "preferred_harnesses = [\"claude_code\", \"codex\", \"a2a\", \"openclaw\"]",
+            "preferred_harnesses = [\"a2a\", \"openclaw\"]",
+        )
+        .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
+            .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Request auth-required remote planning",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::AwaitingApproval);
+        assert_eq!(
+            detail.selected_executor.as_deref(),
+            Some("a2a.remote-task-planner")
+        );
+        assert_eq!(detail.remote_task_ref.as_deref(), Some("remote-task-1"));
+        assert_eq!(
+            detail.action.failure_code.as_deref(),
+            Some("a2a_auth_required")
+        );
     }
 
     #[tokio::test]

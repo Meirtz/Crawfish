@@ -32,6 +32,35 @@ owner_id = "foreign-owner"
 display_name = "Foreign Gateway"
 allowed_scopes = ["crawfish.read", "crawfish.submit"]
 
+[treaties.packs.remote_task_planning]
+id = "remote_task_planning"
+title = "Remote task planning treaty"
+summary = "Allow proposal-only remote task planning across a governed remote agent boundary."
+allowed_capabilities = ["task.plan"]
+allowed_data_scopes = ["objective", "context_files", "desired_outputs"]
+allowed_artifact_classes = ["task_plan.json", "task_plan.md"]
+allowed_auth_forwarding_mode = "none"
+required_checkpoints = ["admission", "pre_dispatch", "post_result"]
+max_delegation_depth = 1
+review_policy = "evaluation_profile"
+
+[treaties.packs.remote_task_planning.local_owner]
+kind = "human"
+id = "local-dev"
+display_name = "Local Developer"
+
+[treaties.packs.remote_task_planning.remote_principal]
+id = "remote-task-planner"
+display_name = "Remote Task Planner"
+agent_card_url = "http://127.0.0.1:7788/agent-card.json"
+trust_domain = "public_unknown"
+
+[[treaties.packs.remote_task_planning.clauses]]
+id = "proposal_only_remote_task_plan"
+title = "Proposal-only remote planning"
+summary = "Remote delegation may only return proposal artifacts and must satisfy treaty checkpoints."
+required_checkpoints = ["admission", "pre_dispatch", "post_result"]
+
 [runtime]
 reconcile_interval_ms = 5000
 
