@@ -41,6 +41,13 @@ The repository currently ships two explicit delivery tracks:
 
 Both tracks remain compiled and tested. Only the mainline alpha path is the public happy path and default project template.
 
+The runtime spine follows the same split in code organization:
+
+- the **mainline support center** is the local control-plane path built out of action lifecycle, execution routing, governance, evaluation, and operator surfaces for local swarm work
+- the **retained experimental subtree** holds OpenClaw, A2A, treaty, federation, remote evidence, and remote follow-up orchestration
+
+Both are part of the same runtime. Only the first is the supported onboarding center for this release line.
+
 ## Runtime Model
 
 ### Component Topology

@@ -103,90 +103,8 @@ The current supported getting-started path is deliberately narrow:
 
 OpenClaw, A2A, treaties, federation packs, remote evidence, and remote follow-up remain in the repository as **experimental alpha** surfaces. They still compile and run under CI, but they are not the public happy path and they are not what `crawfish init` generates by default.
 
-## Experimental Alpha: Remote-Agent Governance
+The deeper remote-governance discussion is retained as an experimental appendix later in this document; it is not the mainline onboarding path.
 
-The sections below describe retained but experimental remote-governance surfaces rather than the recommended onboarding path.
-
-### Why Remote Agents Are Not Just Another Harness
-
-Remote agents are not only remote processes. They are separate authorities.
-
-A harness crossing changes the execution surface. A remote-agent crossing changes the governance problem. A2A's [Agent Card](https://github.com/a2aproject/A2A) model and task lifecycle make that explicit: the runtime is delegating work to another agent system, not just spawning another wrapper on the same machine.
-
-That is why Crawfish treats remote delegation differently:
-
-- harnesses are selected execution surfaces
-- remote agents are treaty-governed delegation targets
-- federation packs decide how remote states, evidence gaps, and remote results are interpreted after delegation
-- doctrine still applies, but treaties decide whether cross-system delegation is allowed at all
-- remote task lineage, remote principal identity, and delegation receipts must remain inspectable
-
-### Why Treaties Precede Marketplaces
-
-Before reputation systems, marketplaces, or federation policy packs, a swarm needs a lawful basis for remote delegation.
-
-In Crawfish, that basis is the treaty.
-
-A treaty decides:
-
-- which remote principal is recognized
-- which capabilities may be delegated
-- which data scopes may cross the boundary
-- which artifact classes may come back
-- which checkpoints and result evidence are mandatory
-- whether missing evidence should be escalated or denied
-
-That is why the current [A2A](https://github.com/a2aproject/A2A) line is treaty-governed rather than marketplace-driven. Google's ["A2A: A New Era of Agent Interoperability"](https://developers.googleblog.com/a2a-a-new-era-of-agent-interoperability/) gives the task-plane shape. Crawfish adds the control-plane question: not just **can** the swarm delegate, but **under what treaty**, **with what evidence**, and **how does the runtime respond when the evidence comes back incomplete**.
-
-Markets can come later. The treaty has to come first.
-
-### Why Federation Packs Matter After The Treaty
-
-Treaties answer the first question: **may this swarm delegate across the boundary at all?**
-
-Federation packs answer the next question: **once the remote side starts talking back, how should the control plane interpret what it sees?**
-
-That second question matters because remote-agent governance does not end at dispatch:
-
-- a remote task can return `input-required`
-- it can demand auth instead of finishing
-- it can return artifacts that are technically well-formed but outside the allowed class or scope
-- it can finish without enough evidence for the local control plane to trust the result
-
-So Crawfish now separates the two responsibilities:
-
-- treaty packs define whether delegation is lawful
-- federation packs define how remote state, evidence, and results are escalated, reviewed, accepted, or rejected
-
-That is how a control plane turns remote delegation from “we made an HTTP call” into governable swarm behavior.
-
-### Why Evidence Bundles Decide Admissibility
-
-Treaties decide whether remote delegation is lawful. Federation packs decide how remote state and remote results should be interpreted. But neither is enough unless the runtime can produce an admissible evidence bundle when the remote side replies.
-
-That is why Crawfish now treats remote evidence as a first-class control-plane object:
-
-- remote terminal state evidence
-- remote artifact manifest
-- remote scope and data evidence
-- checkpoint evidence for `admission`, `pre_dispatch`, and `post_result`
-- treaty violations, policy incidents, and review disposition
-
-This follows the same broad lesson behind LangSmith's [observability concepts](https://docs.langchain.com/langsmith/observability-concepts): traces matter because they preserve evidence, not because they make the UI look richer. In Crawfish, evidence bundles are what decide whether a remote result is admissible, blocked for review, or rejected.
-
-Remote review is therefore not a UI-only feature. It is the operator workflow that turns a treaty-governed but ambiguous remote outcome into an explicit control-plane result:
-
-- `accept_result`
-- `reject_result`
-- `needs_followup`
-
-`needs_followup` is now a real control-plane continuation. Crawfish creates a structured `RemoteFollowupRequest`, keeps the action blocked, preserves the prior remote evidence bundle, and requires an explicit operator-triggered re-dispatch before the same action may create a fresh remote attempt.
-
-That is why the project is **Rust-first, not Rust-only**:
-
-- `crates/` is the implementation spine for the runtime, control plane, storage, and native outbound adapters.
-- `integrations/` is the edge zone for isolated bridge packages where a non-Rust implementation is pragmatic.
-- The current example is [`integrations/openclaw-inbound/`](integrations/openclaw-inbound/), a thin TypeScript ingress bridge. The policy engine, lifecycle authority, storage, and runtime decisions remain in Rust.
 
 ## What The Control Plane Enforces
 
@@ -372,8 +290,6 @@ For the full reference walkthrough, run [`examples/hero-swarm/demo.sh`](examples
 
 If `claude` or `codex` is installed locally, `task_planner` will prefer those harnesses first. If neither local wrapper is available, Crawfish falls back to deterministic planning when the compiled contract allows it.
 
-Experimental remote and federation examples live under [`examples/experimental/`](examples/experimental/).
-
 ## Public Status
 
 Crawfish is public and maintained seriously, but it is still **alpha**.
@@ -411,3 +327,90 @@ Project maintenance policy lives in:
 - [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md)
 - [`.github/SECURITY.md`](.github/SECURITY.md)
 - [`.github/SUPPORT.md`](.github/SUPPORT.md)
+
+## Experimental Alpha Appendix: Remote-Agent Governance
+
+The sections below describe retained but experimental remote-governance surfaces rather than the recommended onboarding path.
+
+### Why Remote Agents Are Not Just Another Harness
+
+Remote agents are not only remote processes. They are separate authorities.
+
+A harness crossing changes the execution surface. A remote-agent crossing changes the governance problem. A2A's [Agent Card](https://github.com/a2aproject/A2A) model and task lifecycle make that explicit: the runtime is delegating work to another agent system, not just spawning another wrapper on the same machine.
+
+That is why Crawfish treats remote delegation differently:
+
+- harnesses are selected execution surfaces
+- remote agents are treaty-governed delegation targets
+- federation packs decide how remote states, evidence gaps, and remote results are interpreted after delegation
+- doctrine still applies, but treaties decide whether cross-system delegation is allowed at all
+- remote task lineage, remote principal identity, and delegation receipts must remain inspectable
+
+### Why Treaties Precede Marketplaces
+
+Before reputation systems, marketplaces, or federation policy packs, a swarm needs a lawful basis for remote delegation.
+
+In Crawfish, that basis is the treaty.
+
+A treaty decides:
+
+- which remote principal is recognized
+- which capabilities may be delegated
+- which data scopes may cross the boundary
+- which artifact classes may come back
+- which checkpoints and result evidence are mandatory
+- whether missing evidence should be escalated or denied
+
+That is why the current [A2A](https://github.com/a2aproject/A2A) line is treaty-governed rather than marketplace-driven. Google's ["A2A: A New Era of Agent Interoperability"](https://developers.googleblog.com/a2a-a-new-era-of-agent-interoperability/) gives the task-plane shape. Crawfish adds the control-plane question: not just **can** the swarm delegate, but **under what treaty**, **with what evidence**, and **how does the runtime respond when the evidence comes back incomplete**.
+
+Markets can come later. The treaty has to come first.
+
+### Why Federation Packs Matter After The Treaty
+
+Treaties answer the first question: **may this swarm delegate across the boundary at all?**
+
+Federation packs answer the next question: **once the remote side starts talking back, how should the control plane interpret what it sees?**
+
+That second question matters because remote-agent governance does not end at dispatch:
+
+- a remote task can return `input-required`
+- it can demand auth instead of finishing
+- it can return artifacts that are technically well-formed but outside the allowed class or scope
+- it can finish without enough evidence for the local control plane to trust the result
+
+So Crawfish now separates the two responsibilities:
+
+- treaty packs define whether delegation is lawful
+- federation packs define how remote state, evidence, and results are escalated, reviewed, accepted, or rejected
+
+That is how a control plane turns remote delegation from “we made an HTTP call” into governable swarm behavior.
+
+### Why Evidence Bundles Decide Admissibility
+
+Treaties decide whether remote delegation is lawful. Federation packs decide how remote state and remote results should be interpreted. But neither is enough unless the runtime can produce an admissible evidence bundle when the remote side replies.
+
+That is why Crawfish now treats remote evidence as a first-class control-plane object:
+
+- remote terminal state evidence
+- remote artifact manifest
+- remote scope and data evidence
+- checkpoint evidence for `admission`, `pre_dispatch`, and `post_result`
+- treaty violations, policy incidents, and review disposition
+
+This follows the same broad lesson behind LangSmith's [observability concepts](https://docs.langchain.com/langsmith/observability-concepts): traces matter because they preserve evidence, not because they make the UI look richer. In Crawfish, evidence bundles are what decide whether a remote result is admissible, blocked for review, or rejected.
+
+Remote review is therefore not a UI-only feature. It is the operator workflow that turns a treaty-governed but ambiguous remote outcome into an explicit control-plane result:
+
+- `accept_result`
+- `reject_result`
+- `needs_followup`
+
+`needs_followup` is now a real control-plane continuation. Crawfish creates a structured `RemoteFollowupRequest`, keeps the action blocked, preserves the prior remote evidence bundle, and requires an explicit operator-triggered re-dispatch before the same action may create a fresh remote attempt.
+
+That is why the project is **Rust-first, not Rust-only**:
+
+- `crates/` is the implementation spine for the runtime, control plane, storage, and native outbound adapters.
+- `integrations/` is the edge zone for isolated bridge packages where a non-Rust implementation is pragmatic.
+- The current example is [`integrations/openclaw-inbound/`](integrations/openclaw-inbound/), a thin TypeScript ingress bridge. The policy engine, lifecycle authority, storage, and runtime decisions remain in Rust.
+
+Experimental remote and federation examples live under [`examples/experimental/`](examples/experimental/).
