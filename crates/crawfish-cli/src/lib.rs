@@ -5,12 +5,12 @@ use crawfish_core::{
     ActionEventsResponse, ActionListResponse, ActionTraceResponse, AdminActionResponse,
     AgentDetail, AlertListResponse, ApproveActionRequest, CrawfishConfig,
     EvaluationDatasetDetailResponse, EvaluationDatasetsResponse, ExecutionContractPatch,
-    ExperimentRunDetailResponse, PairwiseExperimentRunDetailResponse, PolicyValidationRequest,
-    PolicyValidationResponse, RejectActionRequest, ResolveReviewQueueItemRequest,
-    ResolveReviewQueueItemResponse, ReviewQueueResponse, RevokeLeaseRequest,
-    StartEvaluationRunRequest, StartEvaluationRunResponse, StartPairwiseEvaluationRunRequest,
-    StartPairwiseEvaluationRunResponse, SubmitActionRequest, SubmittedAction, SwarmStatusResponse,
-    TreatyDetailResponse, TreatyListResponse,
+    ExperimentRunDetailResponse, FederationPackDetailResponse, FederationPackListResponse,
+    PairwiseExperimentRunDetailResponse, PolicyValidationRequest, PolicyValidationResponse,
+    RejectActionRequest, ResolveReviewQueueItemRequest, ResolveReviewQueueItemResponse,
+    ReviewQueueResponse, RevokeLeaseRequest, StartEvaluationRunRequest, StartEvaluationRunResponse,
+    StartPairwiseEvaluationRunRequest, StartPairwiseEvaluationRunResponse, SubmitActionRequest,
+    SubmittedAction, SwarmStatusResponse, TreatyDetailResponse, TreatyListResponse,
 };
 use crawfish_runtime::Supervisor;
 use crawfish_types::{
@@ -47,6 +47,7 @@ pub enum Commands {
     Eval(EvalCommand),
     Alert(AlertCommand),
     Treaty(TreatyCommand),
+    Federation(FederationCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +139,18 @@ pub enum TreatySubcommands {
 pub struct TreatyCommand {
     #[command(subcommand)]
     pub command: TreatySubcommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FederationSubcommands {
+    List(FederationListCommand),
+    Show(FederationShowCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct FederationCommand {
+    #[command(subcommand)]
+    pub command: FederationSubcommands,
 }
 
 #[derive(Debug, Args)]
@@ -461,6 +474,23 @@ pub struct TreatyShowCommand {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct FederationListCommand {
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FederationShowCommand {
+    pub federation_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
 impl From<OwnerKindArg> for OwnerKind {
     fn from(value: OwnerKindArg) -> Self {
         match value {
@@ -531,6 +561,10 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Commands::Treaty(treaty) => match treaty.command {
             TreatySubcommands::List(command) => treaty_list_command(command).await,
             TreatySubcommands::Show(command) => treaty_show_command(command).await,
+        },
+        Commands::Federation(federation) => match federation.command {
+            FederationSubcommands::List(command) => federation_list_command(command).await,
+            FederationSubcommands::Show(command) => federation_show_command(command).await,
         },
     }
 }
@@ -920,6 +954,22 @@ async fn treaty_show_command(command: TreatyShowCommand) -> anyhow::Result<()> {
     let client = DaemonClient::from_config(&command.config)?;
     let response: TreatyDetailResponse = client
         .get_json(&format!("/v1/treaties/{}", command.treaty_id))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn federation_list_command(command: FederationListCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: FederationPackListResponse = client.get_json("/v1/federation/packs").await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn federation_show_command(command: FederationShowCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: FederationPackDetailResponse = client
+        .get_json(&format!("/v1/federation/packs/{}", command.federation_id))
         .await?;
     print_output(serde_json::to_value(response)?, command.json)?;
     Ok(())

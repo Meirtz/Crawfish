@@ -16,15 +16,15 @@ use crawfish_core::{
     ApproveActionRequest, CheckpointStore, CompiledExecutionPlan, CrawfishConfig,
     DeterministicExecutor, EncounterDecision, EncounterDisposition, EncounterRequest,
     EvaluationDatasetDetailResponse, EvaluationDatasetsResponse, ExecutionContractPatch,
-    ExecutionSurface, ExperimentRunDetailResponse, GovernanceContext, HealthResponse,
-    OpenClawAgentStatusResponse, OpenClawCallerContext, OpenClawInboundActionRequest,
-    OpenClawInboundActionResponse, OpenClawInspectionContext, PairwiseExperimentRunDetailResponse,
-    PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest,
-    ResolveReviewQueueItemRequest, ResolveReviewQueueItemResponse, ReviewQueueResponse,
-    RevokeLeaseRequest, StartEvaluationRunRequest, StartEvaluationRunResponse,
-    StartPairwiseEvaluationRunRequest, StartPairwiseEvaluationRunResponse, SubmitActionRequest,
-    SubmittedAction, SupervisorControl, SwarmStatusResponse, TreatyDetailResponse,
-    TreatyListResponse,
+    ExecutionSurface, ExperimentRunDetailResponse, FederationPackDetailResponse,
+    FederationPackListResponse, GovernanceContext, HealthResponse, OpenClawAgentStatusResponse,
+    OpenClawCallerContext, OpenClawInboundActionRequest, OpenClawInboundActionResponse,
+    OpenClawInspectionContext, PairwiseExperimentRunDetailResponse, PolicyValidationRequest,
+    PolicyValidationResponse, RejectActionRequest, ResolveReviewQueueItemRequest,
+    ResolveReviewQueueItemResponse, ReviewQueueResponse, RevokeLeaseRequest,
+    StartEvaluationRunRequest, StartEvaluationRunResponse, StartPairwiseEvaluationRunRequest,
+    StartPairwiseEvaluationRunResponse, SubmitActionRequest, SubmittedAction, SupervisorControl,
+    SwarmStatusResponse, TreatyDetailResponse, TreatyListResponse,
 };
 use crawfish_harness_local::{LocalHarnessAdapter, LocalHarnessError};
 use crawfish_mcp::McpAdapter;
@@ -38,11 +38,12 @@ use crawfish_types::{
     DegradedProfileName, DeterministicCheckpoint, DoctrinePack, EncounterRecord, EncounterState,
     EvaluationDataset, EvaluationProfile, EvaluationRecord, EvaluationStatus, ExecutionStrategy,
     ExecutionStrategyMode, ExperimentCaseResult, ExperimentCaseStatus, ExperimentRun,
-    ExperimentRunStatus, ExternalRef, FeedbackNote, FeedbackPolicy, HealthStatus,
-    JurisdictionClass, LifecycleRecord, LocalHarnessKind, Metadata, Mutability, NumericComparison,
-    OversightCheckpoint, OwnerKind, OwnerRef, PairwiseCaseResult, PairwiseExperimentRun,
-    PairwiseExperimentRunStatus, PairwiseOutcome, PairwiseProfile, PolicyIncident,
-    PolicyIncidentSeverity, RequesterKind, ReviewQueueItem, ReviewQueueKind, ReviewQueueStatus,
+    ExperimentRunStatus, ExternalRef, FederationDecision, FederationPack, FeedbackNote,
+    FeedbackPolicy, HealthStatus, JurisdictionClass, LifecycleRecord, LocalHarnessKind, Metadata,
+    Mutability, NumericComparison, OversightCheckpoint, OwnerKind, OwnerRef, PairwiseCaseResult,
+    PairwiseExperimentRun, PairwiseExperimentRunStatus, PairwiseOutcome, PairwiseProfile,
+    PolicyIncident, PolicyIncidentSeverity, RemoteEvidenceStatus, RemoteResultAcceptance,
+    RemoteStateDisposition, RequesterKind, ReviewQueueItem, ReviewQueueKind, ReviewQueueStatus,
     ScorecardCriterion, ScorecardCriterionKind, ScorecardSpec, StrategyCheckpointState,
     TraceBundle, TrustDomain, VerificationStatus, VerificationSummary, VerifyLoopFailureMode,
     WorkspaceEdit, WorkspaceEditOp,
@@ -870,6 +871,7 @@ impl Supervisor {
         } else {
             None
         };
+        let federation_pack_id = federation_pack_id_for_action(action);
         let trace = TraceBundle {
             id: format!("trace-{}", action.id),
             action_id: action.id.clone(),
@@ -928,9 +930,13 @@ impl Supervisor {
                 .as_ref()
                 .map(|receipt| receipt.remote_principal.clone()),
             treaty_pack_id: external_ref_value(&action.external_refs, "a2a.treaty_pack"),
+            federation_pack_id: federation_pack_id.clone(),
+            federation_decision: federation_decision_for_action(action),
             delegation_receipt_ref,
             remote_task_ref: external_ref_value(&action.external_refs, "a2a.task_id"),
             remote_outcome_disposition: remote_outcome_disposition_for_action(action),
+            remote_evidence_status: remote_evidence_status_for_action(action),
+            remote_state_disposition: remote_state_disposition_for_action(action),
             treaty_violations: treaty_violations_for_action(action),
             delegation_depth: delegation_depth_for_action(action),
             created_at: now_timestamp(),
@@ -973,6 +979,8 @@ impl Supervisor {
             interaction_model: Some(interaction_model.clone()),
             remote_outcome_disposition: remote_outcome_disposition_for_action(action),
             treaty_violation_count: treaty_violations_for_action(action).len() as u32,
+            federation_pack_id: federation_pack_id_for_action(action),
+            remote_evidence_status: remote_evidence_status_for_action(action),
             feedback_note_id: None,
             created_at: now_timestamp(),
         }])
@@ -1049,10 +1057,17 @@ impl Supervisor {
     ) -> anyhow::Result<Option<ReviewQueueItem>> {
         let treaty_pack = external_ref_value(&action.external_refs, "a2a.treaty_pack")
             .and_then(|treaty_id| self.config.treaties.packs.get(&treaty_id).cloned());
+        let federation_pack = federation_pack_id_for_action(action)
+            .and_then(|pack_id| self.resolve_federation_pack_by_id(&pack_id, treaty_pack.as_ref()));
         let remote_outcome_disposition = remote_outcome_disposition_for_action(action);
+        let remote_evidence_status = remote_evidence_status_for_action(action);
         let should_queue = profile
             .map(|profile| profile.profile.review_queue)
             .unwrap_or(false)
+            || federation_pack
+                .as_ref()
+                .map(|pack| pack.review_defaults.enabled)
+                .unwrap_or(false)
             || (treaty_pack
                 .as_ref()
                 .map(|treaty| treaty.review_queue)
@@ -1086,6 +1101,10 @@ impl Supervisor {
             || evaluation
                 .map(|evaluation| matches!(evaluation.status, EvaluationStatus::Failed))
                 .unwrap_or(false)
+            || matches!(
+                remote_evidence_status,
+                Some(RemoteEvidenceStatus::ScopeViolation)
+            )
             || (treaty_pack
                 .as_ref()
                 .map(|treaty| treaty.review_queue)
@@ -1138,6 +1157,8 @@ impl Supervisor {
                 .map(|evaluation| evaluation.summary.clone())
                 .or_else(|| incidents.first().map(|incident| incident.summary.clone()))
                 .unwrap_or_else(|| "operator review required".to_string()),
+            federation_pack_id: federation_pack.map(|pack| pack.id),
+            remote_evidence_status,
             evaluation_ref: evaluation.map(|evaluation| evaluation.id.clone()),
             dataset_case_ref: dataset_case.map(|case| case.id.clone()),
             pairwise_run_ref: None,
@@ -1166,7 +1187,11 @@ impl Supervisor {
         let mut incidents = Vec::new();
         let treaty_pack = external_ref_value(&action.external_refs, "a2a.treaty_pack")
             .and_then(|treaty_id| self.config.treaties.packs.get(&treaty_id).cloned());
+        let federation_pack = federation_pack_id_for_action(action)
+            .and_then(|pack_id| self.resolve_federation_pack_by_id(&pack_id, treaty_pack.as_ref()));
         let treaty_violations = treaty_violations_for_action(action);
+        let remote_state_disposition = remote_state_disposition_for_action(action);
+        let remote_evidence_status = remote_evidence_status_for_action(action);
         if action.capability == "workspace.patch.apply" {
             incidents.push(PolicyIncident {
                 id: Uuid::new_v4().to_string(),
@@ -1200,6 +1225,21 @@ impl Supervisor {
                     created_at: now_timestamp(),
                 });
             }
+            if federation_pack_id_for_action(action).is_none() {
+                incidents.push(PolicyIncident {
+                    id: Uuid::new_v4().to_string(),
+                    action_id: action.id.clone(),
+                    doctrine_pack_id: doctrine.id.clone(),
+                    jurisdiction: doctrine.jurisdiction.clone(),
+                    reason_code: "frontier_gap_remote_federation_pack".to_string(),
+                    summary:
+                        "remote agent delegation completed without a durable federation governance pack reference"
+                            .to_string(),
+                    severity: PolicyIncidentSeverity::Critical,
+                    checkpoint: Some(crawfish_types::OversightCheckpoint::PreDispatch),
+                    created_at: now_timestamp(),
+                });
+            }
             if external_ref_value(&action.external_refs, "a2a.delegation_receipt").is_none() {
                 incidents.push(PolicyIncident {
                     id: Uuid::new_v4().to_string(),
@@ -1216,6 +1256,32 @@ impl Supervisor {
                 });
             }
         }
+        if matches!(
+            remote_state_disposition,
+            Some(RemoteStateDisposition::Blocked | RemoteStateDisposition::AwaitingApproval)
+        ) {
+            incidents.push(PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: doctrine.id.clone(),
+                jurisdiction: doctrine.jurisdiction.clone(),
+                reason_code: "remote_state_escalated".to_string(),
+                summary: federation_pack
+                    .as_ref()
+                    .map(|pack| {
+                        format!(
+                            "remote state was escalated under federation pack {}",
+                            pack.id
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "remote state was escalated by the control plane".to_string()
+                    }),
+                severity: PolicyIncidentSeverity::Warning,
+                checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                created_at: now_timestamp(),
+            });
+        }
         for violation in &treaty_violations {
             incidents.push(PolicyIncident {
                 id: Uuid::new_v4().to_string(),
@@ -1230,6 +1296,27 @@ impl Supervisor {
                     PolicyIncidentSeverity::Warning
                 },
                 checkpoint: violation.checkpoint.clone(),
+                created_at: now_timestamp(),
+            });
+        }
+        if matches!(
+            remote_evidence_status,
+            Some(RemoteEvidenceStatus::ScopeViolation)
+        ) && !treaty_violations
+            .iter()
+            .any(|violation| violation.code == "treaty_scope_violation")
+        {
+            incidents.push(PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: doctrine.id.clone(),
+                jurisdiction: doctrine.jurisdiction.clone(),
+                reason_code: "treaty_scope_violation".to_string(),
+                summary:
+                    "remote result crossed a scope or artifact boundary outside treaty allowance"
+                        .to_string(),
+                severity: PolicyIncidentSeverity::Critical,
+                checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
                 created_at: now_timestamp(),
             });
         }
@@ -1305,17 +1392,47 @@ impl Supervisor {
                 action_id: action.id.clone(),
                 doctrine_pack_id: doctrine.id.clone(),
                 jurisdiction: doctrine.jurisdiction.clone(),
-                reason_code: "frontier_enforcement_gap".to_string(),
-                summary: treaty_pack
+                reason_code: if matches!(
+                    remote_evidence_status,
+                    Some(RemoteEvidenceStatus::MissingRequiredEvidence)
+                ) {
+                    "frontier_enforcement_gap".to_string()
+                } else {
+                    "remote_state_escalated".to_string()
+                },
+                summary: federation_pack
                     .as_ref()
-                    .map(|treaty| {
+                    .map(|pack| {
                         format!(
-                            "remote result under treaty {} requires operator review before acceptance",
-                            treaty.id
+                            "remote result under federation pack {} requires operator review before acceptance",
+                            pack.id
                         )
                     })
                     .unwrap_or_else(|| {
                         "remote result requires operator review before acceptance".to_string()
+                    }),
+                severity: PolicyIncidentSeverity::Critical,
+                checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                created_at: now_timestamp(),
+            });
+        }
+        if matches!(
+            remote_outcome_disposition_for_action(action),
+            Some(crawfish_types::RemoteOutcomeDisposition::Rejected)
+        ) {
+            incidents.push(PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: doctrine.id.clone(),
+                jurisdiction: doctrine.jurisdiction.clone(),
+                reason_code: "remote_result_rejected".to_string(),
+                summary: federation_pack
+                    .as_ref()
+                    .map(|pack| {
+                        format!("remote result was rejected by federation pack {}", pack.id)
+                    })
+                    .unwrap_or_else(|| {
+                        "remote result was rejected by frontier governance".to_string()
                     }),
                 severity: PolicyIncidentSeverity::Critical,
                 checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
@@ -1359,6 +1476,8 @@ impl Supervisor {
         evaluation: Option<&EvaluationRecord>,
         incidents: &[PolicyIncident],
     ) -> Vec<AlertEvent> {
+        let federation_pack_id = federation_pack_id_for_action(action);
+        let remote_evidence_status = remote_evidence_status_for_action(action);
         let mut configured_rules = profile
             .map(|profile| profile.alert_rules.clone())
             .unwrap_or_default();
@@ -1366,6 +1485,16 @@ impl Supervisor {
             .and_then(|treaty_id| self.config.treaties.packs.get(&treaty_id).cloned())
         {
             for rule_id in treaty_pack.alert_rules {
+                if let Some(rule) = self.evaluation_alert_rules().get(&rule_id).cloned() {
+                    configured_rules.push(rule);
+                }
+            }
+        }
+        if let Some(federation_pack) = federation_pack_id
+            .as_ref()
+            .and_then(|pack_id| self.resolve_federation_pack_by_id(pack_id, None))
+        {
+            for rule_id in federation_pack.alert_defaults.rules {
                 if let Some(rule) = self.evaluation_alert_rules().get(&rule_id).cloned() {
                     configured_rules.push(rule);
                 }
@@ -1392,6 +1521,8 @@ impl Supervisor {
                 action_id: action.id.clone(),
                 severity: rule.severity.clone(),
                 summary: alert_summary_for_rule(&rule, evaluation, incidents),
+                federation_pack_id: federation_pack_id.clone(),
+                remote_evidence_status: remote_evidence_status.clone(),
                 created_at: now_timestamp(),
                 acknowledged_at: None,
                 acknowledged_by: None,
@@ -1822,9 +1953,13 @@ impl Supervisor {
             policy_incidents: trace.policy_incidents.clone(),
             remote_principal: trace.remote_principal.clone(),
             treaty_pack_id: trace.treaty_pack_id.clone(),
+            federation_pack_id: trace.federation_pack_id.clone(),
+            federation_decision: trace.federation_decision.clone(),
             delegation_receipt_ref: trace.delegation_receipt_ref.clone(),
             remote_task_ref: trace.remote_task_ref.clone(),
             remote_outcome_disposition: trace.remote_outcome_disposition.clone(),
+            remote_evidence_status: trace.remote_evidence_status.clone(),
+            remote_state_disposition: trace.remote_state_disposition.clone(),
             treaty_violations: trace.treaty_violations.clone(),
             delegation_depth: trace.delegation_depth,
             verification_summary: trace.verification_summary.clone(),
@@ -2026,6 +2161,8 @@ impl Supervisor {
                     interaction_model: Some(interaction_model),
                     remote_outcome_disposition: remote_outcome_disposition_for_action(&action),
                     treaty_violation_count: treaty_violations_for_action(&action).len() as u32,
+                    federation_pack_id: federation_pack_id_for_action(&action),
+                    remote_evidence_status: remote_evidence_status_for_action(&action),
                     failure_code: None,
                     created_at: now_timestamp(),
                 })
@@ -2135,6 +2272,8 @@ impl Supervisor {
                     interaction_model: Some(interaction_model),
                     remote_outcome_disposition: remote_outcome_disposition_for_action(&action),
                     treaty_violation_count: treaty_violations_for_action(&action).len() as u32,
+                    federation_pack_id: federation_pack_id_for_action(&action),
+                    remote_evidence_status: remote_evidence_status_for_action(&action),
                     failure_code: Some(failure_code),
                     created_at: now_timestamp(),
                 })
@@ -2169,6 +2308,8 @@ impl Supervisor {
             interaction_model: Some(interaction_model_for_action(action, None)),
             remote_outcome_disposition: remote_outcome_disposition_for_action(action),
             treaty_violation_count: treaty_violations_for_action(action).len() as u32,
+            federation_pack_id: federation_pack_id_for_action(action),
+            remote_evidence_status: remote_evidence_status_for_action(action),
             feedback_note_id: None,
             created_at: now_timestamp(),
         };
@@ -2878,6 +3019,80 @@ impl Supervisor {
                                     continue;
                                 }
                             };
+                            let federation_pack = match self
+                                .resolve_federation_pack(adapter.binding(), adapter.treaty_pack())
+                            {
+                                Ok(pack) => pack,
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "a2a",
+                                                "reason": reason,
+                                                "code": "frontier_enforcement_gap",
+                                                "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                            }),
+                                        )
+                                        .await?;
+                                    self.store
+                                        .insert_policy_incident(&PolicyIncident {
+                                            id: Uuid::new_v4().to_string(),
+                                            action_id: action.id.clone(),
+                                            doctrine_pack_id: "remote_agent_treaty_v1".to_string(),
+                                            jurisdiction: JurisdictionClass::ExternalUnknown,
+                                            reason_code: "frontier_enforcement_gap".to_string(),
+                                            summary: reason.clone(),
+                                            severity: PolicyIncidentSeverity::Critical,
+                                            checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                            created_at: now_timestamp(),
+                                        })
+                                        .await?;
+                                    last_reason = Some(reason);
+                                    last_external_refs = base_refs;
+                                    continue;
+                                }
+                            };
+                            let federation_decision = match self.compile_federation_decision(
+                                action,
+                                &treaty_decision,
+                                &federation_pack,
+                            ) {
+                                Ok(decision) => decision,
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "a2a",
+                                                "reason": reason,
+                                                "code": "frontier_enforcement_gap",
+                                                "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                            }),
+                                        )
+                                        .await?;
+                                    self.store
+                                        .insert_policy_incident(&PolicyIncident {
+                                            id: Uuid::new_v4().to_string(),
+                                            action_id: action.id.clone(),
+                                            doctrine_pack_id: "remote_agent_treaty_v1".to_string(),
+                                            jurisdiction: JurisdictionClass::ExternalUnknown,
+                                            reason_code: "frontier_enforcement_gap".to_string(),
+                                            summary: reason.clone(),
+                                            severity: PolicyIncidentSeverity::Critical,
+                                            checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                            created_at: now_timestamp(),
+                                        })
+                                        .await?;
+                                    last_reason = Some(reason);
+                                    last_external_refs = base_refs;
+                                    continue;
+                                }
+                            };
                             let mut receipt = crawfish_types::DelegationReceipt {
                                 id: Uuid::new_v4().to_string(),
                                 action_id: action.id.clone(),
@@ -2910,6 +3125,11 @@ impl Supervisor {
                                 value: treaty_decision.delegation_depth.to_string(),
                                 endpoint: None,
                             });
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.federation_pack".to_string(),
+                                value: federation_pack.id.clone(),
+                                endpoint: None,
+                            });
                             match adapter.run(action).await {
                                 Ok(mut result) => {
                                     let merged_external_refs =
@@ -2925,68 +3145,299 @@ impl Supervisor {
                                         .unwrap_or("completed")
                                     {
                                         "blocked" => {
-                                            return Ok(ExecutionOutcome::Blocked {
-                                                reason: result
-                                                    .outputs
-                                                    .summary
-                                                    .clone()
-                                                    .unwrap_or_else(|| {
-                                                        "remote A2A agent requested additional input"
-                                                            .to_string()
+                                            let mut decision = federation_decision.clone();
+                                            decision.remote_state_disposition =
+                                                Some(federation_pack.blocked_remote_policy.clone());
+                                            let mut outputs = result.outputs;
+                                            set_federation_result_metadata(
+                                                &mut outputs,
+                                                &decision,
+                                                None,
+                                                decision.remote_state_disposition.as_ref(),
+                                                None,
+                                            );
+                                            let mut surface_events = result.events;
+                                            surface_events.push(
+                                                crawfish_core::SurfaceActionEvent {
+                                                    event_type: "federation_state_escalated"
+                                                        .to_string(),
+                                                    payload: serde_json::json!({
+                                                        "timestamp": now_timestamp(),
+                                                        "federation_pack_id": federation_pack.id.clone(),
+                                                        "remote_state": "input-required",
+                                                        "disposition": runtime_enum_to_snake(
+                                                            decision
+                                                                .remote_state_disposition
+                                                                .as_ref()
+                                                                .expect("remote state disposition"),
+                                                        ),
                                                     }),
-                                                failure_code: "a2a_input_required".to_string(),
-                                                continuity_mode: None,
-                                                outputs: result.outputs,
-                                                external_refs: merged_external_refs,
-                                                surface_events: result.events,
-                                            });
+                                                },
+                                            );
+                                            let reason = outputs.summary.clone().unwrap_or_else(
+                                                || {
+                                                    "remote A2A agent requested additional input"
+                                                        .to_string()
+                                                },
+                                            );
+                                            return match decision
+                                                .remote_state_disposition
+                                                .clone()
+                                                .unwrap_or(RemoteStateDisposition::Blocked)
+                                            {
+                                                RemoteStateDisposition::Blocked => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_input_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::AwaitingApproval => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_auth_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Failed => {
+                                                    Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: "remote_state_escalated"
+                                                            .to_string(),
+                                                        outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Running => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_input_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                            };
                                         }
                                         "awaiting_approval" => {
-                                            return Ok(ExecutionOutcome::Blocked {
-                                                reason: result
-                                                    .outputs
-                                                    .summary
-                                                    .clone()
-                                                    .unwrap_or_else(|| {
-                                                        "remote A2A agent requested authorization"
-                                                            .to_string()
+                                            let mut decision = federation_decision.clone();
+                                            decision.remote_state_disposition =
+                                                Some(federation_pack.auth_required_policy.clone());
+                                            let mut outputs = result.outputs;
+                                            set_federation_result_metadata(
+                                                &mut outputs,
+                                                &decision,
+                                                None,
+                                                decision.remote_state_disposition.as_ref(),
+                                                None,
+                                            );
+                                            let mut surface_events = result.events;
+                                            surface_events.push(
+                                                crawfish_core::SurfaceActionEvent {
+                                                    event_type: "federation_state_escalated"
+                                                        .to_string(),
+                                                    payload: serde_json::json!({
+                                                        "timestamp": now_timestamp(),
+                                                        "federation_pack_id": federation_pack.id.clone(),
+                                                        "remote_state": "auth-required",
+                                                        "disposition": runtime_enum_to_snake(
+                                                            decision
+                                                                .remote_state_disposition
+                                                                .as_ref()
+                                                                .expect("remote state disposition"),
+                                                        ),
                                                     }),
-                                                failure_code: "a2a_auth_required".to_string(),
-                                                continuity_mode: None,
-                                                outputs: result.outputs,
-                                                external_refs: merged_external_refs,
-                                                surface_events: result.events,
-                                            });
+                                                },
+                                            );
+                                            let reason =
+                                                outputs.summary.clone().unwrap_or_else(|| {
+                                                    "remote A2A agent requested authorization"
+                                                        .to_string()
+                                                });
+                                            return match decision
+                                                .remote_state_disposition
+                                                .clone()
+                                                .unwrap_or(RemoteStateDisposition::AwaitingApproval)
+                                            {
+                                                RemoteStateDisposition::AwaitingApproval => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_auth_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Blocked => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_input_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Failed => {
+                                                    Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: "remote_state_escalated"
+                                                            .to_string(),
+                                                        outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Running => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_auth_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                            };
                                         }
                                         "failed" => {
-                                            return Ok(ExecutionOutcome::Failed {
-                                                reason: result
-                                                    .outputs
-                                                    .summary
-                                                    .clone()
-                                                    .unwrap_or_else(|| {
-                                                        "remote A2A task failed".to_string()
+                                            let mut decision = federation_decision.clone();
+                                            decision.remote_state_disposition =
+                                                Some(federation_pack.remote_failure_policy.clone());
+                                            let mut outputs = result.outputs;
+                                            set_federation_result_metadata(
+                                                &mut outputs,
+                                                &decision,
+                                                None,
+                                                decision.remote_state_disposition.as_ref(),
+                                                None,
+                                            );
+                                            let mut surface_events = result.events;
+                                            surface_events.push(
+                                                crawfish_core::SurfaceActionEvent {
+                                                    event_type: "federation_state_escalated"
+                                                        .to_string(),
+                                                    payload: serde_json::json!({
+                                                        "timestamp": now_timestamp(),
+                                                        "federation_pack_id": federation_pack.id.clone(),
+                                                        "remote_state": "failed",
+                                                        "disposition": runtime_enum_to_snake(
+                                                            decision
+                                                                .remote_state_disposition
+                                                                .as_ref()
+                                                                .expect("remote state disposition"),
+                                                        ),
                                                     }),
-                                                failure_code: failure_code_a2a_task_failed()
-                                                    .to_string(),
-                                                outputs: result.outputs,
-                                                checkpoint: None,
-                                                external_refs: merged_external_refs,
-                                                surface_events: result.events,
-                                            });
+                                                },
+                                            );
+                                            let reason =
+                                                outputs.summary.clone().unwrap_or_else(|| {
+                                                    "remote A2A task failed".to_string()
+                                                });
+                                            return match decision
+                                                .remote_state_disposition
+                                                .clone()
+                                                .unwrap_or(RemoteStateDisposition::Failed)
+                                            {
+                                                RemoteStateDisposition::Failed => {
+                                                    Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: failure_code_a2a_task_failed(
+                                                        )
+                                                        .to_string(),
+                                                        outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Blocked => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_input_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::AwaitingApproval => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_auth_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Running => {
+                                                    Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: failure_code_a2a_task_failed(
+                                                        )
+                                                        .to_string(),
+                                                        outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                            };
                                         }
                                         _ => {
-                                            let (disposition, violations) = self
-                                                .evaluate_treaty_post_result(
+                                            let (disposition, evidence_status, violations) = self
+                                                .evaluate_federation_post_result(
                                                     &result.outputs,
                                                     &receipt,
                                                     &treaty_decision,
                                                     adapter.treaty_pack(),
+                                                    &federation_pack,
                                                 );
+                                            let mut decision = federation_decision.clone();
+                                            decision.remote_evidence_status =
+                                                Some(evidence_status.clone());
+                                            decision.remote_result_acceptance = Some(match disposition {
+                                                crawfish_types::RemoteOutcomeDisposition::Accepted => {
+                                                    RemoteResultAcceptance::Accepted
+                                                }
+                                                crawfish_types::RemoteOutcomeDisposition::ReviewRequired => {
+                                                    RemoteResultAcceptance::ReviewRequired
+                                                }
+                                                crawfish_types::RemoteOutcomeDisposition::Rejected => {
+                                                    RemoteResultAcceptance::Rejected
+                                                }
+                                            });
                                             set_treaty_result_metadata(
                                                 &mut result.outputs,
                                                 &disposition,
                                                 &violations,
+                                            );
+                                            set_federation_result_metadata(
+                                                &mut result.outputs,
+                                                &decision,
+                                                Some(&evidence_status),
+                                                None,
+                                                decision.remote_result_acceptance.as_ref(),
                                             );
                                             let mut surface_events = result.events.clone();
                                             surface_events.push(crawfish_core::SurfaceActionEvent {
@@ -2996,6 +3447,21 @@ impl Supervisor {
                                                     "disposition": runtime_enum_to_snake(&disposition),
                                                     "violation_count": violations.len(),
                                                     "treaty_pack_id": treaty_decision.treaty_pack_id,
+                                                }),
+                                            });
+                                            surface_events.push(crawfish_core::SurfaceActionEvent {
+                                                event_type: "federation_post_result_assessed".to_string(),
+                                                payload: serde_json::json!({
+                                                    "timestamp": now_timestamp(),
+                                                    "federation_pack_id": federation_pack.id.clone(),
+                                                    "remote_evidence_status": runtime_enum_to_snake(&evidence_status),
+                                                    "remote_result_acceptance": runtime_enum_to_snake(
+                                                        decision
+                                                            .remote_result_acceptance
+                                                            .as_ref()
+                                                            .expect("remote result acceptance"),
+                                                    ),
+                                                    "violation_count": violations.len(),
                                                 }),
                                             });
                                             match disposition {
@@ -3393,6 +3859,58 @@ impl Supervisor {
         )))
     }
 
+    fn builtin_federation_pack(&self, treaty_pack: &crawfish_types::TreatyPack) -> FederationPack {
+        FederationPack {
+            id: "remote_task_plan_default".to_string(),
+            title: "Remote task.plan federation pack".to_string(),
+            summary: "Default remote-agent governance pack for proposal-only task planning over a treaty-governed frontier.".to_string(),
+            treaty_pack_id: treaty_pack.id.clone(),
+            review_defaults: crawfish_types::FederationReviewDefaults {
+                enabled: treaty_pack.review_queue,
+                priority: "high".to_string(),
+            },
+            alert_defaults: crawfish_types::FederationAlertDefaults {
+                rules: treaty_pack.alert_rules.clone(),
+            },
+            required_remote_evidence: treaty_pack.required_result_evidence.clone(),
+            result_acceptance_policy: RemoteResultAcceptance::Accepted,
+            scope_violation_policy: match treaty_pack.on_scope_violation {
+                crawfish_types::TreatyEscalationMode::Deny => RemoteResultAcceptance::Rejected,
+                crawfish_types::TreatyEscalationMode::ReviewRequired => {
+                    RemoteResultAcceptance::ReviewRequired
+                }
+            },
+            evidence_gap_policy: match treaty_pack.on_evidence_gap {
+                crawfish_types::TreatyEscalationMode::Deny => RemoteResultAcceptance::Rejected,
+                crawfish_types::TreatyEscalationMode::ReviewRequired => {
+                    RemoteResultAcceptance::ReviewRequired
+                }
+            },
+            blocked_remote_policy: RemoteStateDisposition::Blocked,
+            auth_required_policy: RemoteStateDisposition::AwaitingApproval,
+            remote_failure_policy: RemoteStateDisposition::Failed,
+            required_checkpoints: treaty_pack.required_checkpoints.clone(),
+            max_delegation_depth: treaty_pack.max_delegation_depth,
+        }
+    }
+
+    fn resolve_federation_pack(
+        &self,
+        binding: &crawfish_types::A2ARemoteAgentBinding,
+        treaty_pack: &crawfish_types::TreatyPack,
+    ) -> anyhow::Result<FederationPack> {
+        match binding.federation_pack.as_deref() {
+            Some(pack_id) => self
+                .config
+                .federation
+                .packs
+                .get(pack_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("federation pack {pack_id} is not configured")),
+            None => Ok(self.builtin_federation_pack(treaty_pack)),
+        }
+    }
+
     fn compile_treaty_decision(
         &self,
         action: &Action,
@@ -3465,18 +3983,71 @@ impl Supervisor {
         })
     }
 
-    fn evaluate_treaty_post_result(
+    fn compile_federation_decision(
+        &self,
+        action: &Action,
+        treaty_decision: &crawfish_types::TreatyDecision,
+        federation_pack: &FederationPack,
+    ) -> anyhow::Result<FederationDecision> {
+        if federation_pack.treaty_pack_id != treaty_decision.treaty_pack_id {
+            anyhow::bail!(
+                "federation pack {} is bound to treaty {}, not {}",
+                federation_pack.id,
+                federation_pack.treaty_pack_id,
+                treaty_decision.treaty_pack_id
+            );
+        }
+        if federation_pack.max_delegation_depth < treaty_decision.delegation_depth {
+            anyhow::bail!(
+                "federation pack {} does not allow delegation depth {}",
+                federation_pack.id,
+                treaty_decision.delegation_depth
+            );
+        }
+        Ok(FederationDecision {
+            federation_pack_id: federation_pack.id.clone(),
+            treaty_pack_id: treaty_decision.treaty_pack_id.clone(),
+            remote_principal: treaty_decision.remote_principal.clone(),
+            capability: action.capability.clone(),
+            required_checkpoints: federation_pack.required_checkpoints.clone(),
+            required_remote_evidence: federation_pack.required_remote_evidence.clone(),
+            delegation_depth: treaty_decision.delegation_depth,
+            escalation: crawfish_types::RemoteEscalationPolicy {
+                result_acceptance_policy: federation_pack.result_acceptance_policy.clone(),
+                scope_violation_policy: federation_pack.scope_violation_policy.clone(),
+                evidence_gap_policy: federation_pack.evidence_gap_policy.clone(),
+                blocked_remote_policy: federation_pack.blocked_remote_policy.clone(),
+                auth_required_policy: federation_pack.auth_required_policy.clone(),
+                remote_failure_policy: federation_pack.remote_failure_policy.clone(),
+            },
+            review_defaults: federation_pack.review_defaults.clone(),
+            alert_defaults: federation_pack.alert_defaults.clone(),
+            remote_state_disposition: None,
+            remote_evidence_status: None,
+            remote_result_acceptance: None,
+            summary: format!(
+                "{} interprets remote task.plan results for treaty {} at delegation depth {}",
+                federation_pack.id,
+                treaty_decision.treaty_pack_id,
+                treaty_decision.delegation_depth
+            ),
+        })
+    }
+
+    fn evaluate_federation_post_result(
         &self,
         outputs: &ActionOutputs,
         receipt: &crawfish_types::DelegationReceipt,
-        decision: &crawfish_types::TreatyDecision,
+        _decision: &crawfish_types::TreatyDecision,
         treaty_pack: &crawfish_types::TreatyPack,
+        federation_pack: &FederationPack,
     ) -> (
         crawfish_types::RemoteOutcomeDisposition,
+        RemoteEvidenceStatus,
         Vec<crawfish_types::TreatyViolation>,
     ) {
         let mut violations = Vec::new();
-        for requirement in &decision.required_result_evidence {
+        for requirement in &federation_pack.required_remote_evidence {
             match requirement {
                 crawfish_types::TreatyEvidenceRequirement::DelegationReceiptPresent => {
                     if receipt.id.is_empty() {
@@ -3571,35 +4142,59 @@ impl Supervisor {
             }
         }
 
-        let disposition = if violations
+        let evidence_status = if violations
             .iter()
             .any(|violation| violation.code == "treaty_scope_violation")
         {
-            match decision.on_scope_violation {
-                crawfish_types::TreatyEscalationMode::Deny => {
-                    crawfish_types::RemoteOutcomeDisposition::Rejected
-                }
-                crawfish_types::TreatyEscalationMode::ReviewRequired => {
-                    crawfish_types::RemoteOutcomeDisposition::ReviewRequired
-                }
-            }
+            RemoteEvidenceStatus::ScopeViolation
         } else if violations
             .iter()
             .any(|violation| violation.code == "frontier_enforcement_gap")
         {
-            match decision.on_evidence_gap {
-                crawfish_types::TreatyEscalationMode::Deny => {
-                    crawfish_types::RemoteOutcomeDisposition::Rejected
-                }
-                crawfish_types::TreatyEscalationMode::ReviewRequired => {
-                    crawfish_types::RemoteOutcomeDisposition::ReviewRequired
-                }
-            }
+            RemoteEvidenceStatus::MissingRequiredEvidence
         } else {
-            crawfish_types::RemoteOutcomeDisposition::Accepted
+            RemoteEvidenceStatus::Satisfied
         };
 
-        (disposition, violations)
+        let disposition = match evidence_status {
+            RemoteEvidenceStatus::ScopeViolation => match federation_pack.scope_violation_policy {
+                RemoteResultAcceptance::Accepted => {
+                    crawfish_types::RemoteOutcomeDisposition::Accepted
+                }
+                RemoteResultAcceptance::ReviewRequired => {
+                    crawfish_types::RemoteOutcomeDisposition::ReviewRequired
+                }
+                RemoteResultAcceptance::Rejected => {
+                    crawfish_types::RemoteOutcomeDisposition::Rejected
+                }
+            },
+            RemoteEvidenceStatus::MissingRequiredEvidence => {
+                match federation_pack.evidence_gap_policy {
+                    RemoteResultAcceptance::Accepted => {
+                        crawfish_types::RemoteOutcomeDisposition::Accepted
+                    }
+                    RemoteResultAcceptance::ReviewRequired => {
+                        crawfish_types::RemoteOutcomeDisposition::ReviewRequired
+                    }
+                    RemoteResultAcceptance::Rejected => {
+                        crawfish_types::RemoteOutcomeDisposition::Rejected
+                    }
+                }
+            }
+            _ => match federation_pack.result_acceptance_policy {
+                RemoteResultAcceptance::Accepted => {
+                    crawfish_types::RemoteOutcomeDisposition::Accepted
+                }
+                RemoteResultAcceptance::ReviewRequired => {
+                    crawfish_types::RemoteOutcomeDisposition::ReviewRequired
+                }
+                RemoteResultAcceptance::Rejected => {
+                    crawfish_types::RemoteOutcomeDisposition::Rejected
+                }
+            },
+        };
+
+        (disposition, evidence_status, violations)
     }
 
     async fn ensure_required_lease_valid(
@@ -5920,6 +6515,37 @@ fn delegation_depth_for_action(action: &Action) -> Option<u32> {
         })
 }
 
+fn federation_pack_id_for_action(action: &Action) -> Option<String> {
+    external_ref_value(&action.external_refs, "a2a.federation_pack")
+}
+
+fn remote_evidence_status_for_action(action: &Action) -> Option<RemoteEvidenceStatus> {
+    action
+        .outputs
+        .metadata
+        .get("federation_remote_evidence_status")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn remote_state_disposition_for_action(action: &Action) -> Option<RemoteStateDisposition> {
+    action
+        .outputs
+        .metadata
+        .get("federation_remote_state_disposition")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn federation_decision_for_action(action: &Action) -> Option<FederationDecision> {
+    action
+        .outputs
+        .metadata
+        .get("federation_decision")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 fn remote_outcome_disposition_for_action(
     action: &Action,
 ) -> Option<crawfish_types::RemoteOutcomeDisposition> {
@@ -5974,6 +6600,37 @@ fn set_treaty_result_metadata(
         "treaty_violations".to_string(),
         serde_json::to_value(violations).unwrap_or_else(|_| Value::Array(Vec::new())),
     );
+}
+
+fn set_federation_result_metadata(
+    outputs: &mut ActionOutputs,
+    decision: &FederationDecision,
+    evidence_status: Option<&RemoteEvidenceStatus>,
+    state_disposition: Option<&RemoteStateDisposition>,
+    result_acceptance: Option<&RemoteResultAcceptance>,
+) {
+    outputs.metadata.insert(
+        "federation_decision".to_string(),
+        serde_json::to_value(decision).unwrap_or(Value::Null),
+    );
+    if let Some(evidence_status) = evidence_status {
+        outputs.metadata.insert(
+            "federation_remote_evidence_status".to_string(),
+            serde_json::to_value(evidence_status).unwrap_or(Value::Null),
+        );
+    }
+    if let Some(state_disposition) = state_disposition {
+        outputs.metadata.insert(
+            "federation_remote_state_disposition".to_string(),
+            serde_json::to_value(state_disposition).unwrap_or(Value::Null),
+        );
+    }
+    if let Some(result_acceptance) = result_acceptance {
+        outputs.metadata.insert(
+            "federation_remote_result_acceptance".to_string(),
+            serde_json::to_value(result_acceptance).unwrap_or(Value::Null),
+        );
+    }
 }
 
 fn default_doctrine_pack(
@@ -7165,6 +7822,8 @@ fn maybe_enqueue_pairwise_review_item(
             "Compare {} vs {} for dataset case {}",
             left_executor, right_executor, dataset_case.id
         ),
+        federation_pack_id: dataset_case.federation_pack_id.clone(),
+        remote_evidence_status: dataset_case.remote_evidence_status.clone(),
         evaluation_ref: None,
         dataset_case_ref: Some(dataset_case.id.clone()),
         pairwise_run_ref: Some(result.pairwise_run_id.clone()),
@@ -7397,6 +8056,81 @@ impl Supervisor {
             run,
             cases: pairwise_results,
         })
+    }
+
+    fn builtin_federation_pack_template(&self) -> FederationPack {
+        FederationPack {
+            id: "remote_task_plan_default".to_string(),
+            title: "Remote task.plan federation pack".to_string(),
+            summary: "Built-in remote governance pack for proposal-only task planning over a treaty-governed frontier.".to_string(),
+            treaty_pack_id: "<binding treaty>".to_string(),
+            review_defaults: crawfish_types::FederationReviewDefaults {
+                enabled: true,
+                priority: "high".to_string(),
+            },
+            alert_defaults: crawfish_types::FederationAlertDefaults {
+                rules: vec!["frontier_gap_detected".to_string()],
+            },
+            required_remote_evidence: vec![
+                crawfish_types::TreatyEvidenceRequirement::DelegationReceiptPresent,
+                crawfish_types::TreatyEvidenceRequirement::RemoteTaskRefPresent,
+                crawfish_types::TreatyEvidenceRequirement::TerminalStateVerified,
+                crawfish_types::TreatyEvidenceRequirement::ArtifactClassesAllowed,
+                crawfish_types::TreatyEvidenceRequirement::DataScopesAllowed,
+            ],
+            result_acceptance_policy: RemoteResultAcceptance::Accepted,
+            scope_violation_policy: RemoteResultAcceptance::Rejected,
+            evidence_gap_policy: RemoteResultAcceptance::ReviewRequired,
+            blocked_remote_policy: RemoteStateDisposition::Blocked,
+            auth_required_policy: RemoteStateDisposition::AwaitingApproval,
+            remote_failure_policy: RemoteStateDisposition::Failed,
+            required_checkpoints: vec![
+                OversightCheckpoint::Admission,
+                OversightCheckpoint::PreDispatch,
+                OversightCheckpoint::PostResult,
+            ],
+            max_delegation_depth: 1,
+        }
+    }
+
+    fn resolve_federation_pack_by_id(
+        &self,
+        pack_id: &str,
+        treaty_pack: Option<&crawfish_types::TreatyPack>,
+    ) -> Option<FederationPack> {
+        if let Some(pack) = self.config.federation.packs.get(pack_id).cloned() {
+            return Some(pack);
+        }
+        if pack_id == "remote_task_plan_default" {
+            return Some(match treaty_pack {
+                Some(treaty_pack) => self.builtin_federation_pack(treaty_pack),
+                None => self.builtin_federation_pack_template(),
+            });
+        }
+        None
+    }
+
+    async fn list_federation_packs(&self) -> anyhow::Result<FederationPackListResponse> {
+        let mut packs = self
+            .config
+            .federation
+            .packs
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if !packs.iter().any(|pack| pack.id == "remote_task_plan_default") {
+            packs.push(self.builtin_federation_pack_template());
+        }
+        Ok(FederationPackListResponse { packs })
+    }
+
+    async fn get_federation_pack(
+        &self,
+        pack_id: &str,
+    ) -> anyhow::Result<Option<FederationPackDetailResponse>> {
+        Ok(self
+            .resolve_federation_pack_by_id(pack_id, None)
+            .map(|pack| FederationPackDetailResponse { pack }))
     }
 }
 
@@ -7693,7 +8427,7 @@ impl SupervisorControl for Supervisor {
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok())
             });
-        let policy_incidents = self.store.list_policy_incidents(action_id).await?;
+        let stored_policy_incidents = self.store.list_policy_incidents(action_id).await?;
         let latest_evaluation = self
             .store
             .list_evaluations(action_id)
@@ -7730,6 +8464,23 @@ impl SupervisorControl for Supervisor {
             latest_evaluation.as_ref(),
             resolved_profile.is_some(),
         );
+        let mut policy_incidents = stored_policy_incidents;
+        let derived_policy_incidents = self.policy_incidents_for_action(
+            &action,
+            resolved_profile.as_ref(),
+            latest_evaluation.as_ref(),
+            &checkpoint_status,
+        );
+        for incident in derived_policy_incidents {
+            let exists = policy_incidents.iter().any(|existing| {
+                existing.reason_code == incident.reason_code
+                    && existing.summary == incident.summary
+                    && existing.checkpoint == incident.checkpoint
+            });
+            if !exists {
+                policy_incidents.push(incident);
+            }
+        }
         let delegation_receipt_ref =
             external_ref_value(&action.external_refs, "a2a.delegation_receipt");
         let delegation_receipt = if let Some(receipt_ref) = delegation_receipt_ref.as_deref() {
@@ -7743,6 +8494,11 @@ impl SupervisorControl for Supervisor {
             .as_ref()
             .map(|treaty| treaty.id.clone())
             .or_else(|| external_ref_value(&action.external_refs, "a2a.treaty_pack"));
+        let federation_pack_id = federation_pack_id_for_action(&action);
+        let federation_summary = federation_pack_id.as_ref().and_then(|pack_id| {
+            self.resolve_federation_pack_by_id(pack_id, treaty_summary.as_ref())
+        });
+        let federation_decision = federation_decision_for_action(&action);
         let remote_task_ref = external_ref_value(&action.external_refs, "a2a.task_id");
         let remote_principal = delegation_receipt
             .as_ref()
@@ -7780,9 +8536,14 @@ impl SupervisorControl for Supervisor {
             remote_principal,
             treaty_pack_id,
             treaty_summary,
+            federation_pack_id,
+            federation_summary,
+            federation_decision,
             delegation_receipt_ref,
             remote_task_ref,
             remote_outcome_disposition: remote_outcome_disposition_for_action(&action),
+            remote_evidence_status: remote_evidence_status_for_action(&action),
+            remote_state_disposition: remote_state_disposition_for_action(&action),
             treaty_violations: treaty_violations_for_action(&action),
             delegation_depth: delegation_depth_for_action(&action),
             delegation_receipt,
@@ -8438,6 +9199,8 @@ fn api_router(supervisor: Arc<Supervisor>) -> Router {
         .route("/v1/alerts/{id}/ack", post(alert_ack_handler))
         .route("/v1/treaties", get(treaty_list_handler))
         .route("/v1/treaties/{id}", get(treaty_detail_handler))
+        .route("/v1/federation/packs", get(federation_list_handler))
+        .route("/v1/federation/packs/{id}", get(federation_detail_handler))
         .route(
             "/v1/inbound/openclaw/actions",
             post(openclaw_submit_action_handler),
@@ -8847,6 +9610,29 @@ async fn treaty_detail_handler(
         .map_err(RuntimeError::Internal)?
         .map(Json)
         .ok_or_else(|| RuntimeError::NotFound(format!("treaty not found: {id}")))
+}
+
+async fn federation_list_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+) -> Result<Json<FederationPackListResponse>, RuntimeError> {
+    Ok(Json(
+        supervisor
+            .list_federation_packs()
+            .await
+            .map_err(RuntimeError::Internal)?,
+    ))
+}
+
+async fn federation_detail_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<FederationPackDetailResponse>, RuntimeError> {
+    supervisor
+        .get_federation_pack(&id)
+        .await
+        .map_err(RuntimeError::Internal)?
+        .map(Json)
+        .ok_or_else(|| RuntimeError::NotFound(format!("federation pack not found: {id}")))
 }
 
 async fn drain_handler(

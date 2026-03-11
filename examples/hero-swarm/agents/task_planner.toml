@@ -75,6 +75,7 @@ capability = "task.plan"
 agent_card_url = "http://127.0.0.1:7788/agent-card.json"
 auth_ref = "A2A_REMOTE_TOKEN"
 treaty_pack = "remote_task_planning"
+federation_pack = "remote_task_plan_default"
 required_scopes = ["planning:read", "planning:propose"]
 streaming_mode = "prefer_streaming"
 allow_in_task_auth = false

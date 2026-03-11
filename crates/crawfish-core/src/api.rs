@@ -3,11 +3,12 @@ use crawfish_types::{
     Action, AgentManifest, AlertEvent, ArtifactRef, AuditReceipt, CapabilityLease,
     CheckpointStatus, ConsentGrant, CounterpartyRef, DatasetCase, DelegationReceipt, DoctrinePack,
     EncounterRecord, EvaluationDataset, EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode,
-    ExperimentCaseResult, ExperimentRun, ExternalRef, GoalSpec, InteractionModel,
-    JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PairwiseCaseResult,
-    PairwiseExperimentRun, PolicyIncident, RemoteOutcomeDisposition, RemotePrincipalRef,
-    RequesterRef, ReviewQueueItem, ScheduleSpec, TraceBundle, TreatyPack, TreatyViolation,
-    TrustDomain, VerificationSummary, WorkspaceLockDetail,
+    ExperimentCaseResult, ExperimentRun, ExternalRef, FederationDecision, FederationPack, GoalSpec,
+    InteractionModel, JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PairwiseCaseResult,
+    PairwiseExperimentRun, PolicyIncident, RemoteEvidenceStatus, RemoteOutcomeDisposition,
+    RemotePrincipalRef, RemoteStateDisposition, RequesterRef, ReviewQueueItem, ScheduleSpec,
+    TraceBundle, TreatyPack, TreatyViolation, TrustDomain, VerificationSummary,
+    WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -101,11 +102,21 @@ pub struct ActionDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub treaty_summary: Option<TreatyPack>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_summary: Option<FederationPack>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_decision: Option<FederationDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_status: Option<RemoteEvidenceStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_state_disposition: Option<RemoteStateDisposition>,
     #[serde(default)]
     pub treaty_violations: Vec<TreatyViolation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +249,16 @@ pub struct TreatyListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TreatyDetailResponse {
     pub treaty: TreatyPack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederationPackListResponse {
+    pub packs: Vec<FederationPack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederationPackDetailResponse {
+    pub pack: FederationPack,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

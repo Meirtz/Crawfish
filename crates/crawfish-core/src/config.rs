@@ -1,8 +1,8 @@
 use crawfish_types::{
     AlertRule, CallerOwnerMapping, CapabilityVisibility, DataBoundaryPolicy, DefaultDisposition,
-    EncounterPolicy, EvaluationDataset, EvaluationProfile, ExecutionContract, McpServerConfig,
-    NetworkBoundaryPolicy, OwnerKind, PairwiseProfile, ScorecardSpec, ToolBoundaryPolicy,
-    TreatyPack, TrustDomain, WorkspaceBoundaryPolicy,
+    EncounterPolicy, EvaluationDataset, EvaluationProfile, ExecutionContract, FederationPack,
+    McpServerConfig, NetworkBoundaryPolicy, OwnerKind, PairwiseProfile, ScorecardSpec,
+    ToolBoundaryPolicy, TreatyPack, TrustDomain, WorkspaceBoundaryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -113,6 +113,12 @@ pub struct TreatiesConfig {
     pub packs: BTreeMap<String, TreatyPack>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct FederationConfig {
+    #[serde(default)]
+    pub packs: BTreeMap<String, FederationPack>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CrawfishConfig {
     pub storage: StorageConfig,
@@ -132,6 +138,8 @@ pub struct CrawfishConfig {
     pub evaluation: EvaluationConfig,
     #[serde(default)]
     pub treaties: TreatiesConfig,
+    #[serde(default)]
+    pub federation: FederationConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
 }
@@ -239,6 +247,7 @@ mod tests {
             governance: GovernanceConfig::default(),
             evaluation: EvaluationConfig::default(),
             treaties: TreatiesConfig::default(),
+            federation: FederationConfig::default(),
             runtime: RuntimeConfig::default(),
         };
 

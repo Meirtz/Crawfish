@@ -1026,6 +1026,8 @@ pub struct A2ARemoteAgentBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_ref: Option<String>,
     pub treaty_pack: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_pack: Option<String>,
     #[serde(default)]
     pub required_scopes: Vec<String>,
     #[serde(default)]
@@ -1121,6 +1123,82 @@ pub enum RemoteOutcomeDisposition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteStateDisposition {
+    Running,
+    Blocked,
+    AwaitingApproval,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteEvidenceStatus {
+    Pending,
+    Satisfied,
+    MissingRequiredEvidence,
+    ScopeViolation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteResultAcceptance {
+    Accepted,
+    ReviewRequired,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederationReviewDefaults {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_federation_review_priority")]
+    pub priority: String,
+}
+
+fn default_federation_review_priority() -> String {
+    "high".to_string()
+}
+
+impl Default for FederationReviewDefaults {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            priority: default_federation_review_priority(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FederationAlertDefaults {
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteEscalationPolicy {
+    pub blocked_remote_policy: RemoteStateDisposition,
+    pub auth_required_policy: RemoteStateDisposition,
+    pub remote_failure_policy: RemoteStateDisposition,
+    pub result_acceptance_policy: RemoteResultAcceptance,
+    pub scope_violation_policy: RemoteResultAcceptance,
+    pub evidence_gap_policy: RemoteResultAcceptance,
+}
+
+impl Default for RemoteEscalationPolicy {
+    fn default() -> Self {
+        Self {
+            blocked_remote_policy: RemoteStateDisposition::Blocked,
+            auth_required_policy: RemoteStateDisposition::AwaitingApproval,
+            remote_failure_policy: RemoteStateDisposition::Failed,
+            result_acceptance_policy: RemoteResultAcceptance::Accepted,
+            scope_violation_policy: RemoteResultAcceptance::Rejected,
+            evidence_gap_policy: RemoteResultAcceptance::ReviewRequired,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TreatyClause {
     pub id: String,
     pub title: String,
@@ -1203,6 +1281,92 @@ pub struct TreatyDecision {
     pub review_queue: bool,
     #[serde(default)]
     pub alert_rules: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederationPack {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub treaty_pack_id: String,
+    #[serde(default)]
+    pub review_defaults: FederationReviewDefaults,
+    #[serde(default)]
+    pub alert_defaults: FederationAlertDefaults,
+    #[serde(default = "default_treaty_required_result_evidence")]
+    pub required_remote_evidence: Vec<TreatyEvidenceRequirement>,
+    #[serde(default = "default_remote_result_acceptance_policy")]
+    pub result_acceptance_policy: RemoteResultAcceptance,
+    #[serde(default = "default_scope_violation_policy")]
+    pub scope_violation_policy: RemoteResultAcceptance,
+    #[serde(default = "default_evidence_gap_policy")]
+    pub evidence_gap_policy: RemoteResultAcceptance,
+    #[serde(default = "default_blocked_remote_policy")]
+    pub blocked_remote_policy: RemoteStateDisposition,
+    #[serde(default = "default_auth_required_policy")]
+    pub auth_required_policy: RemoteStateDisposition,
+    #[serde(default = "default_remote_failure_policy")]
+    pub remote_failure_policy: RemoteStateDisposition,
+    #[serde(default = "default_treaty_required_checkpoints")]
+    pub required_checkpoints: Vec<OversightCheckpoint>,
+    pub max_delegation_depth: u32,
+}
+
+fn default_remote_result_acceptance_policy() -> RemoteResultAcceptance {
+    RemoteResultAcceptance::Accepted
+}
+
+fn default_scope_violation_policy() -> RemoteResultAcceptance {
+    RemoteResultAcceptance::Rejected
+}
+
+fn default_evidence_gap_policy() -> RemoteResultAcceptance {
+    RemoteResultAcceptance::ReviewRequired
+}
+
+fn default_blocked_remote_policy() -> RemoteStateDisposition {
+    RemoteStateDisposition::Blocked
+}
+
+fn default_auth_required_policy() -> RemoteStateDisposition {
+    RemoteStateDisposition::AwaitingApproval
+}
+
+fn default_remote_failure_policy() -> RemoteStateDisposition {
+    RemoteStateDisposition::Failed
+}
+
+fn default_treaty_required_checkpoints() -> Vec<OversightCheckpoint> {
+    vec![
+        OversightCheckpoint::Admission,
+        OversightCheckpoint::PreDispatch,
+        OversightCheckpoint::PostResult,
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederationDecision {
+    pub federation_pack_id: String,
+    pub treaty_pack_id: String,
+    pub remote_principal: RemotePrincipalRef,
+    pub capability: String,
+    #[serde(default)]
+    pub required_checkpoints: Vec<OversightCheckpoint>,
+    #[serde(default)]
+    pub required_remote_evidence: Vec<TreatyEvidenceRequirement>,
+    pub delegation_depth: u32,
+    pub escalation: RemoteEscalationPolicy,
+    #[serde(default)]
+    pub review_defaults: FederationReviewDefaults,
+    #[serde(default)]
+    pub alert_defaults: FederationAlertDefaults,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_state_disposition: Option<RemoteStateDisposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_status: Option<RemoteEvidenceStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_result_acceptance: Option<RemoteResultAcceptance>,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1603,11 +1767,19 @@ pub struct TraceBundle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub treaty_pack_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_decision: Option<FederationDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_status: Option<RemoteEvidenceStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_state_disposition: Option<RemoteStateDisposition>,
     #[serde(default)]
     pub treaty_violations: Vec<TreatyViolation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1642,6 +1814,10 @@ pub struct EvaluationRecord {
     pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
     #[serde(default)]
     pub treaty_violation_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_status: Option<RemoteEvidenceStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback_note_id: Option<String>,
     pub created_at: String,
@@ -1686,6 +1862,10 @@ pub struct ReviewQueueItem {
     pub priority: String,
     pub reason_code: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_status: Option<RemoteEvidenceStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1919,11 +2099,19 @@ pub struct DatasetCase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub treaty_pack_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_decision: Option<FederationDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_status: Option<RemoteEvidenceStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_state_disposition: Option<RemoteStateDisposition>,
     #[serde(default)]
     pub treaty_violations: Vec<TreatyViolation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2000,6 +2188,10 @@ pub struct ExperimentCaseResult {
     pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
     #[serde(default)]
     pub treaty_violation_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_status: Option<RemoteEvidenceStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_code: Option<String>,
     pub created_at: String,
@@ -2081,6 +2273,10 @@ pub struct AlertEvent {
     pub action_id: String,
     pub severity: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_status: Option<RemoteEvidenceStatus>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledged_at: Option<String>,
