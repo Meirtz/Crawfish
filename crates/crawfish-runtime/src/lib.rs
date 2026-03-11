@@ -3174,12 +3174,11 @@ impl Supervisor {
                                                     }),
                                                 },
                                             );
-                                            let reason = outputs.summary.clone().unwrap_or_else(
-                                                || {
+                                            let reason =
+                                                outputs.summary.clone().unwrap_or_else(|| {
                                                     "remote A2A agent requested additional input"
                                                         .to_string()
-                                                },
-                                            );
+                                                });
                                             return match decision
                                                 .remote_state_disposition
                                                 .clone()
@@ -8118,7 +8117,10 @@ impl Supervisor {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        if !packs.iter().any(|pack| pack.id == "remote_task_plan_default") {
+        if !packs
+            .iter()
+            .any(|pack| pack.id == "remote_task_plan_default")
+        {
             packs.push(self.builtin_federation_pack_template());
         }
         Ok(FederationPackListResponse { packs })
