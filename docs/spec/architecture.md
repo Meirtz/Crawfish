@@ -48,6 +48,11 @@ The runtime spine follows the same split in code organization:
 
 Both are part of the same runtime. Only the first is the supported onboarding center for this release line.
 
+When reading the rest of this document, use this rule:
+
+- sections that describe local action lifecycle, local execution routing, local governance, and local evaluation are part of the current support center
+- sections that describe OpenClaw, A2A, treaty, federation, remote evidence, and remote follow-up remain architecturally real but operationally experimental
+
 ## Runtime Model
 
 ### Component Topology
@@ -982,6 +987,8 @@ ACPX-like tools are useful evidence of this layer, but they should be treated as
 
 ## OpenClaw Interoperability Model
 
+This entire section describes a retained **experimental alpha** surface, not the default onboarding path.
+
 OpenClaw is the first-priority harness ecosystem integration because it spans both ingress and execution.
 
 ### Inbound: OpenClaw -> Crawfish
@@ -1031,6 +1038,8 @@ OpenClaw inbound and outbound paths must reuse the same governance model as A2A 
 - emit auditable receipt
 
 ## A2A Remote-Agent Delegation
+
+This section also describes a retained **experimental alpha** surface. It remains implemented and tested, but it is not the public happy path.
 
 A2A is the first implemented remote-agent plane, using the [A2A project](https://github.com/a2aproject/A2A) and Google's ["A2A: A New Era of Agent Interoperability"](https://developers.googleblog.com/a2a-a-new-era-of-agent-interoperability/) as the reference shape.
 

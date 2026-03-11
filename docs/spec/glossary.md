@@ -66,3 +66,4 @@ This glossary is shared across the repository. Other documents should reuse thes
 | **hero demo** | The canonical public example for Crawfish: an engineering and operations swarm made up of `repo_indexer`, `repo_reviewer`, `ci_triage`, `incident_enricher`, `workspace_editor`, and `task_planner`. |
 | **mainline alpha** | The supported public happy path for the current release line: local swarm control, local harness routing, deterministic fallback, approval-gated local mutation, and inspectable runtime state. |
 | **experimental alpha** | Implemented and tested surfaces that remain outside the current public happy path, such as OpenClaw, A2A, and federation or treaty-driven remote governance. |
+| **support center** | The part of the product that current onboarding, default templates, reference examples, and public guarantees are optimized around. In the current release line, that is the mainline alpha local swarm path. |

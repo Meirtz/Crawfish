@@ -70,6 +70,8 @@ Crawfish now distinguishes between two delivery tracks:
 
 This distinction matters because the product philosophy remains broad, but the public onboarding path should stay narrow and reliable.
 
+That means the public promise should optimize for the local swarm path first. Remote-agent and federation work remain strategically important, but they should be read as retained experimental architecture rather than as the current default user journey.
+
 ## Protocol Planes
 
 Crawfish should talk about interoperability in three planes:
