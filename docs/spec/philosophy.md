@@ -10,7 +10,7 @@ The emerging environment is different:
 
 - harnesses will proliferate faster than standards stabilize
 - reasoning quality will improve, regress, split, and recombine across providers
-- governance and institutions will lag behind capability growth
+- governance and institutions will lag behind capability growth, which is also the broader institutional-lag frame behind Notion's ["Steam, Steel, and Infinite Minds"](https://www.notion.com/blog/steam-steel-and-infinite-minds-ai)
 - same-device and multi-owner agent encounters will become normal before the ecosystem feels ready for them
 
 This document defines the forward-looking philosophy that the rest of the spec set should inherit.
@@ -20,6 +20,8 @@ It also adopts one hard lesson from frontier history: a constitution can define 
 ## Principle 1: Build For Swarm-Age Governance, Not Single-Agent Demos
 
 The future category is not the single assistant with a convenient shell. It is the governed swarm: many bounded workers, many execution surfaces, many owners, many risk envelopes, and many possible encounter paths.
+
+This is also where Crawfish breaks with much earlier "multi-agent" framing. A large share of earlier multi-agent systems focused on context-managed sub-agents inside one application: LangChain explicitly frames the problem around [context engineering](https://docs.langchain.com/oss/python/langchain/multi-agent), OpenAI's Agents SDK centers [handoffs](https://openai.github.io/openai-agents-python/handoffs/) and shared run [context](https://openai.github.io/openai-agents-python/context/), and AutoGen Swarm describes agents that [share the same message context](https://microsoft.github.io/autogen/0.7.3/user-guide/agentchat-user-guide/swarm.html). Those patterns solve coordination inside one app. Crawfish targets the next problem: real encounters across owners, trust domains, and harness surfaces.
 
 That means Crawfish should optimize for:
 
@@ -143,6 +145,8 @@ Crawfish should assume:
 - evaluation and doctrine will need to serve as provisional institutional memory
 
 This is why review queues, alerts, dataset capture, replay, and checkpoint evidence belong in the runtime itself rather than in post hoc dashboards alone.
+
+The reason is not just operational hygiene. It is institutional memory. If swarms are going to operate in frontier conditions before broader governance catches up, then traces, evaluations, review queues, and replay datasets become the runtime's way to remember, compare, and correct behavior without pretending the constitution enforced itself.
 
 ## Principle 9: Design For Future Multi-Owner Encounters, Not Yesterday's App Sandbox
 

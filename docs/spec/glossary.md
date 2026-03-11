@@ -18,6 +18,7 @@ This glossary is shared across the repository. Other documents should reuse thes
 | **deterministic executor** | A traditional programmatic executor that does not rely on an LLM or external agent harness. Examples include policy evaluators, static analyzers, rule engines, AST transforms, classifiers, and queueing logic. |
 | **contract** | The runtime-enforced set of delivery, execution, safety, quality, and recovery constraints applied to an action. |
 | **execution strategy** | The per-action execution pattern used by Crawfish, such as `single_pass` or `verify_loop`, independent of which adapter or harness is selected. |
+| **interaction model** | A derived runtime classification describing what kind of boundary the action is actually crossing, such as `context_split`, `same_owner_swarm`, `same_device_multi_owner`, or `remote_harness`. It is not user-supplied configuration. |
 | **verification spec** | The deterministic check set attached to a `verify_loop`, such as tests, lint, schema validation, file checks, or approval gates. |
 | **policy** | A rule set that influences or constrains execution. Policies may be hard or soft and may come from organization defaults, agent defaults, or action overrides. |
 | **trust domain** | The relationship class between the caller and the target runtime surface, such as `same_owner_local`, `same_device_foreign_owner`, or `external_partner`. It is an input to governance, not merely a label. |
@@ -44,6 +45,7 @@ This glossary is shared across the repository. Other documents should reuse thes
 | **OpenClaw binding** | A first-class harness binding that lets Crawfish call OpenClaw through its Gateway protocol or be called by OpenClaw through plugins and RPC. |
 | **manifest** | The declarative specification of an agent, including capabilities, dependencies, runtime profile, lifecycle policy, and contract defaults. |
 | **checkpoint** | A durable recovery record written at safe execution boundaries such as model turns, mutating tool calls, or explicit yield points. |
+| **context split** | A narrow multi-agent pattern in which sub-agents or bounded workers coordinate inside one application authority without a meaningful owner, trust-domain, or external-harness boundary. Context split is coordination, not full swarm governance. |
 | **action store** | The persistent storage layer for action metadata, feedback events, terminal state, and artifact references. |
 | **hard policy** | A rule that must never be violated. If it cannot be satisfied, the runtime rejects, blocks, or fails the action. |
 | **soft policy** | A preferred rule that may trigger rerouting or degradation before the runtime declares failure. |

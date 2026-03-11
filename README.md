@@ -20,7 +20,7 @@ The agent stack is changing faster than the rules around it.
 - Governance and operational practice still trail capability growth.
 - Multi-owner agent encounters are no longer theoretical. They already happen on the same laptop.
 
-Most teams are still driving by the rear-view mirror: building with yesterday's application assumptions while swarm-scale agency is arriving with today's tools.
+Most teams are still driving by the rear-view mirror, in the sense described by Notion's ["Steam, Steel, and Infinite Minds"](https://www.notion.com/blog/steam-steel-and-infinite-minds-ai): building with yesterday's application assumptions while swarm-scale agency is arriving with today's tools.
 
 Crawfish is built for that mismatch.
 
@@ -60,6 +60,25 @@ Crawfish treats the future as swarm-shaped:
 - many continuity states, not a binary up/down illusion
 
 `Swarm` here does **not** imply shared trust, shared memory, or ambient context sharing. It means a governed collection of agents and harness-backed workers under one control plane.
+
+## Why Swarm, Not Role-Split Multi-Agent
+
+Much earlier "multi-agent" work was often about splitting roles inside one application, not governing real encounters across owners, harnesses, and trust boundaries.
+
+- LangChain's multi-agent docs frame the problem primarily as [context engineering](https://docs.langchain.com/oss/python/langchain/multi-agent): deciding what information each sub-agent should see and how much context to pass.
+- OpenAI's Agents SDK frames multi-agent coordination around [handoffs](https://openai.github.io/openai-agents-python/handoffs/) and shared run [context](https://openai.github.io/openai-agents-python/context/) inside one agentic application.
+- AutoGen's Swarm docs explicitly describe agents that [share the same message context](https://microsoft.github.io/autogen/0.7.3/user-guide/agentchat-user-guide/swarm.html).
+
+Those patterns are useful. They are not the same as the environment Crawfish is built for.
+
+Crawfish targets the point where "many" stops meaning "more prompt wrappers inside one app" and starts meaning:
+
+- many bounded workers, not one conversation tree
+- many owners, not one ambient authority
+- many harness surfaces, not one centrally managed loop
+- many real encounter boundaries, not only context partitioning
+
+That is why Crawfish needs doctrine, checkpoints, leases, evidence, evaluation, and escalation. Context split is coordination. Swarm governance is a different systems problem.
 
 ## Why Crawfish Is Not Another Harness
 
@@ -175,7 +194,7 @@ The short version:
 - build for swarm-age governance, not single-agent demos
 - harnesses are replaceable, control planes are strategic
 - reasoning is volatile; contracts and verification must survive model churn
-- institutions lag capability growth; runtime guardrails cannot
+- institutions lag capability growth, as argued in Notion's ["Steam, Steel, and Infinite Minds"](https://www.notion.com/blog/steam-steel-and-infinite-minds-ai); runtime guardrails cannot
 - constitutions do not enforce themselves
 - constitutions guide models; institutions govern swarms
 - frontier enforcement gaps are runtime failures, not merely policy failures

@@ -36,6 +36,7 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - named evaluation profiles, scorecards, datasets, experiment runs, experiment case results, and alert events
 - operator commands and UDS endpoints for `eval dataset list`, `eval dataset show`, `eval run`, `eval run-status`, `alert list`, and `alert ack`
 - automatic dataset capture and isolated replay runs for `task.plan`, `repo.review`, and `incident.enrich`
+- derived `interaction_model` metadata across action inspection, trace bundles, and dataset cases
 
 ### Changed
 
@@ -54,11 +55,14 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - the public implementation boundary is now documented as Rust-first, not Rust-only
 - the public philosophy and architecture now explicitly distinguish constitutions from runtime enforcement, and position evaluation as a swarm control-plane substrate rather than a future UI-only concern
 - `quality.evaluation_profile` is now the primary evaluation config surface; `evaluation_hook` remains alpha-compatible but deprecated
+- the public README and spec now explicitly distinguish context-split multi-agent coordination from real swarm encounters across owners, harnesses, and trust domains, with inline source citations on first mention
+- `PolicyIncident.reason_code` is now the primary runtime field, with legacy `code` preserved as an alpha-compatibility alias
 
 ### Migration Notes
 
 - prefer `quality.evaluation_profile` for new configs and manifests
 - `quality.evaluation_hook` still parses during `0.1.x alpha`, but only legacy built-ins are normalized automatically
+- prefer `PolicyIncident.reason_code` in new integrations and tooling; the older `code` name remains accepted as a compatibility alias during alpha
 
 ### Security
 

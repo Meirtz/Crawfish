@@ -205,6 +205,14 @@ pub enum JurisdictionClass {
   ExternalUnknown,
 }
 
+pub enum InteractionModel {
+  ContextSplit,
+  SameOwnerSwarm,
+  SameDeviceMultiOwner,
+  RemoteHarness,
+  ExternalUnknown,
+}
+
 pub enum OversightCheckpoint {
   Admission,
   PreDispatch,
@@ -226,7 +234,7 @@ pub struct PolicyIncident {
   pub action_id: String,
   pub doctrine_pack_id: String,
   pub jurisdiction: JurisdictionClass,
-  pub code: String,
+  pub reason_code: String,
   pub summary: String,
   pub severity: PolicyIncidentSeverity,
   pub checkpoint: Option<OversightCheckpoint>,
@@ -237,6 +245,7 @@ pub struct TraceBundle {
   pub id: String,
   pub action_id: String,
   pub capability: String,
+  pub interaction_model: InteractionModel,
   pub selected_executor: Option<String>,
   pub artifact_refs: Vec<ArtifactRef>,
   pub external_refs: Vec<ExternalRef>,
@@ -652,6 +661,8 @@ Governance resolution is separate from execution contract compilation. It decide
 
 Encounter policy answers whether an interaction is allowed. Doctrine answers whether the runtime can prove that the interaction is being governed correctly.
 
+This is also where Crawfish separates older context-split multi-agent patterns from real swarm encounters. LangChain's multi-agent framing is explicitly about [context engineering](https://docs.langchain.com/oss/python/langchain/multi-agent), OpenAI's Agents SDK centers [handoffs](https://openai.github.io/openai-agents-python/handoffs/) and shared [context](https://openai.github.io/openai-agents-python/context/), and AutoGen Swarm describes agents that [share the same message context](https://microsoft.github.io/autogen/0.7.3/user-guide/agentchat-user-guide/swarm.html). Crawfish still supports that `context_split` case as a derived interaction model, but the doctrine compiler treats everything outside that narrow class as frontier governance territory.
+
 This is the architecture-level answer to the frontier problem:
 
 - a constitution or policy may say what should happen
@@ -662,6 +673,7 @@ This is the architecture-level answer to the frontier problem:
 
 Each action should therefore compile:
 
+- `InteractionModel`
 - `JurisdictionClass`
 - `DoctrinePack`
 - `CheckpointStatus`
@@ -669,6 +681,16 @@ Each action should therefore compile:
 - `PolicyIncident`
 
 If a required checkpoint cannot be satisfied, the action must not silently continue. The only legal exits are deny, store-and-forward, or human handoff.
+
+In practice the doctrine compiler interprets the interaction classes this way:
+
+- `context_split`: multiple workers may coordinate inside one bounded application with no meaningful owner or harness boundary
+- `same_owner_swarm`: the control plane is already operating over multiple bounded workers under one owner
+- `same_device_multi_owner`: frontier territory on the same machine
+- `remote_harness`: frontier territory because execution crosses into a harness surface
+- `external_unknown`: frontier territory with insufficient authority or trust classification
+
+Everything except `context_split` must prove doctrine evidence at the relevant checkpoints. Missing evidence produces a `PolicyIncident` with `reason_code = "frontier_enforcement_gap"`.
 
 ### Governance Precedence
 

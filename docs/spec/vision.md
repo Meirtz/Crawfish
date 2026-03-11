@@ -27,7 +27,7 @@ Crawfish is built around eight philosophical commitments:
 - **Interoperability should be layered.** Tool interoperability, harness interoperability, and remote-agent interoperability are different problems and should not be collapsed into one transport abstraction.
 - **Graceful degradation is better than brittle autonomy.** A production system should shrink safely under pressure before it fails hard.
 - **Continuity matters more than peak cleverness.** The product is judged by the safest useful work it can keep doing when the reasoning layer is impaired, not only by the best-case intelligence of a healthy model route.
-- **Institutions lag capability growth.** Runtime guardrails, encounter policy, and revocation semantics should arrive before the ecosystem feels fully comfortable with them.
+- **Institutions lag capability growth.** Runtime guardrails, encounter policy, and revocation semantics should arrive before the ecosystem feels fully comfortable with them, in the broader sense argued by Notion's ["Steam, Steel, and Infinite Minds"](https://www.notion.com/blog/steam-steel-and-infinite-minds-ai).
 - **Constitutions are necessary but insufficient.** High-level rules matter, but runtime checkpoints and evidence are what turn them into governance.
 - **Evaluation is a control-plane primitive.** Traces, scorecards, review queues, alerts, datasets, and replay loops should be runtime objects, not only analytics afterthoughts.
 
@@ -73,7 +73,7 @@ This framing is more accurate than treating all integrations as generic subproce
 
 ## Why Governance Becomes Core When Agents Roam
 
-The first generation of multi-agent systems mostly treated agents as task-level helpers. Multiple agents often meant little more than role separation or context isolation inside one application.
+The first generation of multi-agent systems mostly treated agents as task-level helpers. Multiple agents often meant little more than role separation or context isolation inside one application. LangChain's multi-agent docs explicitly frame this around [context engineering](https://docs.langchain.com/oss/python/langchain/multi-agent), OpenAI's Agents SDK frames it around [handoffs](https://openai.github.io/openai-agents-python/handoffs/) and shared run [context](https://openai.github.io/openai-agents-python/context/), and AutoGen Swarm describes agents that [share the same message context](https://microsoft.github.io/autogen/0.7.3/user-guide/agentchat-user-guide/swarm.html).
 
 That world is ending.
 
@@ -85,6 +85,11 @@ If each person, team, and product can have many always-on agents, the real probl
 - agents may request access to capabilities or data they do not own
 
 At that point, governance is not a secondary security feature. It becomes part of the runtime's core job.
+
+The distinction matters:
+
+- old multi-agent often meant context-managed sub-agents under one application authority
+- Crawfish targets true swarm governance across owners, trust domains, and harness surfaces
 
 ## Sovereignty Before Coordination
 
