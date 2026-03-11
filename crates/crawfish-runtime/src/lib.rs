@@ -922,6 +922,9 @@ impl Supervisor {
             treaty_pack_id: external_ref_value(&action.external_refs, "a2a.treaty_pack"),
             delegation_receipt_ref,
             remote_task_ref: external_ref_value(&action.external_refs, "a2a.task_id"),
+            remote_outcome_disposition: remote_outcome_disposition_for_action(action),
+            treaty_violations: treaty_violations_for_action(action),
+            delegation_depth: delegation_depth_for_action(action),
             created_at: now_timestamp(),
         };
         Ok(trace)
@@ -1015,9 +1018,20 @@ impl Supervisor {
         incidents: &[PolicyIncident],
         dataset_case: Option<&DatasetCase>,
     ) -> anyhow::Result<Option<ReviewQueueItem>> {
+        let treaty_pack = external_ref_value(&action.external_refs, "a2a.treaty_pack")
+            .and_then(|treaty_id| self.config.treaties.packs.get(&treaty_id).cloned());
+        let remote_outcome_disposition = remote_outcome_disposition_for_action(action);
         let should_queue = profile
             .map(|profile| profile.profile.review_queue)
             .unwrap_or(false)
+            || (treaty_pack
+                .as_ref()
+                .map(|treaty| treaty.review_queue)
+                .unwrap_or(false)
+                && matches!(
+                    remote_outcome_disposition,
+                    Some(crawfish_types::RemoteOutcomeDisposition::ReviewRequired)
+                ))
             || evaluation
                 .map(|evaluation| {
                     matches!(
@@ -1037,13 +1051,21 @@ impl Supervisor {
             return Ok(None);
         }
 
-        let priority = if incidents
+        let high_priority = incidents
             .iter()
             .any(|incident| matches!(incident.severity, PolicyIncidentSeverity::Critical))
             || evaluation
                 .map(|evaluation| matches!(evaluation.status, EvaluationStatus::Failed))
                 .unwrap_or(false)
-        {
+            || (treaty_pack
+                .as_ref()
+                .map(|treaty| treaty.review_queue)
+                .unwrap_or(false)
+                && matches!(
+                    remote_outcome_disposition,
+                    Some(crawfish_types::RemoteOutcomeDisposition::ReviewRequired)
+                ));
+        let priority = if high_priority {
             "high".to_string()
         } else {
             "medium".to_string()
@@ -1064,6 +1086,11 @@ impl Supervisor {
             .unwrap_or(false)
         {
             "evaluation_failed".to_string()
+        } else if matches!(
+            remote_outcome_disposition,
+            Some(crawfish_types::RemoteOutcomeDisposition::ReviewRequired)
+        ) {
+            "treaty_review_required".to_string()
         } else {
             "policy_incident".to_string()
         };
@@ -1108,6 +1135,9 @@ impl Supervisor {
             jurisdiction_class_for_action(action, None),
         );
         let mut incidents = Vec::new();
+        let treaty_pack = external_ref_value(&action.external_refs, "a2a.treaty_pack")
+            .and_then(|treaty_id| self.config.treaties.packs.get(&treaty_id).cloned());
+        let treaty_violations = treaty_violations_for_action(action);
         if action.capability == "workspace.patch.apply" {
             incidents.push(PolicyIncident {
                 id: Uuid::new_v4().to_string(),
@@ -1156,6 +1186,23 @@ impl Supervisor {
                     created_at: now_timestamp(),
                 });
             }
+        }
+        for violation in &treaty_violations {
+            incidents.push(PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: doctrine.id.clone(),
+                jurisdiction: doctrine.jurisdiction.clone(),
+                reason_code: violation.code.clone(),
+                summary: violation.summary.clone(),
+                severity: if violation.code == "treaty_scope_violation" {
+                    PolicyIncidentSeverity::Critical
+                } else {
+                    PolicyIncidentSeverity::Warning
+                },
+                checkpoint: violation.checkpoint.clone(),
+                created_at: now_timestamp(),
+            });
         }
         if let Some(hook) = action.contract.quality.evaluation_hook.as_deref() {
             if legacy_evaluation_hook_profile_name(hook).is_none() {
@@ -1220,6 +1267,32 @@ impl Supervisor {
                 created_at: now_timestamp(),
             });
         }
+        if matches!(
+            remote_outcome_disposition_for_action(action),
+            Some(crawfish_types::RemoteOutcomeDisposition::ReviewRequired)
+        ) {
+            incidents.push(PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: doctrine.id.clone(),
+                jurisdiction: doctrine.jurisdiction.clone(),
+                reason_code: "frontier_enforcement_gap".to_string(),
+                summary: treaty_pack
+                    .as_ref()
+                    .map(|treaty| {
+                        format!(
+                            "remote result under treaty {} requires operator review before acceptance",
+                            treaty.id
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "remote result requires operator review before acceptance".to_string()
+                    }),
+                severity: PolicyIncidentSeverity::Critical,
+                checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                created_at: now_timestamp(),
+            });
+        }
         let has_required_checkpoint_gap = checkpoint_status
             .iter()
             .any(|status| status.required && !matches!(status.outcome, CheckpointOutcome::Passed));
@@ -1260,6 +1333,15 @@ impl Supervisor {
         let mut configured_rules = profile
             .map(|profile| profile.alert_rules.clone())
             .unwrap_or_default();
+        if let Some(treaty_pack) = external_ref_value(&action.external_refs, "a2a.treaty_pack")
+            .and_then(|treaty_id| self.config.treaties.packs.get(&treaty_id).cloned())
+        {
+            for rule_id in treaty_pack.alert_rules {
+                if let Some(rule) = self.evaluation_alert_rules().get(&rule_id).cloned() {
+                    configured_rules.push(rule);
+                }
+            }
+        }
         if !configured_rules
             .iter()
             .any(|rule| rule.id == "frontier_gap_detected")
@@ -1672,6 +1754,9 @@ impl Supervisor {
             treaty_pack_id: trace.treaty_pack_id.clone(),
             delegation_receipt_ref: trace.delegation_receipt_ref.clone(),
             remote_task_ref: trace.remote_task_ref.clone(),
+            remote_outcome_disposition: trace.remote_outcome_disposition.clone(),
+            treaty_violations: trace.treaty_violations.clone(),
+            delegation_depth: trace.delegation_depth,
             verification_summary: trace.verification_summary.clone(),
             evaluation_refs: evaluations
                 .iter()
@@ -2593,16 +2678,58 @@ impl Supervisor {
                     attempted_agentic_route = true;
                     match self.resolve_a2a_adapter(manifest) {
                         Ok(Some((adapter, mut base_refs))) => {
+                            let treaty_decision = match self.compile_treaty_decision(
+                                action,
+                                adapter.binding(),
+                                adapter.treaty_pack(),
+                            ) {
+                                Ok(decision) => decision,
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "a2a",
+                                                "reason": reason,
+                                                "code": failure_code_treaty_denied(),
+                                                "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                            }),
+                                        )
+                                        .await?;
+                                    self.store
+                                        .insert_policy_incident(&PolicyIncident {
+                                            id: Uuid::new_v4().to_string(),
+                                            action_id: action.id.clone(),
+                                            doctrine_pack_id: "swarm_frontier_v1".to_string(),
+                                            jurisdiction: JurisdictionClass::ExternalUnknown,
+                                            reason_code: "treaty_denied".to_string(),
+                                            summary: reason.clone(),
+                                            severity: PolicyIncidentSeverity::Critical,
+                                            checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                            created_at: now_timestamp(),
+                                        })
+                                        .await?;
+                                    last_reason = Some(reason);
+                                    last_external_refs = base_refs;
+                                    continue;
+                                }
+                            };
                             let mut receipt = crawfish_types::DelegationReceipt {
                                 id: Uuid::new_v4().to_string(),
                                 action_id: action.id.clone(),
-                                treaty_pack_id: adapter.treaty_pack().id.clone(),
-                                remote_principal: adapter.treaty_pack().remote_principal.clone(),
+                                treaty_pack_id: treaty_decision.treaty_pack_id.clone(),
+                                remote_principal: treaty_decision.remote_principal.clone(),
                                 capability: action.capability.clone(),
-                                requested_scopes: adapter.binding().required_scopes.clone(),
+                                requested_scopes: treaty_decision.requested_scopes.clone(),
+                                delegated_data_scopes: treaty_decision
+                                    .delegated_data_scopes
+                                    .clone(),
                                 decision: crawfish_types::DelegationDecision::Allowed,
                                 remote_agent_card_url: adapter.binding().agent_card_url.clone(),
                                 remote_task_ref: None,
+                                delegation_depth: Some(treaty_decision.delegation_depth),
                                 created_at: now_timestamp(),
                             };
                             self.store.insert_delegation_receipt(&receipt).await?;
@@ -2616,8 +2743,13 @@ impl Supervisor {
                                 value: receipt.id.clone(),
                                 endpoint: None,
                             });
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.delegation_depth".to_string(),
+                                value: treaty_decision.delegation_depth.to_string(),
+                                endpoint: None,
+                            });
                             match adapter.run(action).await {
-                                Ok(result) => {
+                                Ok(mut result) => {
                                     let merged_external_refs =
                                         merge_external_refs(base_refs, result.external_refs);
                                     receipt.remote_task_ref =
@@ -2682,16 +2814,84 @@ impl Supervisor {
                                             });
                                         }
                                         _ => {
-                                            return Ok(ExecutionOutcome::Completed {
-                                                outputs: result.outputs,
-                                                selected_executor: format!(
-                                                    "a2a.{}",
-                                                    adapter.name()
-                                                ),
-                                                checkpoint: None,
-                                                external_refs: merged_external_refs,
-                                                surface_events: result.events,
+                                            let (disposition, violations) = self
+                                                .evaluate_treaty_post_result(
+                                                    &result.outputs,
+                                                    &receipt,
+                                                    &treaty_decision,
+                                                    adapter.treaty_pack(),
+                                                );
+                                            set_treaty_result_metadata(
+                                                &mut result.outputs,
+                                                &disposition,
+                                                &violations,
+                                            );
+                                            let mut surface_events = result.events.clone();
+                                            surface_events.push(crawfish_core::SurfaceActionEvent {
+                                                event_type: "treaty_post_result_assessed".to_string(),
+                                                payload: serde_json::json!({
+                                                    "timestamp": now_timestamp(),
+                                                    "disposition": runtime_enum_to_snake(&disposition),
+                                                    "violation_count": violations.len(),
+                                                    "treaty_pack_id": treaty_decision.treaty_pack_id,
+                                                }),
                                             });
+                                            match disposition {
+                                                crawfish_types::RemoteOutcomeDisposition::Accepted => {
+                                                    return Ok(ExecutionOutcome::Completed {
+                                                        outputs: result.outputs,
+                                                        selected_executor: format!(
+                                                            "a2a.{}",
+                                                            adapter.name()
+                                                        ),
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    });
+                                                }
+                                                crawfish_types::RemoteOutcomeDisposition::ReviewRequired => {
+                                                    let reason = violations
+                                                        .first()
+                                                        .map(|violation| violation.summary.clone())
+                                                        .unwrap_or_else(|| {
+                                                            "remote result requires treaty review before acceptance".to_string()
+                                                        });
+                                                    let code = violations
+                                                        .first()
+                                                        .map(|violation| violation.code.clone())
+                                                        .unwrap_or_else(|| {
+                                                            "frontier_enforcement_gap".to_string()
+                                                        });
+                                                    return Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: code,
+                                                        continuity_mode: None,
+                                                        outputs: result.outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    });
+                                                }
+                                                crawfish_types::RemoteOutcomeDisposition::Rejected => {
+                                                    let reason = violations
+                                                        .first()
+                                                        .map(|violation| violation.summary.clone())
+                                                        .unwrap_or_else(|| {
+                                                            "remote result was rejected by treaty governance".to_string()
+                                                        });
+                                                    let code = violations
+                                                        .first()
+                                                        .map(|violation| violation.code.clone())
+                                                        .unwrap_or_else(|| "treaty_scope_violation".to_string());
+                                                    return Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: code,
+                                                        outputs: result.outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    });
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -3029,6 +3229,215 @@ impl Supervisor {
             A2aAdapter::new(binding, treaty_pack, self.state_dir()),
             external_refs,
         )))
+    }
+
+    fn compile_treaty_decision(
+        &self,
+        action: &Action,
+        binding: &crawfish_types::A2ARemoteAgentBinding,
+        treaty_pack: &crawfish_types::TreatyPack,
+    ) -> anyhow::Result<crawfish_types::TreatyDecision> {
+        if action.initiator_owner.kind != treaty_pack.local_owner.kind
+            || action.initiator_owner.id != treaty_pack.local_owner.id
+        {
+            anyhow::bail!(
+                "treaty {} requires local owner {}:{}, got {}:{}",
+                treaty_pack.id,
+                runtime_enum_to_snake(&treaty_pack.local_owner.kind),
+                treaty_pack.local_owner.id,
+                runtime_enum_to_snake(&action.initiator_owner.kind),
+                action.initiator_owner.id
+            );
+        }
+        if !treaty_pack
+            .allowed_capabilities
+            .iter()
+            .any(|capability| capability == &binding.capability)
+        {
+            anyhow::bail!(
+                "treaty {} does not allow capability {}",
+                treaty_pack.id,
+                binding.capability
+            );
+        }
+        if treaty_pack.max_delegation_depth != 1 {
+            anyhow::bail!(
+                "treaty {} exceeds supported delegation depth {}",
+                treaty_pack.id,
+                treaty_pack.max_delegation_depth
+            );
+        }
+
+        let delegated_data_scopes = task_plan_delegated_data_scopes(action);
+        let out_of_scope = delegated_data_scopes
+            .iter()
+            .filter(|scope| {
+                !treaty_pack
+                    .allowed_data_scopes
+                    .iter()
+                    .any(|allowed| allowed == *scope)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !out_of_scope.is_empty() {
+            anyhow::bail!(
+                "treaty {} does not allow delegated data scopes: {}",
+                treaty_pack.id,
+                out_of_scope.join(", ")
+            );
+        }
+
+        Ok(crawfish_types::TreatyDecision {
+            treaty_pack_id: treaty_pack.id.clone(),
+            remote_principal: treaty_pack.remote_principal.clone(),
+            capability: binding.capability.clone(),
+            requested_scopes: binding.required_scopes.clone(),
+            delegated_data_scopes,
+            required_checkpoints: treaty_pack.required_checkpoints.clone(),
+            required_result_evidence: treaty_pack.required_result_evidence.clone(),
+            delegation_depth: 1,
+            on_scope_violation: treaty_pack.on_scope_violation.clone(),
+            on_evidence_gap: treaty_pack.on_evidence_gap.clone(),
+            review_queue: treaty_pack.review_queue,
+            alert_rules: treaty_pack.alert_rules.clone(),
+        })
+    }
+
+    fn evaluate_treaty_post_result(
+        &self,
+        outputs: &ActionOutputs,
+        receipt: &crawfish_types::DelegationReceipt,
+        decision: &crawfish_types::TreatyDecision,
+        treaty_pack: &crawfish_types::TreatyPack,
+    ) -> (
+        crawfish_types::RemoteOutcomeDisposition,
+        Vec<crawfish_types::TreatyViolation>,
+    ) {
+        let mut violations = Vec::new();
+        for requirement in &decision.required_result_evidence {
+            match requirement {
+                crawfish_types::TreatyEvidenceRequirement::DelegationReceiptPresent => {
+                    if receipt.id.is_empty() {
+                        violations.push(crawfish_types::TreatyViolation {
+                            code: "frontier_enforcement_gap".to_string(),
+                            summary: "delegation receipt is missing".to_string(),
+                            checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                            subject: Some("delegation_receipt".to_string()),
+                        });
+                    }
+                }
+                crawfish_types::TreatyEvidenceRequirement::RemoteTaskRefPresent => {
+                    if receipt
+                        .remote_task_ref
+                        .as_deref()
+                        .unwrap_or_default()
+                        .is_empty()
+                    {
+                        violations.push(crawfish_types::TreatyViolation {
+                            code: "frontier_enforcement_gap".to_string(),
+                            summary: "remote task reference is missing".to_string(),
+                            checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                            subject: Some("remote_task_ref".to_string()),
+                        });
+                    }
+                }
+                crawfish_types::TreatyEvidenceRequirement::TerminalStateVerified => {
+                    let verified = outputs
+                        .metadata
+                        .get("a2a_remote_state")
+                        .and_then(Value::as_str)
+                        .map(|state| matches!(state, "completed" | "failed"))
+                        .unwrap_or(false)
+                        && outputs.metadata.contains_key("a2a_result");
+                    if !verified {
+                        violations.push(crawfish_types::TreatyViolation {
+                            code: "frontier_enforcement_gap".to_string(),
+                            summary:
+                                "remote terminal state could not be proven from returned evidence"
+                                    .to_string(),
+                            checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                            subject: Some("terminal_state".to_string()),
+                        });
+                    }
+                }
+                crawfish_types::TreatyEvidenceRequirement::ArtifactClassesAllowed => {
+                    let disallowed = outputs
+                        .artifacts
+                        .iter()
+                        .map(artifact_basename)
+                        .filter(|artifact| {
+                            !treaty_pack
+                                .allowed_artifact_classes
+                                .iter()
+                                .any(|allowed| allowed == artifact)
+                        })
+                        .collect::<Vec<_>>();
+                    for artifact in disallowed {
+                        violations.push(crawfish_types::TreatyViolation {
+                            code: "treaty_scope_violation".to_string(),
+                            summary: format!(
+                                "remote result returned disallowed artifact class {artifact}"
+                            ),
+                            checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                            subject: Some(artifact),
+                        });
+                    }
+                }
+                crawfish_types::TreatyEvidenceRequirement::DataScopesAllowed => {
+                    let disallowed = receipt
+                        .delegated_data_scopes
+                        .iter()
+                        .filter(|scope| {
+                            !treaty_pack
+                                .allowed_data_scopes
+                                .iter()
+                                .any(|allowed| allowed == *scope)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for scope in disallowed {
+                        violations.push(crawfish_types::TreatyViolation {
+                            code: "treaty_scope_violation".to_string(),
+                            summary: format!(
+                                "remote delegation used a data scope outside treaty allowance: {scope}"
+                            ),
+                            checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                            subject: Some(scope),
+                        });
+                    }
+                }
+            }
+        }
+
+        let disposition = if violations
+            .iter()
+            .any(|violation| violation.code == "treaty_scope_violation")
+        {
+            match decision.on_scope_violation {
+                crawfish_types::TreatyEscalationMode::Deny => {
+                    crawfish_types::RemoteOutcomeDisposition::Rejected
+                }
+                crawfish_types::TreatyEscalationMode::ReviewRequired => {
+                    crawfish_types::RemoteOutcomeDisposition::ReviewRequired
+                }
+            }
+        } else if violations
+            .iter()
+            .any(|violation| violation.code == "frontier_enforcement_gap")
+        {
+            match decision.on_evidence_gap {
+                crawfish_types::TreatyEscalationMode::Deny => {
+                    crawfish_types::RemoteOutcomeDisposition::Rejected
+                }
+                crawfish_types::TreatyEscalationMode::ReviewRequired => {
+                    crawfish_types::RemoteOutcomeDisposition::ReviewRequired
+                }
+            }
+        } else {
+            crawfish_types::RemoteOutcomeDisposition::Accepted
+        };
+
+        (disposition, violations)
     }
 
     async fn ensure_required_lease_valid(
@@ -5235,6 +5644,77 @@ fn external_ref_value(external_refs: &[ExternalRef], kind: &str) -> Option<Strin
         .map(|reference| reference.value.clone())
 }
 
+fn delegation_depth_for_action(action: &Action) -> Option<u32> {
+    external_ref_value(&action.external_refs, "a2a.delegation_depth")
+        .and_then(|value| value.parse::<u32>().ok())
+        .or_else(|| {
+            if matches!(
+                interaction_model_for_action(action, None),
+                crawfish_types::InteractionModel::RemoteAgent
+            ) {
+                Some(1)
+            } else {
+                None
+            }
+        })
+}
+
+fn remote_outcome_disposition_for_action(
+    action: &Action,
+) -> Option<crawfish_types::RemoteOutcomeDisposition> {
+    action
+        .outputs
+        .metadata
+        .get("treaty_remote_outcome_disposition")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn treaty_violations_for_action(action: &Action) -> Vec<crawfish_types::TreatyViolation> {
+    action
+        .outputs
+        .metadata
+        .get("treaty_violations")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+fn task_plan_delegated_data_scopes(action: &Action) -> Vec<String> {
+    let mut scopes = Vec::new();
+    for key in [
+        "objective",
+        "workspace_root",
+        "context_files",
+        "constraints",
+        "desired_outputs",
+        "background",
+        "verification_feedback",
+        "base_ref",
+        "head_ref",
+    ] {
+        if action.inputs.contains_key(key) {
+            scopes.push(key.to_string());
+        }
+    }
+    scopes
+}
+
+fn set_treaty_result_metadata(
+    outputs: &mut ActionOutputs,
+    disposition: &crawfish_types::RemoteOutcomeDisposition,
+    violations: &[crawfish_types::TreatyViolation],
+) {
+    outputs.metadata.insert(
+        "treaty_remote_outcome_disposition".to_string(),
+        serde_json::to_value(disposition).unwrap_or(Value::Null),
+    );
+    outputs.metadata.insert(
+        "treaty_violations".to_string(),
+        serde_json::to_value(violations).unwrap_or_else(|_| Value::Array(Vec::new())),
+    );
+}
+
 fn default_doctrine_pack(
     action: &Action,
     interaction_model: &crawfish_types::InteractionModel,
@@ -5355,6 +5835,7 @@ fn checkpoint_status_for_action(
     let has_remote_treaty = external_ref_value(&action.external_refs, "a2a.treaty_pack").is_some();
     let has_remote_receipt =
         external_ref_value(&action.external_refs, "a2a.delegation_receipt").is_some();
+    let remote_outcome_disposition = remote_outcome_disposition_for_action(action);
 
     let requires = |checkpoint: OversightCheckpoint| {
         doctrine
@@ -5426,7 +5907,11 @@ fn checkpoint_status_for_action(
                 && (!matches!(
                     interaction_model,
                     crawfish_types::InteractionModel::RemoteAgent
-                ) || has_remote_receipt)
+                ) || (has_remote_receipt
+                    && matches!(
+                        remote_outcome_disposition,
+                        Some(crawfish_types::RemoteOutcomeDisposition::Accepted)
+                    )))
             {
                 CheckpointOutcome::Passed
             } else {
@@ -5444,6 +5929,14 @@ fn checkpoint_status_for_action(
             ) && !has_remote_receipt
             {
                 Some("remote delegation receipt is missing".to_string())
+            } else if matches!(
+                interaction_model,
+                crawfish_types::InteractionModel::RemoteAgent
+            ) && !matches!(
+                remote_outcome_disposition,
+                Some(crawfish_types::RemoteOutcomeDisposition::Accepted)
+            ) {
+                Some("remote outcome did not satisfy treaty post-result governance".to_string())
             } else {
                 Some("terminal evidence present".to_string())
             },
@@ -6813,6 +7306,10 @@ impl SupervisorControl for Supervisor {
         };
         let treaty_summary = external_ref_value(&action.external_refs, "a2a.treaty_pack")
             .and_then(|treaty_id| self.config.treaties.packs.get(&treaty_id).cloned());
+        let treaty_pack_id = treaty_summary
+            .as_ref()
+            .map(|treaty| treaty.id.clone())
+            .or_else(|| external_ref_value(&action.external_refs, "a2a.treaty_pack"));
         let remote_task_ref = external_ref_value(&action.external_refs, "a2a.task_id");
         let remote_principal = delegation_receipt
             .as_ref()
@@ -6848,9 +7345,13 @@ impl SupervisorControl for Supervisor {
                 .collect(),
             alert_refs: alert_events.iter().map(|alert| alert.id.clone()).collect(),
             remote_principal,
+            treaty_pack_id,
             treaty_summary,
             delegation_receipt_ref,
             remote_task_ref,
+            remote_outcome_disposition: remote_outcome_disposition_for_action(&action),
+            treaty_violations: treaty_violations_for_action(&action),
+            delegation_depth: delegation_depth_for_action(&action),
             delegation_receipt,
             action,
             encounter,
@@ -8633,6 +9134,7 @@ allow_in_task_auth = false
         StreamingCompleted,
         InputRequired,
         AuthRequired,
+        StreamingMissingTaskRef,
     }
 
     #[derive(Clone)]
@@ -8695,6 +9197,23 @@ allow_in_task_auth = false
                     "events": [
                         { "kind": "lifecycle", "state": "working" },
                         { "kind": "assistant", "text": "Remote planner is preparing a task plan." }
+                    ]
+                }
+            }),
+            (RuntimeA2aMode::StreamingMissingTaskRef, "message/stream") => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "task": {
+                        "id": "",
+                        "status": { "state": "completed" },
+                        "result": {
+                            "text": "# Task Plan\n1. Inspect the objective and the context files.\n2. Produce a proposal-only plan with ordered steps and rollout notes.\nRisks: remote coordination can drift from local assumptions.\nAssumptions: the plan remains proposal-only.\nTest: verify the proposal covers desired outputs."
+                        }
+                    },
+                    "events": [
+                        { "kind": "lifecycle", "state": "working" },
+                        { "kind": "assistant", "text": "Remote planner completed without a durable task id." }
                     ]
                 }
             }),
@@ -9508,6 +10027,135 @@ EOF
             detail.action.failure_code.as_deref(),
             Some("a2a_auth_required")
         );
+    }
+
+    #[tokio::test]
+    async fn task_plan_a2a_scope_violation_rejects_remote_result() {
+        let dir = tempdir().unwrap();
+        let a2a_url = spawn_runtime_a2a_server(RuntimeA2aMode::StreamingCompleted).await;
+        std::env::set_var("A2A_REMOTE_TOKEN", "remote-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace(
+            "preferred_harnesses = [\"claude_code\", \"codex\", \"a2a\", \"openclaw\"]",
+            "preferred_harnesses = [\"a2a\"]",
+        )
+        .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
+            .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url)
+            .replace(
+                "allowed_artifact_classes = [\"task_plan.json\", \"task_plan.md\"]",
+                "allowed_artifact_classes = [\"task_plan.json\"]",
+            );
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Trigger treaty scope violation for remote artifact classes",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Failed);
+        assert_eq!(
+            detail.remote_outcome_disposition,
+            Some(crawfish_types::RemoteOutcomeDisposition::Rejected)
+        );
+        assert!(detail
+            .treaty_violations
+            .iter()
+            .any(|violation| violation.code == "treaty_scope_violation"));
+        assert!(detail
+            .policy_incidents
+            .iter()
+            .any(|incident| incident.reason_code == "treaty_scope_violation"));
+    }
+
+    #[tokio::test]
+    async fn task_plan_a2a_missing_result_evidence_requires_review() {
+        let dir = tempdir().unwrap();
+        let a2a_url = spawn_runtime_a2a_server(RuntimeA2aMode::StreamingMissingTaskRef).await;
+        std::env::set_var("A2A_REMOTE_TOKEN", "remote-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace(
+            "preferred_harnesses = [\"claude_code\", \"codex\", \"a2a\", \"openclaw\"]",
+            "preferred_harnesses = [\"a2a\"]",
+        )
+        .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
+            .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Trigger treaty evidence gap for remote planning",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.phase, ActionPhase::Blocked);
+        assert_eq!(
+            detail.remote_outcome_disposition,
+            Some(crawfish_types::RemoteOutcomeDisposition::ReviewRequired)
+        );
+        assert_eq!(detail.delegation_depth, Some(1));
+        assert!(detail
+            .treaty_violations
+            .iter()
+            .any(|violation| violation.code == "frontier_enforcement_gap"));
+        assert!(detail
+            .policy_incidents
+            .iter()
+            .any(|incident| incident.reason_code == "frontier_enforcement_gap"));
+        let trace = supervisor
+            .store()
+            .get_trace_bundle(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("trace bundle");
+        assert_eq!(
+            trace.remote_outcome_disposition,
+            Some(crawfish_types::RemoteOutcomeDisposition::ReviewRequired)
+        );
+        assert!(trace
+            .treaty_violations
+            .iter()
+            .any(|violation| violation.code == "frontier_enforcement_gap"));
     }
 
     #[tokio::test]

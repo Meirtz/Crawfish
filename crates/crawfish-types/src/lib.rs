@@ -1061,12 +1061,63 @@ impl Default for TreatyAuthForwardingMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePrincipalKind {
+    Agent,
+    Service,
+    Unknown,
+}
+
+impl Default for RemotePrincipalKind {
+    fn default() -> Self {
+        Self::Agent
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemotePrincipalRef {
+    #[serde(default)]
+    pub kind: RemotePrincipalKind,
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub agent_card_url: String,
     pub trust_domain: TrustDomain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TreatyEscalationMode {
+    Deny,
+    ReviewRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TreatyEvidenceRequirement {
+    DelegationReceiptPresent,
+    RemoteTaskRefPresent,
+    TerminalStateVerified,
+    ArtifactClassesAllowed,
+    DataScopesAllowed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreatyViolation {
+    pub code: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<OversightCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteOutcomeDisposition {
+    Accepted,
+    ReviewRequired,
+    Rejected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1095,10 +1146,63 @@ pub struct TreatyPack {
     pub allowed_auth_forwarding_mode: TreatyAuthForwardingMode,
     #[serde(default)]
     pub required_checkpoints: Vec<OversightCheckpoint>,
+    #[serde(default = "default_treaty_required_result_evidence")]
+    pub required_result_evidence: Vec<TreatyEvidenceRequirement>,
     pub max_delegation_depth: u32,
     pub review_policy: String,
+    #[serde(default = "default_treaty_scope_violation_mode")]
+    pub on_scope_violation: TreatyEscalationMode,
+    #[serde(default = "default_treaty_evidence_gap_mode")]
+    pub on_evidence_gap: TreatyEscalationMode,
+    #[serde(default = "default_true")]
+    pub review_queue: bool,
+    #[serde(default)]
+    pub alert_rules: Vec<String>,
     #[serde(default)]
     pub clauses: Vec<TreatyClause>,
+}
+
+fn default_treaty_required_result_evidence() -> Vec<TreatyEvidenceRequirement> {
+    vec![
+        TreatyEvidenceRequirement::DelegationReceiptPresent,
+        TreatyEvidenceRequirement::RemoteTaskRefPresent,
+        TreatyEvidenceRequirement::TerminalStateVerified,
+        TreatyEvidenceRequirement::ArtifactClassesAllowed,
+        TreatyEvidenceRequirement::DataScopesAllowed,
+    ]
+}
+
+fn default_treaty_scope_violation_mode() -> TreatyEscalationMode {
+    TreatyEscalationMode::Deny
+}
+
+fn default_treaty_evidence_gap_mode() -> TreatyEscalationMode {
+    TreatyEscalationMode::ReviewRequired
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreatyDecision {
+    pub treaty_pack_id: String,
+    pub remote_principal: RemotePrincipalRef,
+    pub capability: String,
+    #[serde(default)]
+    pub requested_scopes: Vec<String>,
+    #[serde(default)]
+    pub delegated_data_scopes: Vec<String>,
+    #[serde(default)]
+    pub required_checkpoints: Vec<OversightCheckpoint>,
+    #[serde(default)]
+    pub required_result_evidence: Vec<TreatyEvidenceRequirement>,
+    pub delegation_depth: u32,
+    pub on_scope_violation: TreatyEscalationMode,
+    pub on_evidence_gap: TreatyEscalationMode,
+    pub review_queue: bool,
+    #[serde(default)]
+    pub alert_rules: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1119,10 +1223,14 @@ pub struct DelegationReceipt {
     pub capability: String,
     #[serde(default)]
     pub requested_scopes: Vec<String>,
+    #[serde(default)]
+    pub delegated_data_scopes: Vec<String>,
     pub decision: DelegationDecision,
     pub remote_agent_card_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<u32>,
     pub created_at: String,
 }
 
@@ -1498,6 +1606,12 @@ pub struct TraceBundle {
     pub delegation_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
+    #[serde(default)]
+    pub treaty_violations: Vec<TreatyViolation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<u32>,
     pub created_at: String,
 }
 
@@ -1786,6 +1900,12 @@ pub struct DatasetCase {
     pub delegation_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
+    #[serde(default)]
+    pub treaty_violations: Vec<TreatyViolation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_summary: Option<VerificationSummary>,
     #[serde(default)]

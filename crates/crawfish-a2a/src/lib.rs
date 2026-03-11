@@ -1087,22 +1087,41 @@ mod tests {
                 display_name: None,
             },
             remote_principal: crawfish_types::RemotePrincipalRef {
+                kind: crawfish_types::RemotePrincipalKind::Agent,
                 id: "remote-task-planner".to_string(),
                 display_name: None,
                 agent_card_url,
                 trust_domain: crawfish_types::TrustDomain::ExternalPartner,
             },
             allowed_capabilities: vec!["task.plan".to_string()],
-            allowed_data_scopes: vec!["proposal_only".to_string()],
-            allowed_artifact_classes: vec!["task_plan".to_string()],
+            allowed_data_scopes: vec![
+                "objective".to_string(),
+                "workspace_root".to_string(),
+                "desired_outputs".to_string(),
+            ],
+            allowed_artifact_classes: vec![
+                "task_plan.json".to_string(),
+                "task_plan.md".to_string(),
+            ],
             allowed_auth_forwarding_mode: TreatyAuthForwardingMode::None,
             required_checkpoints: vec![
                 crawfish_types::OversightCheckpoint::Admission,
                 crawfish_types::OversightCheckpoint::PreDispatch,
                 crawfish_types::OversightCheckpoint::PostResult,
             ],
+            required_result_evidence: vec![
+                crawfish_types::TreatyEvidenceRequirement::DelegationReceiptPresent,
+                crawfish_types::TreatyEvidenceRequirement::RemoteTaskRefPresent,
+                crawfish_types::TreatyEvidenceRequirement::TerminalStateVerified,
+                crawfish_types::TreatyEvidenceRequirement::ArtifactClassesAllowed,
+                crawfish_types::TreatyEvidenceRequirement::DataScopesAllowed,
+            ],
             max_delegation_depth: 1,
             review_policy: "operator_review_queue".to_string(),
+            on_scope_violation: crawfish_types::TreatyEscalationMode::Deny,
+            on_evidence_gap: crawfish_types::TreatyEscalationMode::ReviewRequired,
+            review_queue: true,
+            alert_rules: vec!["frontier_gap_detected".to_string()],
             clauses: Vec::new(),
         }
     }

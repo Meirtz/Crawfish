@@ -37,12 +37,17 @@ id = "remote_task_planning"
 title = "Remote task planning treaty"
 summary = "Allow proposal-only remote task planning across a governed remote agent boundary."
 allowed_capabilities = ["task.plan"]
-allowed_data_scopes = ["objective", "context_files", "desired_outputs"]
+allowed_data_scopes = ["objective", "workspace_root", "context_files", "constraints", "desired_outputs", "background", "verification_feedback", "base_ref", "head_ref"]
 allowed_artifact_classes = ["task_plan.json", "task_plan.md"]
 allowed_auth_forwarding_mode = "none"
 required_checkpoints = ["admission", "pre_dispatch", "post_result"]
+required_result_evidence = ["delegation_receipt_present", "remote_task_ref_present", "terminal_state_verified", "artifact_classes_allowed", "data_scopes_allowed"]
 max_delegation_depth = 1
 review_policy = "evaluation_profile"
+on_scope_violation = "deny"
+on_evidence_gap = "review_required"
+review_queue = true
+alert_rules = ["frontier_gap_detected"]
 
 [treaties.packs.remote_task_planning.local_owner]
 kind = "human"
@@ -50,6 +55,7 @@ id = "local-dev"
 display_name = "Local Developer"
 
 [treaties.packs.remote_task_planning.remote_principal]
+kind = "agent"
 id = "remote-task-planner"
 display_name = "Remote Task Planner"
 agent_card_url = "http://127.0.0.1:7788/agent-card.json"

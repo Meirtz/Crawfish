@@ -5,8 +5,9 @@ use crawfish_types::{
     EncounterRecord, EvaluationDataset, EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode,
     ExperimentCaseResult, ExperimentRun, ExternalRef, GoalSpec, InteractionModel,
     JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PairwiseCaseResult,
-    PairwiseExperimentRun, PolicyIncident, RemotePrincipalRef, RequesterRef, ReviewQueueItem,
-    ScheduleSpec, TraceBundle, TreatyPack, TrustDomain, VerificationSummary, WorkspaceLockDetail,
+    PairwiseExperimentRun, PolicyIncident, RemoteOutcomeDisposition, RemotePrincipalRef,
+    RequesterRef, ReviewQueueItem, ScheduleSpec, TraceBundle, TreatyPack, TreatyViolation,
+    TrustDomain, VerificationSummary, WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,11 +97,19 @@ pub struct ActionDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_principal: Option<RemotePrincipalRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treaty_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub treaty_summary: Option<TreatyPack>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
+    #[serde(default)]
+    pub treaty_violations: Vec<TreatyViolation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_receipt: Option<DelegationReceipt>,
 }
