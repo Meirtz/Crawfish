@@ -521,7 +521,7 @@ impl SqliteStore {
         )
         .bind(&incident.id)
         .bind(&incident.action_id)
-        .bind(&incident.code)
+        .bind(&incident.reason_code)
         .bind(&incident.created_at)
         .bind(payload)
         .execute(&self.pool)

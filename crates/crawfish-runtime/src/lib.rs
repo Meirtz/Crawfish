@@ -38,9 +38,9 @@ use crawfish_types::{
     ExperimentRunStatus, ExternalRef, FeedbackNote, FeedbackPolicy, HealthStatus,
     JurisdictionClass, LifecycleRecord, LocalHarnessKind, Metadata, Mutability,
     OversightCheckpoint, OwnerKind, OwnerRef, PolicyIncident, PolicyIncidentSeverity,
-    ReviewQueueItem, ReviewQueueStatus, ScorecardCriterion, ScorecardCriterionKind, ScorecardSpec,
-    StrategyCheckpointState, TraceBundle, TrustDomain, VerificationStatus, VerificationSummary,
-    VerifyLoopFailureMode, WorkspaceEdit, WorkspaceEditOp,
+    RequesterKind, ReviewQueueItem, ReviewQueueStatus, ScorecardCriterion, ScorecardCriterionKind,
+    ScorecardSpec, StrategyCheckpointState, TraceBundle, TrustDomain, VerificationStatus,
+    VerificationSummary, VerifyLoopFailureMode, WorkspaceEdit, WorkspaceEditOp,
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
@@ -671,7 +671,16 @@ impl Supervisor {
     }
 
     async fn postprocess_terminal_action(&self, action: &mut Action) -> anyhow::Result<()> {
-        let doctrine = default_doctrine_pack(action);
+        let encounter = match action.encounter_ref.as_deref() {
+            Some(encounter_ref) => self.store.get_encounter(encounter_ref).await?,
+            None => None,
+        };
+        let interaction_model = interaction_model_for_action(action, encounter.as_ref());
+        let doctrine = default_doctrine_pack(
+            action,
+            &interaction_model,
+            jurisdiction_class_for_action(action, encounter.as_ref()),
+        );
         let resolved_profile = self.resolve_evaluation_profile(action)?;
         let preliminary_checkpoint_status =
             checkpoint_status_for_action(action, &doctrine, true, None, resolved_profile.is_some());
@@ -712,7 +721,7 @@ impl Supervisor {
                     "policy_incident_recorded",
                     serde_json::json!({
                         "incident_id": incident.id,
-                        "code": incident.code,
+                        "reason_code": incident.reason_code,
                         "severity": format!("{:?}", incident.severity).to_lowercase(),
                     }),
                 )
@@ -727,7 +736,13 @@ impl Supervisor {
             resolved_profile.is_some(),
         );
         let trace = self
-            .build_trace_bundle_for_action(action, &doctrine, &checkpoint_status, &incidents)
+            .build_trace_bundle_for_action(
+                action,
+                &doctrine,
+                &interaction_model,
+                &checkpoint_status,
+                &incidents,
+            )
             .await?;
         self.store.put_trace_bundle(&trace).await?;
         self.store
@@ -816,6 +831,7 @@ impl Supervisor {
         &self,
         action: &Action,
         doctrine: &DoctrinePack,
+        interaction_model: &crawfish_types::InteractionModel,
         checkpoint_status: &[CheckpointStatus],
         incidents: &[PolicyIncident],
     ) -> anyhow::Result<TraceBundle> {
@@ -825,6 +841,7 @@ impl Supervisor {
             action_id: action.id.clone(),
             capability: action.capability.clone(),
             goal_summary: action.goal.summary.clone(),
+            interaction_model: Some(interaction_model.clone()),
             jurisdiction_class: Some(doctrine.jurisdiction.clone()),
             doctrine_summary: Some(doctrine.clone()),
             checkpoint_status: checkpoint_status.to_vec(),
@@ -998,7 +1015,7 @@ impl Supervisor {
 
         let reason_code = if incidents
             .iter()
-            .any(|incident| incident.code == "unresolved_evaluation_profile")
+            .any(|incident| incident.reason_code == "unresolved_evaluation_profile")
         {
             "enforcement_gap".to_string()
         } else if evaluation
@@ -1043,7 +1060,12 @@ impl Supervisor {
         evaluation: Option<&EvaluationRecord>,
         checkpoint_status: &[CheckpointStatus],
     ) -> Vec<PolicyIncident> {
-        let doctrine = default_doctrine_pack(action);
+        let interaction_model = interaction_model_for_action(action, None);
+        let doctrine = default_doctrine_pack(
+            action,
+            &interaction_model,
+            jurisdiction_class_for_action(action, None),
+        );
         let mut incidents = Vec::new();
         if action.capability == "workspace.patch.apply" {
             incidents.push(PolicyIncident {
@@ -1051,7 +1073,7 @@ impl Supervisor {
                 action_id: action.id.clone(),
                 doctrine_pack_id: doctrine.id.clone(),
                 jurisdiction: doctrine.jurisdiction.clone(),
-                code: "frontier_gap_mutation_post_result_review".to_string(),
+                reason_code: "frontier_gap_mutation_post_result_review".to_string(),
                 summary:
                     "Mutation completed without evaluation-spine review; doctrine is ahead of enforcement."
                         .to_string(),
@@ -1067,7 +1089,7 @@ impl Supervisor {
                     action_id: action.id.clone(),
                     doctrine_pack_id: doctrine.id.clone(),
                     jurisdiction: doctrine.jurisdiction.clone(),
-                    code: "unsupported_evaluation_hook".to_string(),
+                    reason_code: "unsupported_evaluation_hook".to_string(),
                     summary: format!(
                         "evaluation_hook `{hook}` is deprecated and could not be normalized into a named evaluation profile"
                     ),
@@ -1083,7 +1105,7 @@ impl Supervisor {
                 action_id: action.id.clone(),
                 doctrine_pack_id: doctrine.id.clone(),
                 jurisdiction: doctrine.jurisdiction.clone(),
-                code: "unresolved_evaluation_profile".to_string(),
+                reason_code: "unresolved_evaluation_profile".to_string(),
                 summary: "post-result evaluation is required but no resolvable evaluation profile was available".to_string(),
                 severity: PolicyIncidentSeverity::Critical,
                 checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
@@ -1097,7 +1119,7 @@ impl Supervisor {
                     action_id: action.id.clone(),
                     doctrine_pack_id: doctrine.id.clone(),
                     jurisdiction: doctrine.jurisdiction.clone(),
-                    code: "evaluation_failed".to_string(),
+                    reason_code: "evaluation_failed".to_string(),
                     summary: evaluation.summary.clone(),
                     severity: PolicyIncidentSeverity::Warning,
                     checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
@@ -1115,11 +1137,38 @@ impl Supervisor {
                 action_id: action.id.clone(),
                 doctrine_pack_id: doctrine.id.clone(),
                 jurisdiction: doctrine.jurisdiction.clone(),
-                code: "post_result_checkpoint_failed".to_string(),
+                reason_code: "post_result_checkpoint_failed".to_string(),
                 summary: "post-result checkpoint could not be proven with current evidence"
                     .to_string(),
                 severity: PolicyIncidentSeverity::Critical,
                 checkpoint: Some(crawfish_types::OversightCheckpoint::PostResult),
+                created_at: now_timestamp(),
+            });
+        }
+        let has_required_checkpoint_gap = checkpoint_status
+            .iter()
+            .any(|status| status.required && !matches!(status.outcome, CheckpointOutcome::Passed));
+        let has_frontier_specific_gap = incidents
+            .iter()
+            .any(|incident| incident.reason_code.starts_with("frontier_gap_"));
+        if interaction_model_is_frontier(&interaction_model)
+            && (has_required_checkpoint_gap || has_frontier_specific_gap)
+        {
+            incidents.push(PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: doctrine.id.clone(),
+                jurisdiction: doctrine.jurisdiction.clone(),
+                reason_code: "frontier_enforcement_gap".to_string(),
+                summary:
+                    "frontier governance required explicit checkpoint evidence, but one or more required checkpoints could not be proven."
+                        .to_string(),
+                severity: PolicyIncidentSeverity::Critical,
+                checkpoint: checkpoint_status
+                    .iter()
+                    .find(|status| status.required && !matches!(status.outcome, CheckpointOutcome::Passed))
+                    .map(|status| status.checkpoint.clone())
+                    .or_else(|| incidents.iter().find_map(|incident| incident.checkpoint.clone())),
                 created_at: now_timestamp(),
             });
         }
@@ -1310,7 +1359,9 @@ impl Supervisor {
             ScorecardCriterionKind::IncidentAbsent => {
                 let incidents = self.store.list_policy_incidents(&action.id).await?;
                 if let Some(code) = criterion.incident_code.as_deref() {
-                    Ok(!incidents.iter().any(|incident| incident.code == code))
+                    Ok(!incidents
+                        .iter()
+                        .any(|incident| incident.reason_code == code))
                 } else {
                     Ok(incidents.is_empty())
                 }
@@ -1343,6 +1394,7 @@ impl Supervisor {
             dataset_name: dataset_name.clone(),
             capability: action.capability.clone(),
             goal_summary: action.goal.summary.clone(),
+            interaction_model: trace.interaction_model.clone(),
             normalized_inputs: action.inputs.clone(),
             expected_artifacts: action
                 .outputs
@@ -1484,7 +1536,12 @@ impl Supervisor {
                 action.outputs = outputs.clone();
                 action.selected_executor = Some(selected_executor.clone());
                 action.external_refs = external_refs.clone();
-                let doctrine = default_doctrine_pack(&action);
+                let interaction_model = interaction_model_for_action(&action, None);
+                let doctrine = default_doctrine_pack(
+                    &action,
+                    &interaction_model,
+                    jurisdiction_class_for_action(&action, None),
+                );
                 let resolved_profile = self.resolve_evaluation_profile(&action)?;
                 let checkpoint_status = checkpoint_status_for_action(
                     &action,
@@ -4384,6 +4441,10 @@ enum WorkspaceLockAttempt {
     Conflict(crawfish_types::WorkspaceLockDetail),
 }
 
+fn is_remote_harness_executor(executor: &str) -> bool {
+    executor.starts_with("openclaw.") || executor.starts_with("local_harness.")
+}
+
 fn jurisdiction_class_for_action(
     action: &Action,
     encounter: Option<&EncounterRecord>,
@@ -4391,7 +4452,7 @@ fn jurisdiction_class_for_action(
     if action
         .selected_executor
         .as_deref()
-        .map(|executor| executor.starts_with("openclaw."))
+        .map(is_remote_harness_executor)
         .unwrap_or(false)
     {
         return JurisdictionClass::RemoteHarness;
@@ -4401,35 +4462,131 @@ fn jurisdiction_class_for_action(
         Some(TrustDomain::SameOwnerLocal) => JurisdictionClass::SameOwnerLocal,
         Some(TrustDomain::SameDeviceForeignOwner) => JurisdictionClass::SameDeviceForeignOwner,
         Some(_) => JurisdictionClass::ExternalUnknown,
-        None => JurisdictionClass::ExternalUnknown,
+        None => match action
+            .counterparty_refs
+            .first()
+            .map(|counterparty| &counterparty.trust_domain)
+        {
+            Some(TrustDomain::SameOwnerLocal) => JurisdictionClass::SameOwnerLocal,
+            Some(TrustDomain::SameDeviceForeignOwner) => JurisdictionClass::SameDeviceForeignOwner,
+            Some(_) => JurisdictionClass::ExternalUnknown,
+            None => JurisdictionClass::ExternalUnknown,
+        },
     }
 }
 
-fn default_doctrine_pack(action: &Action) -> DoctrinePack {
-    let jurisdiction = jurisdiction_class_for_action(action, None);
-    let mut rules = vec![
-        crawfish_types::DoctrineRule {
-            id: "explicit_jurisdiction".to_string(),
-            title: "Explicit jurisdiction before action".to_string(),
-            summary: "Authority must be classified before execution begins.".to_string(),
-            required_checkpoints: vec![crawfish_types::OversightCheckpoint::Admission],
-        },
-        crawfish_types::DoctrineRule {
-            id: "dispatch_under_control".to_string(),
-            title: "Dispatch under control".to_string(),
-            summary: "Execution surfaces are selected by the control plane, not by ambient trust."
-                .to_string(),
-            required_checkpoints: vec![crawfish_types::OversightCheckpoint::PreDispatch],
-        },
-        crawfish_types::DoctrineRule {
-            id: "results_need_evidence".to_string(),
-            title: "Results need evidence".to_string(),
-            summary:
-                "Terminal outputs require traceable evidence and, when configured, evaluation."
-                    .to_string(),
-            required_checkpoints: vec![crawfish_types::OversightCheckpoint::PostResult],
-        },
-    ];
+fn interaction_model_for_action(
+    action: &Action,
+    encounter: Option<&EncounterRecord>,
+) -> crawfish_types::InteractionModel {
+    if action
+        .selected_executor
+        .as_deref()
+        .map(is_remote_harness_executor)
+        .unwrap_or(false)
+    {
+        return crawfish_types::InteractionModel::RemoteHarness;
+    }
+
+    match encounter.map(|encounter| &encounter.trust_domain) {
+        Some(TrustDomain::SameOwnerLocal) => crawfish_types::InteractionModel::SameOwnerSwarm,
+        Some(TrustDomain::SameDeviceForeignOwner) => {
+            crawfish_types::InteractionModel::SameDeviceMultiOwner
+        }
+        Some(_) => crawfish_types::InteractionModel::ExternalUnknown,
+        None if matches!(
+            action
+                .counterparty_refs
+                .first()
+                .map(|counterparty| &counterparty.trust_domain),
+            Some(TrustDomain::SameOwnerLocal)
+        ) =>
+        {
+            crawfish_types::InteractionModel::SameOwnerSwarm
+        }
+        None if matches!(
+            action
+                .counterparty_refs
+                .first()
+                .map(|counterparty| &counterparty.trust_domain),
+            Some(TrustDomain::SameDeviceForeignOwner)
+        ) =>
+        {
+            crawfish_types::InteractionModel::SameDeviceMultiOwner
+        }
+        None if matches!(action.requester.kind, RequesterKind::Agent)
+            && action.counterparty_refs.is_empty() =>
+        {
+            crawfish_types::InteractionModel::ContextSplit
+        }
+        None if action.initiator_owner.kind == OwnerKind::ServiceAccount
+            && action.counterparty_refs.is_empty()
+            && !action
+                .external_refs
+                .iter()
+                .any(|reference| reference.kind.starts_with("openclaw.")) =>
+        {
+            crawfish_types::InteractionModel::ContextSplit
+        }
+        None => crawfish_types::InteractionModel::ExternalUnknown,
+    }
+}
+
+fn interaction_model_is_frontier(interaction_model: &crawfish_types::InteractionModel) -> bool {
+    !matches!(
+        interaction_model,
+        crawfish_types::InteractionModel::ContextSplit
+    )
+}
+
+fn default_doctrine_pack(
+    action: &Action,
+    interaction_model: &crawfish_types::InteractionModel,
+    jurisdiction: JurisdictionClass,
+) -> DoctrinePack {
+    let mut rules = vec![crawfish_types::DoctrineRule {
+        id: "results_need_evidence".to_string(),
+        title: "Results need evidence".to_string(),
+        summary: "Terminal outputs require traceable evidence and, when configured, evaluation."
+            .to_string(),
+        required_checkpoints: vec![crawfish_types::OversightCheckpoint::PostResult],
+    }];
+
+    if interaction_model_is_frontier(interaction_model) {
+        rules.insert(
+            0,
+            crawfish_types::DoctrineRule {
+                id: "explicit_jurisdiction".to_string(),
+                title: "Explicit jurisdiction before action".to_string(),
+                summary: "Authority must be classified before execution begins.".to_string(),
+                required_checkpoints: vec![crawfish_types::OversightCheckpoint::Admission],
+            },
+        );
+        rules.insert(
+            1,
+            crawfish_types::DoctrineRule {
+                id: "dispatch_under_control".to_string(),
+                title: "Dispatch under control".to_string(),
+                summary:
+                    "Execution surfaces are selected by the control plane, not by ambient trust."
+                        .to_string(),
+                required_checkpoints: vec![crawfish_types::OversightCheckpoint::PreDispatch],
+            },
+        );
+    } else {
+        rules.insert(
+            0,
+            crawfish_types::DoctrineRule {
+                id: "context_split_coordination".to_string(),
+                title: "Context split still needs evidence".to_string(),
+                summary:
+                    "Role-split or handoff-style sub-agents still need bounded dispatch and inspectable results."
+                        .to_string(),
+                required_checkpoints: vec![crawfish_types::OversightCheckpoint::PreDispatch],
+            },
+        );
+    }
+
     if action.capability == "workspace.patch.apply" {
         rules.push(crawfish_types::DoctrineRule {
             id: "mutations_need_gate".to_string(),
@@ -4439,11 +4596,25 @@ fn default_doctrine_pack(action: &Action) -> DoctrinePack {
             required_checkpoints: vec![crawfish_types::OversightCheckpoint::PreMutation],
         });
     }
+
+    let (id, title, summary) = if interaction_model_is_frontier(interaction_model) {
+        (
+            "swarm_frontier_v1",
+            "Swarm frontier doctrine",
+            "Constitutions do not enforce themselves; frontier encounters require runtime checkpoints and evidence.",
+        )
+    } else {
+        (
+            "context_split_coordination_v1",
+            "Context-split coordination doctrine",
+            "Role-split multi-agent patterns still need bounded dispatch and evidence, but they are not frontier governance by default.",
+        )
+    };
+
     DoctrinePack {
-        id: "swarm_frontier_v1".to_string(),
-        title: "Swarm frontier doctrine".to_string(),
-        summary: "Constitutions do not enforce themselves; runtime checkpoints and evidence do."
-            .to_string(),
+        id: id.to_string(),
+        title: title.to_string(),
+        summary: summary.to_string(),
         jurisdiction,
         rules,
     }
@@ -5328,8 +5499,13 @@ impl SupervisorControl for Supervisor {
             .await?
             .into_iter()
             .last();
-        let doctrine_summary = Some(default_doctrine_pack(&action));
+        let interaction_model = Some(interaction_model_for_action(&action, encounter.as_ref()));
         let jurisdiction_class = Some(jurisdiction_class_for_action(&action, encounter.as_ref()));
+        let doctrine_summary = Some(default_doctrine_pack(
+            &action,
+            interaction_model.as_ref().expect("interaction model"),
+            jurisdiction_class.clone().expect("jurisdiction class"),
+        ));
         let trace_bundle = self.store.get_trace_bundle(action_id).await?;
         let review_queue_items = self
             .store
@@ -5370,6 +5546,7 @@ impl SupervisorControl for Supervisor {
             },
             terminal_code: action.failure_code.clone(),
             lock_detail: action.lock_detail.clone(),
+            interaction_model,
             jurisdiction_class,
             doctrine_summary,
             checkpoint_status,
@@ -7197,6 +7374,10 @@ workspace_policy = "crawfish_managed"
             Some("openclaw.task-planner")
         );
         assert_eq!(
+            detail.interaction_model,
+            Some(crawfish_types::InteractionModel::RemoteHarness)
+        );
+        assert_eq!(
             detail.strategy_mode,
             Some(ExecutionStrategyMode::VerifyLoop)
         );
@@ -7338,6 +7519,10 @@ fi
         assert_eq!(
             detail.selected_executor.as_deref(),
             Some("local_harness.claude_code")
+        );
+        assert_eq!(
+            detail.interaction_model,
+            Some(crawfish_types::InteractionModel::RemoteHarness)
         );
         assert_eq!(detail.strategy_iteration, Some(2));
         assert!(detail
@@ -8243,6 +8428,53 @@ depends_on = []
         assert!(error.to_string().contains("denied"));
     }
 
+    #[test]
+    fn intra_runtime_agent_handoff_derives_context_split_interaction_model() {
+        let action = Action {
+            id: "context-split".to_string(),
+            target_agent_id: "task_planner".to_string(),
+            requester: RequesterRef {
+                kind: RequesterKind::Agent,
+                id: "delegator-agent".to_string(),
+            },
+            initiator_owner: local_owner("local-dev"),
+            counterparty_refs: Vec::new(),
+            goal: crawfish_types::GoalSpec {
+                summary: "delegate planning subtask".to_string(),
+                details: None,
+            },
+            capability: "task.plan".to_string(),
+            inputs: Metadata::default(),
+            contract: crawfish_types::ExecutionContract::default(),
+            execution_strategy: None,
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            encounter_ref: None,
+            audit_receipt_ref: None,
+            data_boundary: "owner_local".to_string(),
+            schedule: crawfish_types::ScheduleSpec::default(),
+            phase: ActionPhase::Accepted,
+            created_at: now_timestamp(),
+            started_at: None,
+            finished_at: None,
+            checkpoint_ref: None,
+            continuity_mode: None,
+            degradation_profile: None,
+            failure_reason: None,
+            failure_code: None,
+            selected_executor: None,
+            recovery_stage: None,
+            lock_detail: None,
+            external_refs: Vec::new(),
+            outputs: ActionOutputs::default(),
+        };
+
+        assert_eq!(
+            interaction_model_for_action(&action, None),
+            crawfish_types::InteractionModel::ContextSplit
+        );
+    }
+
     #[tokio::test]
     async fn policy_validate_is_dry_run_only() {
         let dir = tempdir().unwrap();
@@ -8858,6 +9090,7 @@ depends_on = []
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(inspected["action"]["id"], action_id);
+        assert_eq!(inspected["interaction_model"], "same_device_multi_owner");
         assert!(inspected["external_refs"]
             .as_array()
             .unwrap()
@@ -9073,6 +9306,10 @@ depends_on = []
             .expect("action detail");
         assert_eq!(detail.action.phase, ActionPhase::Completed);
         assert_eq!(
+            detail.interaction_model,
+            Some(crawfish_types::InteractionModel::SameOwnerSwarm)
+        );
+        assert_eq!(
             detail.jurisdiction_class,
             Some(JurisdictionClass::SameOwnerLocal)
         );
@@ -9092,6 +9329,10 @@ depends_on = []
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(trace_payload["trace"]["action_id"], submitted.action_id);
+        assert_eq!(
+            trace_payload["trace"]["interaction_model"],
+            "same_owner_swarm"
+        );
         assert!(trace_payload["trace"]["enforcement_records"]
             .as_array()
             .unwrap()
@@ -9199,6 +9440,9 @@ depends_on = []
             .await
             .unwrap()
             .expect("dataset detail");
+        assert!(detail.cases.iter().all(|case| {
+            case.interaction_model == Some(crawfish_types::InteractionModel::SameOwnerSwarm)
+        }));
         let dataset_case_ids: std::collections::BTreeSet<String> =
             detail.cases.iter().map(|case| case.id.clone()).collect();
         assert!(detail
@@ -9371,7 +9615,11 @@ depends_on = []
         assert!(detail
             .policy_incidents
             .iter()
-            .any(|incident| incident.code == "unsupported_evaluation_hook"));
+            .any(|incident| incident.reason_code == "unsupported_evaluation_hook"));
+        assert!(detail
+            .policy_incidents
+            .iter()
+            .any(|incident| incident.reason_code == "frontier_enforcement_gap"));
         assert!(detail.latest_evaluation.is_some());
     }
 
@@ -9415,7 +9663,11 @@ depends_on = []
         assert!(detail
             .policy_incidents
             .iter()
-            .any(|incident| incident.code == "frontier_gap_mutation_post_result_review"));
+            .any(|incident| incident.reason_code == "frontier_gap_mutation_post_result_review"));
+        assert!(detail
+            .policy_incidents
+            .iter()
+            .any(|incident| incident.reason_code == "frontier_enforcement_gap"));
         assert!(detail
             .checkpoint_status
             .iter()

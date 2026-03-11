@@ -3,9 +3,10 @@ use crawfish_types::{
     Action, AgentManifest, AlertEvent, ArtifactRef, AuditReceipt, CapabilityLease,
     CheckpointStatus, ConsentGrant, CounterpartyRef, DatasetCase, DoctrinePack, EncounterRecord,
     EvaluationDataset, EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode,
-    ExperimentCaseResult, ExperimentRun, ExternalRef, GoalSpec, JurisdictionClass, LifecycleRecord,
-    Metadata, OwnerRef, PolicyIncident, RequesterRef, ReviewQueueItem, ScheduleSpec, TraceBundle,
-    TrustDomain, VerificationSummary, WorkspaceLockDetail,
+    ExperimentCaseResult, ExperimentRun, ExternalRef, GoalSpec, InteractionModel,
+    JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PolicyIncident, RequesterRef,
+    ReviewQueueItem, ScheduleSpec, TraceBundle, TrustDomain, VerificationSummary,
+    WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,6 +73,8 @@ pub struct ActionDetail {
     pub terminal_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_detail: Option<WorkspaceLockDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_model: Option<InteractionModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jurisdiction_class: Option<JurisdictionClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

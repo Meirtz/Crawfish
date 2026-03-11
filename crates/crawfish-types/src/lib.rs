@@ -1271,6 +1271,16 @@ pub enum JurisdictionClass {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum InteractionModel {
+    ContextSplit,
+    SameOwnerSwarm,
+    SameDeviceMultiOwner,
+    RemoteHarness,
+    ExternalUnknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum OversightCheckpoint {
     Admission,
     PreDispatch,
@@ -1339,7 +1349,8 @@ pub struct PolicyIncident {
     pub action_id: String,
     pub doctrine_pack_id: String,
     pub jurisdiction: JurisdictionClass,
-    pub code: String,
+    #[serde(alias = "code")]
+    pub reason_code: String,
     pub summary: String,
     pub severity: PolicyIncidentSeverity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1353,6 +1364,8 @@ pub struct TraceBundle {
     pub action_id: String,
     pub capability: String,
     pub goal_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_model: Option<InteractionModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jurisdiction_class: Option<JurisdictionClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1524,6 +1537,8 @@ pub struct DatasetCase {
     pub dataset_name: String,
     pub capability: String,
     pub goal_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_model: Option<InteractionModel>,
     #[serde(default)]
     pub normalized_inputs: Metadata,
     #[serde(default)]
