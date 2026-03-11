@@ -80,6 +80,9 @@ blocked_remote_policy = "blocked"
 auth_required_policy = "awaiting_approval"
 remote_failure_policy = "failed"
 required_checkpoints = ["admission", "pre_dispatch", "post_result"]
+followup_allowed = true
+max_followup_attempts = 2
+followup_review_priority = "high"
 max_delegation_depth = 1
 
 [federation.packs.remote_task_plan_default.review_defaults]

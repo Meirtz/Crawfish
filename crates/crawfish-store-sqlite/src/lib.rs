@@ -4,7 +4,7 @@ use crawfish_types::{
     Action, AgentManifest, AlertEvent, AuditReceipt, CapabilityLease, ConsentGrant, DatasetCase,
     DelegationReceipt, EncounterRecord, EvaluationRecord, ExperimentCaseResult, ExperimentRun,
     FeedbackNote, LifecycleRecord, PairwiseCaseResult, PairwiseExperimentRun, PolicyIncident,
-    RemoteEvidenceBundle, ReviewQueueItem, TraceBundle,
+    RemoteAttemptRecord, RemoteEvidenceBundle, RemoteFollowupRequest, ReviewQueueItem, TraceBundle,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, Pool, Row, Sqlite, SqlitePool};
@@ -433,6 +433,128 @@ impl SqliteStore {
         rows.into_iter()
             .map(|row| {
                 let payload: String = row.try_get("bundle_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
+    pub async fn upsert_remote_followup_request(
+        &self,
+        request: &RemoteFollowupRequest,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(request)?;
+        sqlx::query(
+            r#"
+            INSERT INTO remote_followup_requests (id, action_id, status, created_at, updated_at, request_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+              action_id = excluded.action_id,
+              status = excluded.status,
+              created_at = excluded.created_at,
+              updated_at = excluded.updated_at,
+              request_json = excluded.request_json
+            "#,
+        )
+        .bind(&request.id)
+        .bind(&request.action_id)
+        .bind(format!("{:?}", request.status).to_lowercase())
+        .bind(&request.created_at)
+        .bind(&request.updated_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_remote_followup_request(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<RemoteFollowupRequest>> {
+        let row = sqlx::query("SELECT request_json FROM remote_followup_requests WHERE id = ?1")
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("request_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn list_remote_followup_requests(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<RemoteFollowupRequest>> {
+        let rows = sqlx::query(
+            "SELECT request_json FROM remote_followup_requests WHERE action_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(action_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("request_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
+    pub async fn upsert_remote_attempt_record(
+        &self,
+        record: &RemoteAttemptRecord,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(record)?;
+        sqlx::query(
+            r#"
+            INSERT INTO remote_attempt_records (id, action_id, attempt, created_at, completed_at, record_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+              action_id = excluded.action_id,
+              attempt = excluded.attempt,
+              created_at = excluded.created_at,
+              completed_at = excluded.completed_at,
+              record_json = excluded.record_json
+            "#,
+        )
+        .bind(&record.id)
+        .bind(&record.action_id)
+        .bind(i64::from(record.attempt))
+        .bind(&record.created_at)
+        .bind(&record.completed_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_remote_attempt_record(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Option<RemoteAttemptRecord>> {
+        let row = sqlx::query("SELECT record_json FROM remote_attempt_records WHERE id = ?1")
+            .bind(attempt_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("record_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn list_remote_attempt_records(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<RemoteAttemptRecord>> {
+        let rows = sqlx::query(
+            "SELECT record_json FROM remote_attempt_records WHERE action_id = ?1 ORDER BY attempt ASC, created_at ASC, id ASC",
+        )
+        .bind(action_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("record_json")?;
                 Ok(serde_json::from_str(&payload)?)
             })
             .collect()
@@ -1206,6 +1328,48 @@ impl ActionStore for SqliteStore {
         action_id: &str,
     ) -> anyhow::Result<Vec<RemoteEvidenceBundle>> {
         SqliteStore::list_remote_evidence_bundles(self, action_id).await
+    }
+
+    async fn upsert_remote_followup_request(
+        &self,
+        request: &RemoteFollowupRequest,
+    ) -> anyhow::Result<()> {
+        SqliteStore::upsert_remote_followup_request(self, request).await
+    }
+
+    async fn get_remote_followup_request(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<RemoteFollowupRequest>> {
+        SqliteStore::get_remote_followup_request(self, request_id).await
+    }
+
+    async fn list_remote_followup_requests(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<RemoteFollowupRequest>> {
+        SqliteStore::list_remote_followup_requests(self, action_id).await
+    }
+
+    async fn upsert_remote_attempt_record(
+        &self,
+        record: &RemoteAttemptRecord,
+    ) -> anyhow::Result<()> {
+        SqliteStore::upsert_remote_attempt_record(self, record).await
+    }
+
+    async fn get_remote_attempt_record(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Option<RemoteAttemptRecord>> {
+        SqliteStore::get_remote_attempt_record(self, attempt_id).await
+    }
+
+    async fn list_remote_attempt_records(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<RemoteAttemptRecord>> {
+        SqliteStore::list_remote_attempt_records(self, action_id).await
     }
 
     async fn insert_evaluation(&self, evaluation: &EvaluationRecord) -> anyhow::Result<()> {

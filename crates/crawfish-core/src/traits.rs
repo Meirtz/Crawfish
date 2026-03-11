@@ -36,6 +36,30 @@ pub trait ActionStore: Send + Sync {
         &self,
         action_id: &str,
     ) -> anyhow::Result<Vec<crawfish_types::RemoteEvidenceBundle>>;
+    async fn upsert_remote_followup_request(
+        &self,
+        request: &crawfish_types::RemoteFollowupRequest,
+    ) -> anyhow::Result<()>;
+    async fn get_remote_followup_request(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<crawfish_types::RemoteFollowupRequest>>;
+    async fn list_remote_followup_requests(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<crawfish_types::RemoteFollowupRequest>>;
+    async fn upsert_remote_attempt_record(
+        &self,
+        record: &crawfish_types::RemoteAttemptRecord,
+    ) -> anyhow::Result<()>;
+    async fn get_remote_attempt_record(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Option<crawfish_types::RemoteAttemptRecord>>;
+    async fn list_remote_attempt_records(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<crawfish_types::RemoteAttemptRecord>>;
     async fn insert_evaluation(
         &self,
         evaluation: &crawfish_types::EvaluationRecord,
@@ -201,6 +225,10 @@ pub trait SupervisorControl: Send + Sync {
         &self,
         action_id: &str,
     ) -> anyhow::Result<Option<crate::ActionRemoteEvidenceResponse>>;
+    async fn get_action_remote_followups(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Option<crate::ActionRemoteFollowupsResponse>>;
     async fn list_action_evaluations(
         &self,
         action_id: &str,
@@ -243,6 +271,12 @@ pub trait SupervisorControl: Send + Sync {
         &self,
         treaty_id: &str,
     ) -> anyhow::Result<Option<crate::TreatyDetailResponse>>;
+    async fn dispatch_remote_followup(
+        &self,
+        action_id: &str,
+        followup_id: &str,
+        request: crate::DispatchRemoteFollowupRequest,
+    ) -> anyhow::Result<crate::DispatchRemoteFollowupResponse>;
     async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<crate::AgentDetail>>;
     async fn inspect_action(&self, action_id: &str) -> anyhow::Result<Option<crate::ActionDetail>>;
     async fn submit_action(

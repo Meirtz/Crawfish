@@ -1176,6 +1176,82 @@ pub enum RemoteReviewReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteFollowupStatus {
+    Open,
+    Dispatched,
+    Superseded,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteFollowupReason {
+    MissingTreatyEvidence,
+    PostResultCheckpointGap,
+    ScopeDataAmbiguity,
+    ArtifactAdmissibilityAmbiguity,
+    OperatorRequestedClarification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteFollowupRequest {
+    pub id: String,
+    pub action_id: String,
+    pub remote_evidence_ref: String,
+    pub treaty_pack_id: String,
+    pub federation_pack_id: String,
+    pub remote_principal: RemotePrincipalRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_task_ref: Option<String>,
+    pub reason_code: String,
+    #[serde(default)]
+    pub reasons: Vec<RemoteFollowupReason>,
+    #[serde(default)]
+    pub requested_evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_note: Option<String>,
+    pub status: RemoteFollowupStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteAttemptRecord {
+    pub id: String,
+    pub action_id: String,
+    pub attempt: u32,
+    pub capability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_model: Option<InteractionModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_principal: Option<RemotePrincipalRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treaty_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_task_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_request_ref: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FederationReviewDefaults {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -1336,6 +1412,12 @@ pub struct FederationPack {
     pub remote_failure_policy: RemoteStateDisposition,
     #[serde(default = "default_treaty_required_checkpoints")]
     pub required_checkpoints: Vec<OversightCheckpoint>,
+    #[serde(default = "default_true")]
+    pub followup_allowed: bool,
+    #[serde(default = "default_federation_max_followup_attempts")]
+    pub max_followup_attempts: u32,
+    #[serde(default = "default_federation_review_priority")]
+    pub followup_review_priority: String,
     pub max_delegation_depth: u32,
 }
 
@@ -1369,6 +1451,10 @@ fn default_treaty_required_checkpoints() -> Vec<OversightCheckpoint> {
         OversightCheckpoint::PreDispatch,
         OversightCheckpoint::PostResult,
     ]
+}
+
+fn default_federation_max_followup_attempts() -> u32 {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1444,6 +1530,8 @@ pub struct RemoteEvidenceBundle {
     pub id: String,
     pub action_id: String,
     pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_attempt_ref: Option<String>,
     pub interaction_model: InteractionModel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub treaty_pack_id: Option<String>,
@@ -1477,6 +1565,8 @@ pub struct RemoteEvidenceBundle {
     pub remote_review_disposition: Option<RemoteReviewDisposition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_review_reason: Option<RemoteReviewReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_request_ref: Option<String>,
     pub created_at: String,
 }
 
@@ -1856,6 +1946,10 @@ pub struct TraceBundle {
     pub delegation_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_evidence_ref: Option<String>,
+    #[serde(default)]
+    pub remote_attempt_refs: Vec<String>,
+    #[serde(default)]
+    pub remote_followup_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1906,6 +2000,10 @@ pub struct EvaluationRecord {
     pub remote_evidence_status: Option<RemoteEvidenceStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_attempt_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_followup_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_review_disposition: Option<RemoteReviewDisposition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1961,6 +2059,8 @@ pub struct ReviewQueueItem {
     pub remote_evidence_status: Option<RemoteEvidenceStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_followup_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2205,6 +2305,10 @@ pub struct DatasetCase {
     pub delegation_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_evidence_ref: Option<String>,
+    #[serde(default)]
+    pub remote_attempt_refs: Vec<String>,
+    #[serde(default)]
+    pub remote_followup_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2297,6 +2401,10 @@ pub struct ExperimentCaseResult {
     pub remote_evidence_status: Option<RemoteEvidenceStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_attempt_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_followup_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_review_disposition: Option<RemoteReviewDisposition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

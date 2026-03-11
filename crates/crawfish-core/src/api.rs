@@ -5,10 +5,11 @@ use crawfish_types::{
     EncounterRecord, EvaluationDataset, EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode,
     ExperimentCaseResult, ExperimentRun, ExternalRef, FederationDecision, FederationPack, GoalSpec,
     InteractionModel, JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PairwiseCaseResult,
-    PairwiseExperimentRun, PolicyIncident, RemoteEvidenceBundle, RemoteEvidenceStatus,
-    RemoteOutcomeDisposition, RemotePrincipalRef, RemoteReviewDisposition, RemoteStateDisposition,
-    RequesterRef, ReviewQueueItem, ScheduleSpec, TraceBundle, TreatyPack, TreatyViolation,
-    TrustDomain, VerificationSummary, WorkspaceLockDetail,
+    PairwiseExperimentRun, PolicyIncident, RemoteAttemptRecord, RemoteEvidenceBundle,
+    RemoteEvidenceStatus, RemoteFollowupRequest, RemoteOutcomeDisposition, RemotePrincipalRef,
+    RemoteReviewDisposition, RemoteStateDisposition, RequesterRef, ReviewQueueItem, ScheduleSpec,
+    TraceBundle, TreatyPack, TreatyViolation, TrustDomain, VerificationSummary,
+    WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -121,6 +122,14 @@ pub struct ActionDetail {
     pub remote_review_disposition: Option<RemoteReviewDisposition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_remote_review_ref: Option<String>,
+    #[serde(default)]
+    pub remote_followup_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_remote_followup_ref: Option<String>,
+    #[serde(default)]
+    pub remote_attempt_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_remote_attempt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_state_disposition: Option<RemoteStateDisposition>,
     #[serde(default)]
@@ -179,6 +188,14 @@ pub struct ActionTraceResponse {
 pub struct ActionRemoteEvidenceResponse {
     #[serde(default)]
     pub bundles: Vec<RemoteEvidenceBundle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActionRemoteFollowupsResponse {
+    #[serde(default)]
+    pub followups: Vec<RemoteFollowupRequest>,
+    #[serde(default)]
+    pub attempts: Vec<RemoteAttemptRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,6 +311,19 @@ pub struct ResolveReviewQueueItemRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolveReviewQueueItemResponse {
     pub item: ReviewQueueItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DispatchRemoteFollowupRequest {
+    pub dispatcher_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DispatchRemoteFollowupResponse {
+    pub action: SubmittedAction,
+    pub followup: RemoteFollowupRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

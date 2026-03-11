@@ -724,9 +724,52 @@ fn build_task_plan_prompt(action: &Action) -> String {
         .get("verification_feedback")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let remote_followup = action
+        .inputs
+        .get("remote_followup")
+        .and_then(Value::as_object);
+    let followup_section = remote_followup
+        .map(|followup| {
+            let requested_evidence = followup
+                .get("requested_evidence")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "(none)".to_string());
+            let prior_attempts = followup
+                .get("prior_remote_attempt_refs")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "(none)".to_string());
+            let previous_remote_task = followup
+                .get("previous_remote_task_ref")
+                .and_then(Value::as_str)
+                .unwrap_or("(none)");
+            let operator_note = followup
+                .get("operator_note")
+                .and_then(Value::as_str)
+                .unwrap_or("(none)");
+            format!(
+                "Remote follow-up continuation:\nRequested evidence:\n{requested_evidence}\n\nPrevious remote task:\n{previous_remote_task}\n\nPrior remote attempts:\n{prior_attempts}\n\nOperator note:\n{operator_note}"
+            )
+        })
+        .unwrap_or_else(|| "Remote follow-up continuation:\n(none)".to_string());
 
     format!(
-        "You are helping plan a proposal-only task.\n\nObjective:\n{objective}\n\nWorkspace root:\n{workspace_root}\n\nContext files:\n{}\n\nConstraints:\n{}\n\nDesired outputs:\n{}\n\nBackground:\n{}\n\nVerification feedback:\n{}\n\nReturn a concrete plan with target files, ordered steps, risks, assumptions, test suggestions, and a confidence summary.",
+        "You are helping plan a proposal-only task.\n\nObjective:\n{objective}\n\nWorkspace root:\n{workspace_root}\n\nContext files:\n{}\n\nConstraints:\n{}\n\nDesired outputs:\n{}\n\nBackground:\n{}\n\nVerification feedback:\n{}\n\n{}\n\nReturn a concrete plan with target files, ordered steps, risks, assumptions, test suggestions, and a confidence summary.",
         if context_files.is_empty() {
             "(none)".to_string()
         } else {
@@ -747,7 +790,8 @@ fn build_task_plan_prompt(action: &Action) -> String {
             "(none)"
         } else {
             verification_feedback
-        }
+        },
+        followup_section
     )
 }
 

@@ -2,15 +2,17 @@ use bytes::Bytes;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crawfish_core::{
     AcknowledgeAlertRequest, AcknowledgeAlertResponse, ActionDetail, ActionEvaluationsResponse,
-    ActionEventsResponse, ActionListResponse, ActionRemoteEvidenceResponse, ActionTraceResponse,
-    AdminActionResponse, AgentDetail, AlertListResponse, ApproveActionRequest, CrawfishConfig,
-    EvaluationDatasetDetailResponse, EvaluationDatasetsResponse, ExecutionContractPatch,
-    ExperimentRunDetailResponse, FederationPackDetailResponse, FederationPackListResponse,
-    PairwiseExperimentRunDetailResponse, PolicyValidationRequest, PolicyValidationResponse,
-    RejectActionRequest, ResolveReviewQueueItemRequest, ResolveReviewQueueItemResponse,
-    ReviewQueueResponse, RevokeLeaseRequest, StartEvaluationRunRequest, StartEvaluationRunResponse,
-    StartPairwiseEvaluationRunRequest, StartPairwiseEvaluationRunResponse, SubmitActionRequest,
-    SubmittedAction, SwarmStatusResponse, TreatyDetailResponse, TreatyListResponse,
+    ActionEventsResponse, ActionListResponse, ActionRemoteEvidenceResponse,
+    ActionRemoteFollowupsResponse, ActionTraceResponse, AdminActionResponse, AgentDetail,
+    AlertListResponse, ApproveActionRequest, CrawfishConfig, DispatchRemoteFollowupRequest,
+    DispatchRemoteFollowupResponse, EvaluationDatasetDetailResponse, EvaluationDatasetsResponse,
+    ExecutionContractPatch, ExperimentRunDetailResponse, FederationPackDetailResponse,
+    FederationPackListResponse, PairwiseExperimentRunDetailResponse, PolicyValidationRequest,
+    PolicyValidationResponse, RejectActionRequest, ResolveReviewQueueItemRequest,
+    ResolveReviewQueueItemResponse, ReviewQueueResponse, RevokeLeaseRequest,
+    StartEvaluationRunRequest, StartEvaluationRunResponse, StartPairwiseEvaluationRunRequest,
+    StartPairwiseEvaluationRunResponse, SubmitActionRequest, SubmittedAction, SwarmStatusResponse,
+    TreatyDetailResponse, TreatyListResponse,
 };
 use crawfish_runtime::Supervisor;
 use crawfish_types::{
@@ -55,6 +57,8 @@ pub enum ActionSubcommands {
     List(ListActionsCommand),
     Events(ActionEventsCommand),
     RemoteEvidence(ActionRemoteEvidenceCommand),
+    RemoteFollowups(ActionRemoteFollowupsCommand),
+    RemoteFollowupDispatch(ActionRemoteFollowupDispatchCommand),
     Trace(ActionTraceCommand),
     Evals(ActionEvaluationsCommand),
     Submit(SubmitActionCommand),
@@ -315,6 +319,30 @@ pub struct ActionRemoteEvidenceCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct ActionRemoteFollowupsCommand {
+    pub action_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ActionRemoteFollowupDispatchCommand {
+    pub action_id: String,
+    #[arg(long)]
+    pub request: String,
+    #[arg(long)]
+    pub dispatcher: String,
+    #[arg(long)]
+    pub note: Option<String>,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct ActionEvaluationsCommand {
     pub action_id: String,
     #[arg(long, default_value = "Crawfish.toml")]
@@ -543,6 +571,12 @@ pub async fn run_cli() -> anyhow::Result<()> {
             ActionSubcommands::Events(command) => action_events_command(command).await,
             ActionSubcommands::RemoteEvidence(command) => {
                 action_remote_evidence_command(command).await
+            }
+            ActionSubcommands::RemoteFollowups(command) => {
+                action_remote_followups_command(command).await
+            }
+            ActionSubcommands::RemoteFollowupDispatch(command) => {
+                action_remote_followup_dispatch_command(command).await
             }
             ActionSubcommands::Trace(command) => action_trace_command(command).await,
             ActionSubcommands::Evals(command) => action_evaluations_command(command).await,
@@ -796,6 +830,40 @@ async fn action_remote_evidence_command(
             "/v1/actions/{}/remote-evidence",
             command.action_id
         ))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn action_remote_followups_command(
+    command: ActionRemoteFollowupsCommand,
+) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: ActionRemoteFollowupsResponse = client
+        .get_json(&format!(
+            "/v1/actions/{}/remote-followups",
+            command.action_id
+        ))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn action_remote_followup_dispatch_command(
+    command: ActionRemoteFollowupDispatchCommand,
+) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: DispatchRemoteFollowupResponse = client
+        .post_json(
+            &format!(
+                "/v1/actions/{}/remote-followups/{}/dispatch",
+                command.action_id, command.request
+            ),
+            &DispatchRemoteFollowupRequest {
+                dispatcher_ref: command.dispatcher,
+                note: command.note,
+            },
+        )
         .await?;
     print_output(serde_json::to_value(response)?, command.json)?;
     Ok(())

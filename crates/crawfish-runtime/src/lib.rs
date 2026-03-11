@@ -12,9 +12,10 @@ use crawfish_core::{
     authorize_encounter, compile_execution_plan, neutral_policy, now_timestamp,
     owner_policy_for_manifest, AcknowledgeAlertRequest, AcknowledgeAlertResponse, ActionDetail,
     ActionEvaluationsResponse, ActionEventsResponse, ActionListResponse,
-    ActionRemoteEvidenceResponse, ActionStore, ActionSummary, ActionTraceResponse,
-    AdminActionResponse, AgentDetail, AlertListResponse, ApproveActionRequest, CheckpointStore,
-    CompiledExecutionPlan, CrawfishConfig, DeterministicExecutor, EncounterDecision,
+    ActionRemoteEvidenceResponse, ActionRemoteFollowupsResponse, ActionStore, ActionSummary,
+    ActionTraceResponse, AdminActionResponse, AgentDetail, AlertListResponse, ApproveActionRequest,
+    CheckpointStore, CompiledExecutionPlan, CrawfishConfig, DeterministicExecutor,
+    DispatchRemoteFollowupRequest, DispatchRemoteFollowupResponse, EncounterDecision,
     EncounterDisposition, EncounterRequest, EvaluationDatasetDetailResponse,
     EvaluationDatasetsResponse, ExecutionContractPatch, ExecutionSurface,
     ExperimentRunDetailResponse, FederationPackDetailResponse, FederationPackListResponse,
@@ -43,8 +44,9 @@ use crawfish_types::{
     FeedbackPolicy, HealthStatus, InteractionModel, JurisdictionClass, LifecycleRecord,
     LocalHarnessKind, Metadata, Mutability, NumericComparison, OversightCheckpoint, OwnerKind,
     OwnerRef, PairwiseCaseResult, PairwiseExperimentRun, PairwiseExperimentRunStatus,
-    PairwiseOutcome, PairwiseProfile, PolicyIncident, PolicyIncidentSeverity, RemoteEvidenceBundle,
-    RemoteEvidenceItem, RemoteEvidenceStatus, RemoteOutcomeDisposition, RemoteResultAcceptance,
+    PairwiseOutcome, PairwiseProfile, PolicyIncident, PolicyIncidentSeverity, RemoteAttemptRecord,
+    RemoteEvidenceBundle, RemoteEvidenceItem, RemoteEvidenceStatus, RemoteFollowupReason,
+    RemoteFollowupRequest, RemoteFollowupStatus, RemoteOutcomeDisposition, RemoteResultAcceptance,
     RemoteReviewDisposition, RemoteReviewReason, RemoteStateDisposition, RequesterKind,
     ReviewQueueItem, ReviewQueueKind, ReviewQueueStatus, ScorecardCriterion,
     ScorecardCriterionKind, ScorecardSpec, StrategyCheckpointState, TraceBundle, TrustDomain,
@@ -753,6 +755,16 @@ impl Supervisor {
             .await?;
         if let Some(bundle) = &remote_evidence_bundle {
             self.store.insert_remote_evidence_bundle(bundle).await?;
+            if let Some(attempt_ref) = &bundle.remote_attempt_ref {
+                if let Some(mut attempt) = self.store.get_remote_attempt_record(attempt_ref).await?
+                {
+                    attempt.remote_evidence_ref = Some(bundle.id.clone());
+                    if attempt.completed_at.is_none() {
+                        attempt.completed_at = Some(now_timestamp());
+                    }
+                    self.store.upsert_remote_attempt_record(&attempt).await?;
+                }
+            }
             self.store
                 .append_action_event(
                     &action.id,
@@ -773,6 +785,8 @@ impl Supervisor {
         for evaluation in &mut evaluations {
             if let Some(bundle) = &remote_evidence_bundle {
                 evaluation.remote_evidence_ref = Some(bundle.id.clone());
+                evaluation.remote_attempt_ref = bundle.remote_attempt_ref.clone();
+                evaluation.remote_followup_ref = bundle.followup_request_ref.clone();
                 evaluation.remote_review_disposition = bundle.remote_review_disposition.clone();
             }
             self.store.insert_evaluation(evaluation).await?;
@@ -888,6 +902,21 @@ impl Supervisor {
                 .await?;
         }
 
+        if let Some(followup) = self.close_active_remote_followup_request(action).await? {
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "remote_followup_closed",
+                    serde_json::json!({
+                        "followup_request_id": followup.id,
+                        "status": runtime_enum_to_snake(&followup.status),
+                    }),
+                )
+                .await?;
+            clear_remote_followup_context(action);
+            self.store.upsert_action(action).await?;
+        }
+
         Ok(())
     }
 
@@ -908,6 +937,8 @@ impl Supervisor {
         } else {
             None
         };
+        let remote_attempts = self.store.list_remote_attempt_records(&action.id).await?;
+        let remote_followups = self.store.list_remote_followup_requests(&action.id).await?;
         let federation_pack_id = federation_pack_id_for_action(action);
         let trace = TraceBundle {
             id: format!("trace-{}", action.id),
@@ -971,6 +1002,14 @@ impl Supervisor {
             federation_decision: federation_decision_for_action(action),
             delegation_receipt_ref,
             remote_evidence_ref: remote_evidence_bundle.map(|bundle| bundle.id.clone()),
+            remote_attempt_refs: remote_attempts
+                .iter()
+                .map(|attempt| attempt.id.clone())
+                .collect(),
+            remote_followup_refs: remote_followups
+                .iter()
+                .map(|followup| followup.id.clone())
+                .collect(),
             remote_task_ref: external_ref_value(&action.external_refs, "a2a.task_id"),
             remote_outcome_disposition: remote_outcome_disposition_for_action(action),
             remote_evidence_status: remote_evidence_status_for_action(action),
@@ -1004,6 +1043,8 @@ impl Supervisor {
         };
         let treaty_pack_id = external_ref_value(&action.external_refs, "a2a.treaty_pack");
         let remote_task_ref = external_ref_value(&action.external_refs, "a2a.task_id");
+        let remote_attempts = self.store.list_remote_attempt_records(&action.id).await?;
+        let latest_remote_attempt = remote_attempts.last().cloned();
         let remote_terminal_state = action
             .outputs
             .metadata
@@ -1130,12 +1171,21 @@ impl Supervisor {
 
         Ok(Some(RemoteEvidenceBundle {
             id: format!(
-                "remote-evidence-{}-{}",
+                "remote-evidence-{}-attempt-{}",
                 action.id,
-                strategy_iteration_for_action(action)
+                latest_remote_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.attempt)
+                    .unwrap_or_else(|| strategy_iteration_for_action(action))
             ),
             action_id: action.id.clone(),
-            attempt: strategy_iteration_for_action(action),
+            attempt: latest_remote_attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt)
+                .unwrap_or_else(|| strategy_iteration_for_action(action)),
+            remote_attempt_ref: latest_remote_attempt
+                .as_ref()
+                .map(|attempt| attempt.id.clone()),
             interaction_model: interaction_model.clone(),
             treaty_pack_id,
             federation_pack_id: federation_pack_id_for_action(action),
@@ -1155,6 +1205,9 @@ impl Supervisor {
             remote_outcome_disposition,
             remote_review_disposition,
             remote_review_reason,
+            followup_request_ref: latest_remote_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.followup_request_ref.clone()),
             created_at: now_timestamp(),
         }))
     }
@@ -1182,6 +1235,12 @@ impl Supervisor {
                 observed_incidents,
             )
             .await?;
+        let latest_remote_attempt = self
+            .store
+            .list_remote_attempt_records(&action.id)
+            .await?
+            .into_iter()
+            .last();
         Ok(vec![EvaluationRecord {
             id: Uuid::new_v4().to_string(),
             action_id: action.id.clone(),
@@ -1197,6 +1256,12 @@ impl Supervisor {
             federation_pack_id: federation_pack_id_for_action(action),
             remote_evidence_status: remote_evidence_status_for_action(action),
             remote_evidence_ref: None,
+            remote_attempt_ref: latest_remote_attempt
+                .as_ref()
+                .map(|attempt| attempt.id.clone()),
+            remote_followup_ref: latest_remote_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.followup_request_ref.clone()),
             remote_review_disposition: remote_review_disposition_for_action(action),
             feedback_note_id: None,
             created_at: now_timestamp(),
@@ -1411,6 +1476,8 @@ impl Supervisor {
             federation_pack_id: federation_pack.map(|pack| pack.id),
             remote_evidence_status,
             remote_evidence_ref: remote_evidence_bundle.map(|bundle| bundle.id.clone()),
+            remote_followup_ref: remote_evidence_bundle
+                .and_then(|bundle| bundle.followup_request_ref.clone()),
             remote_task_ref: external_ref_value(&action.external_refs, "a2a.task_id"),
             remote_review_disposition,
             evaluation_ref: evaluation.map(|evaluation| evaluation.id.clone()),
@@ -2218,6 +2285,8 @@ impl Supervisor {
             remote_outcome_disposition: trace.remote_outcome_disposition.clone(),
             remote_evidence_status: trace.remote_evidence_status.clone(),
             remote_evidence_ref: trace.remote_evidence_ref.clone(),
+            remote_attempt_refs: trace.remote_attempt_refs.clone(),
+            remote_followup_refs: trace.remote_followup_refs.clone(),
             remote_review_disposition: trace.remote_review_disposition.clone(),
             remote_state_disposition: trace.remote_state_disposition.clone(),
             treaty_violations: trace.treaty_violations.clone(),
@@ -2389,6 +2458,18 @@ impl Supervisor {
                     evaluation.as_ref(),
                     &checkpoint_status,
                 );
+                let latest_remote_attempt = self
+                    .store
+                    .list_remote_attempt_records(&action.id)
+                    .await?
+                    .into_iter()
+                    .last();
+                let latest_remote_evidence = self
+                    .store
+                    .list_remote_evidence_bundles(&action.id)
+                    .await?
+                    .into_iter()
+                    .last();
                 Ok(ExperimentCaseResult {
                     id: Uuid::new_v4().to_string(),
                     run_id: run.id.clone(),
@@ -2423,8 +2504,16 @@ impl Supervisor {
                     treaty_violation_count: treaty_violations_for_action(&action).len() as u32,
                     federation_pack_id: federation_pack_id_for_action(&action),
                     remote_evidence_status: remote_evidence_status_for_action(&action),
-                    remote_evidence_ref: None,
+                    remote_evidence_ref: latest_remote_evidence
+                        .as_ref()
+                        .map(|bundle| bundle.id.clone()),
                     remote_review_disposition: remote_review_disposition_for_action(&action),
+                    remote_attempt_ref: latest_remote_attempt
+                        .as_ref()
+                        .map(|attempt| attempt.id.clone()),
+                    remote_followup_ref: latest_remote_attempt
+                        .as_ref()
+                        .and_then(|attempt| attempt.followup_request_ref.clone()),
                     failure_code: None,
                     created_at: now_timestamp(),
                 })
@@ -2504,6 +2593,18 @@ impl Supervisor {
                     evaluation.as_ref(),
                     &checkpoint_status,
                 );
+                let latest_remote_attempt = self
+                    .store
+                    .list_remote_attempt_records(&action.id)
+                    .await?
+                    .into_iter()
+                    .last();
+                let latest_remote_evidence = self
+                    .store
+                    .list_remote_evidence_bundles(&action.id)
+                    .await?
+                    .into_iter()
+                    .last();
 
                 Ok(ExperimentCaseResult {
                     id: Uuid::new_v4().to_string(),
@@ -2536,8 +2637,16 @@ impl Supervisor {
                     treaty_violation_count: treaty_violations_for_action(&action).len() as u32,
                     federation_pack_id: federation_pack_id_for_action(&action),
                     remote_evidence_status: remote_evidence_status_for_action(&action),
-                    remote_evidence_ref: None,
+                    remote_evidence_ref: latest_remote_evidence
+                        .as_ref()
+                        .map(|bundle| bundle.id.clone()),
                     remote_review_disposition: remote_review_disposition_for_action(&action),
+                    remote_attempt_ref: latest_remote_attempt
+                        .as_ref()
+                        .map(|attempt| attempt.id.clone()),
+                    remote_followup_ref: latest_remote_attempt
+                        .as_ref()
+                        .and_then(|attempt| attempt.followup_request_ref.clone()),
                     failure_code: Some(failure_code),
                     created_at: now_timestamp(),
                 })
@@ -2552,6 +2661,12 @@ impl Supervisor {
         summary: &VerificationSummary,
         feedback: Option<&String>,
     ) -> anyhow::Result<()> {
+        let latest_remote_attempt = self
+            .store
+            .list_remote_attempt_records(&action.id)
+            .await?
+            .into_iter()
+            .last();
         let evaluation = EvaluationRecord {
             id: Uuid::new_v4().to_string(),
             action_id: action.id.clone(),
@@ -2576,6 +2691,12 @@ impl Supervisor {
             remote_evidence_status: remote_evidence_status_for_action(action),
             remote_evidence_ref: None,
             remote_review_disposition: remote_review_disposition_for_action(action),
+            remote_attempt_ref: latest_remote_attempt
+                .as_ref()
+                .map(|attempt| attempt.id.clone()),
+            remote_followup_ref: latest_remote_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.followup_request_ref.clone()),
             feedback_note_id: None,
             created_at: now_timestamp(),
         };
@@ -3168,17 +3289,24 @@ impl Supervisor {
         action: &mut Action,
         manifest: &AgentManifest,
     ) -> anyhow::Result<ExecutionOutcome> {
-        let deterministic_fallback = action
-            .contract
-            .execution
-            .fallback_chain
-            .iter()
-            .any(|route| route == "deterministic");
+        let has_active_followup = active_remote_followup_ref_for_action(action).is_some();
+        let deterministic_fallback = !has_active_followup
+            && action
+                .contract
+                .execution
+                .fallback_chain
+                .iter()
+                .any(|route| route == "deterministic");
         let mut attempted_agentic_route = false;
         let mut last_reason: Option<String> = None;
         let mut last_external_refs = Vec::new();
+        let preferred_routes = if has_active_followup {
+            vec!["a2a".to_string()]
+        } else {
+            action.contract.execution.preferred_harnesses.clone()
+        };
 
-        for route in action.contract.execution.preferred_harnesses.clone() {
+        for route in preferred_routes {
             match route.as_str() {
                 "claude_code" | "codex" => {
                     attempted_agentic_route = true;
@@ -3396,10 +3524,50 @@ impl Supervisor {
                                 value: federation_pack.id.clone(),
                                 endpoint: None,
                             });
+                            let followup_request_ref =
+                                active_remote_followup_ref_for_action(action);
+                            let attempt_created_at = now_timestamp();
+                            let mut attempt_record = RemoteAttemptRecord {
+                                id: Uuid::new_v4().to_string(),
+                                action_id: action.id.clone(),
+                                attempt: self
+                                    .store
+                                    .list_remote_attempt_records(&action.id)
+                                    .await?
+                                    .len() as u32
+                                    + 1,
+                                capability: action.capability.clone(),
+                                interaction_model: Some(
+                                    crawfish_types::InteractionModel::RemoteAgent,
+                                ),
+                                executor: Some("a2a".to_string()),
+                                remote_principal: Some(treaty_decision.remote_principal.clone()),
+                                treaty_pack_id: Some(treaty_decision.treaty_pack_id.clone()),
+                                federation_pack_id: Some(federation_pack.id.clone()),
+                                remote_task_ref: None,
+                                remote_evidence_ref: None,
+                                followup_request_ref: followup_request_ref.clone(),
+                                created_at: attempt_created_at,
+                                completed_at: None,
+                            };
+                            self.store
+                                .upsert_remote_attempt_record(&attempt_record)
+                                .await?;
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.remote_attempt".to_string(),
+                                value: attempt_record.id.clone(),
+                                endpoint: None,
+                            });
                             match adapter.run(action).await {
                                 Ok(mut result) => {
                                     let merged_external_refs =
                                         merge_external_refs(base_refs, result.external_refs);
+                                    attempt_record.remote_task_ref =
+                                        external_ref_value(&merged_external_refs, "a2a.task_id");
+                                    attempt_record.completed_at = Some(now_timestamp());
+                                    self.store
+                                        .upsert_remote_attempt_record(&attempt_record)
+                                        .await?;
                                     receipt.remote_task_ref =
                                         external_ref_value(&merged_external_refs, "a2a.task_id");
                                     self.store.insert_delegation_receipt(&receipt).await?;
@@ -3791,6 +3959,12 @@ impl Supervisor {
                                 Err(error) => {
                                     let reason = error.to_string();
                                     let code = a2a_failure_code(&error);
+                                    attempt_record.remote_task_ref =
+                                        external_ref_value(&base_refs, "a2a.task_id");
+                                    attempt_record.completed_at = Some(now_timestamp());
+                                    self.store
+                                        .upsert_remote_attempt_record(&attempt_record)
+                                        .await?;
                                     self.store
                                         .append_action_event(
                                             &action.id,
@@ -4155,6 +4329,9 @@ impl Supervisor {
             auth_required_policy: RemoteStateDisposition::AwaitingApproval,
             remote_failure_policy: RemoteStateDisposition::Failed,
             required_checkpoints: treaty_pack.required_checkpoints.clone(),
+            followup_allowed: true,
+            max_followup_attempts: 2,
+            followup_review_priority: "high".to_string(),
             max_delegation_depth: treaty_pack.max_delegation_depth,
         }
     }
@@ -6784,6 +6961,22 @@ fn federation_pack_id_for_action(action: &Action) -> Option<String> {
     external_ref_value(&action.external_refs, "a2a.federation_pack")
 }
 
+fn remote_followup_context(action: &Action) -> Option<&Value> {
+    action.inputs.get("remote_followup")
+}
+
+fn active_remote_followup_ref_for_action(action: &Action) -> Option<String> {
+    remote_followup_context(action)
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("request_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn clear_remote_followup_context(action: &mut Action) {
+    action.inputs.remove("remote_followup");
+}
+
 fn strategy_iteration_for_action(action: &Action) -> u32 {
     action
         .outputs
@@ -8171,6 +8364,7 @@ fn maybe_enqueue_pairwise_review_item(
         remote_evidence_ref: dataset_case.remote_evidence_ref.clone(),
         remote_task_ref: dataset_case.remote_task_ref.clone(),
         remote_review_disposition: dataset_case.remote_review_disposition.clone(),
+        remote_followup_ref: dataset_case.remote_followup_refs.last().cloned(),
         evaluation_ref: None,
         dataset_case_ref: Some(dataset_case.id.clone()),
         pairwise_run_ref: Some(result.pairwise_run_id.clone()),
@@ -8457,6 +8651,9 @@ impl Supervisor {
                 OversightCheckpoint::PreDispatch,
                 OversightCheckpoint::PostResult,
             ],
+            followup_allowed: true,
+            max_followup_attempts: 2,
+            followup_review_priority: "high".to_string(),
             max_delegation_depth: 1,
         }
     }
@@ -8476,6 +8673,140 @@ impl Supervisor {
             });
         }
         None
+    }
+
+    fn remote_followup_reasons_for_bundle(
+        &self,
+        bundle: &RemoteEvidenceBundle,
+    ) -> Vec<RemoteFollowupReason> {
+        let mut reasons = Vec::new();
+        if matches!(
+            bundle.remote_evidence_status,
+            Some(RemoteEvidenceStatus::MissingRequiredEvidence)
+        ) {
+            reasons.push(RemoteFollowupReason::MissingTreatyEvidence);
+        }
+        if bundle.evidence_items.iter().any(|item| {
+            !item.satisfied && matches!(item.checkpoint, Some(OversightCheckpoint::PostResult))
+        }) {
+            reasons.push(RemoteFollowupReason::PostResultCheckpointGap);
+        }
+        if matches!(
+            bundle.remote_evidence_status,
+            Some(RemoteEvidenceStatus::ScopeViolation)
+        ) {
+            reasons.push(RemoteFollowupReason::ScopeDataAmbiguity);
+        }
+        if bundle
+            .evidence_items
+            .iter()
+            .any(|item| item.id == "artifact_classes_allowed" && !item.satisfied)
+        {
+            reasons.push(RemoteFollowupReason::ArtifactAdmissibilityAmbiguity);
+        }
+        if reasons.is_empty() {
+            reasons.push(RemoteFollowupReason::OperatorRequestedClarification);
+        }
+        let mut deduped = Vec::new();
+        for reason in reasons {
+            if !deduped.contains(&reason) {
+                deduped.push(reason);
+            }
+        }
+        deduped
+    }
+
+    fn requested_evidence_for_bundle(&self, bundle: &RemoteEvidenceBundle) -> Vec<String> {
+        let mut requested = bundle
+            .evidence_items
+            .iter()
+            .filter(|item| !item.satisfied)
+            .map(|item| item.summary.clone())
+            .collect::<Vec<_>>();
+        requested.extend(
+            bundle
+                .policy_incidents
+                .iter()
+                .filter(|incident| {
+                    matches!(
+                        incident.reason_code.as_str(),
+                        "frontier_enforcement_gap" | "treaty_scope_violation"
+                    )
+                })
+                .map(|incident| incident.summary.clone()),
+        );
+        requested.sort();
+        requested.dedup();
+        if requested.is_empty() {
+            requested.push("provide admissibility evidence for the remote result".to_string());
+        }
+        requested
+    }
+
+    async fn create_remote_followup_request(
+        &self,
+        action: &Action,
+        bundle: &RemoteEvidenceBundle,
+        reason_code: String,
+        operator_note: Option<String>,
+    ) -> anyhow::Result<RemoteFollowupRequest> {
+        let treaty_pack_id = bundle
+            .treaty_pack_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote follow-up requires treaty pack lineage"))?;
+        let federation_pack_id = bundle
+            .federation_pack_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote follow-up requires federation pack lineage"))?;
+        let remote_principal = bundle
+            .remote_principal
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote follow-up requires remote principal lineage"))?;
+        let timestamp = now_timestamp();
+        let request = RemoteFollowupRequest {
+            id: Uuid::new_v4().to_string(),
+            action_id: action.id.clone(),
+            remote_evidence_ref: bundle.id.clone(),
+            treaty_pack_id,
+            federation_pack_id,
+            remote_principal,
+            remote_task_ref: bundle.remote_task_ref.clone(),
+            reason_code,
+            reasons: self.remote_followup_reasons_for_bundle(bundle),
+            requested_evidence: self.requested_evidence_for_bundle(bundle),
+            operator_note,
+            status: RemoteFollowupStatus::Open,
+            dispatched_at: None,
+            dispatched_by: None,
+            closed_at: None,
+            superseded_by: None,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        };
+        self.store.upsert_remote_followup_request(&request).await?;
+        Ok(request)
+    }
+
+    async fn close_active_remote_followup_request(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<Option<RemoteFollowupRequest>> {
+        let Some(followup_id) = active_remote_followup_ref_for_action(action) else {
+            return Ok(None);
+        };
+        let Some(mut followup) = self.store.get_remote_followup_request(&followup_id).await? else {
+            return Ok(None);
+        };
+        if matches!(
+            followup.status,
+            RemoteFollowupStatus::Open | RemoteFollowupStatus::Dispatched
+        ) {
+            followup.status = RemoteFollowupStatus::Closed;
+            followup.closed_at = Some(now_timestamp());
+            followup.updated_at = now_timestamp();
+            self.store.upsert_remote_followup_request(&followup).await?;
+        }
+        Ok(Some(followup))
     }
 
     async fn list_federation_packs(&self) -> anyhow::Result<FederationPackListResponse> {
@@ -8569,6 +8900,19 @@ impl SupervisorControl for Supervisor {
         }
         Ok(Some(ActionRemoteEvidenceResponse {
             bundles: self.store.list_remote_evidence_bundles(action_id).await?,
+        }))
+    }
+
+    async fn get_action_remote_followups(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Option<ActionRemoteFollowupsResponse>> {
+        if self.store.get_action(action_id).await?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(ActionRemoteFollowupsResponse {
+            followups: self.store.list_remote_followup_requests(action_id).await?,
+            attempts: self.store.list_remote_attempt_records(action_id).await?,
         }))
     }
 
@@ -8670,6 +9014,223 @@ impl SupervisorControl for Supervisor {
             .get(treaty_id)
             .cloned()
             .map(|treaty| TreatyDetailResponse { treaty }))
+    }
+
+    async fn dispatch_remote_followup(
+        &self,
+        action_id: &str,
+        followup_id: &str,
+        request: DispatchRemoteFollowupRequest,
+    ) -> anyhow::Result<DispatchRemoteFollowupResponse> {
+        let mut action = self
+            .store
+            .get_action(action_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("action not found: {action_id}"))?;
+        let mut followup = self
+            .store
+            .get_remote_followup_request(followup_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("remote follow-up request not found: {followup_id}"))?;
+        if followup.action_id != action_id {
+            anyhow::bail!(
+                "remote follow-up request {followup_id} does not belong to action {action_id}"
+            );
+        }
+        if !matches!(followup.status, RemoteFollowupStatus::Open) {
+            anyhow::bail!("remote follow-up request {followup_id} is not open");
+        }
+        if !matches!(action.phase, ActionPhase::Blocked) {
+            anyhow::bail!("action {action_id} is not blocked for remote follow-up");
+        }
+
+        let manifest = self
+            .store
+            .get_agent_manifest(&action.target_agent_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("agent not found: {}", action.target_agent_id))?;
+        let Some((adapter, _)) = self.resolve_a2a_adapter(&manifest)? else {
+            let incident = PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: "remote_agent_treaty_v1".to_string(),
+                jurisdiction: JurisdictionClass::ExternalUnknown,
+                reason_code: "followup_dispatch_denied".to_string(),
+                summary: "remote follow-up dispatch requires an A2A binding".to_string(),
+                severity: PolicyIncidentSeverity::Critical,
+                checkpoint: Some(OversightCheckpoint::PreDispatch),
+                created_at: now_timestamp(),
+            };
+            self.store.insert_policy_incident(&incident).await?;
+            anyhow::bail!("remote follow-up dispatch requires an A2A binding");
+        };
+
+        let treaty_pack = adapter.treaty_pack().clone();
+        let federation_pack = self.resolve_federation_pack(adapter.binding(), &treaty_pack)?;
+        let denial_summary = if treaty_pack.id != followup.treaty_pack_id {
+            Some(format!(
+                "follow-up treaty mismatch: expected {}, got {}",
+                followup.treaty_pack_id, treaty_pack.id
+            ))
+        } else if treaty_pack.remote_principal != followup.remote_principal {
+            Some("follow-up remote principal no longer matches treaty binding".to_string())
+        } else if federation_pack.id != followup.federation_pack_id {
+            Some(format!(
+                "follow-up federation pack mismatch: expected {}, got {}",
+                followup.federation_pack_id, federation_pack.id
+            ))
+        } else if !federation_pack.followup_allowed {
+            Some(format!(
+                "federation pack {} does not allow remote follow-up dispatch",
+                federation_pack.id
+            ))
+        } else {
+            None
+        };
+        if let Some(summary) = denial_summary {
+            let incident = PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: "remote_agent_treaty_v1".to_string(),
+                jurisdiction: JurisdictionClass::ExternalUnknown,
+                reason_code: "followup_dispatch_denied".to_string(),
+                summary: summary.clone(),
+                severity: PolicyIncidentSeverity::Critical,
+                checkpoint: Some(OversightCheckpoint::PreDispatch),
+                created_at: now_timestamp(),
+            };
+            self.store.insert_policy_incident(&incident).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "policy_incident_recorded",
+                    serde_json::json!({
+                        "incident_id": incident.id,
+                        "reason_code": incident.reason_code,
+                        "severity": "critical",
+                    }),
+                )
+                .await?;
+            anyhow::bail!(summary);
+        }
+
+        let followup_attempt_count = self
+            .store
+            .list_remote_attempt_records(action_id)
+            .await?
+            .into_iter()
+            .filter(|attempt| attempt.followup_request_ref.is_some())
+            .count() as u32;
+        if followup_attempt_count >= federation_pack.max_followup_attempts {
+            let summary = format!(
+                "remote follow-up dispatch exceeds max_followup_attempts ({})",
+                federation_pack.max_followup_attempts
+            );
+            let incident = PolicyIncident {
+                id: Uuid::new_v4().to_string(),
+                action_id: action.id.clone(),
+                doctrine_pack_id: "remote_agent_treaty_v1".to_string(),
+                jurisdiction: JurisdictionClass::ExternalUnknown,
+                reason_code: "followup_attempt_limit_exceeded".to_string(),
+                summary: summary.clone(),
+                severity: PolicyIncidentSeverity::Warning,
+                checkpoint: Some(OversightCheckpoint::PreDispatch),
+                created_at: now_timestamp(),
+            };
+            self.store.insert_policy_incident(&incident).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "policy_incident_recorded",
+                    serde_json::json!({
+                        "incident_id": incident.id,
+                        "reason_code": incident.reason_code,
+                        "severity": "warning",
+                    }),
+                )
+                .await?;
+            anyhow::bail!(summary);
+        }
+
+        self.compile_treaty_decision(&action, adapter.binding(), &treaty_pack)
+            .map_err(|error| anyhow::anyhow!("followup_dispatch_denied: {error}"))?;
+
+        let prior_attempts = self.store.list_remote_attempt_records(action_id).await?;
+        let prior_evidence = self.store.list_remote_evidence_bundles(action_id).await?;
+        for mut request_to_supersede in self.store.list_remote_followup_requests(action_id).await? {
+            if request_to_supersede.id != followup.id
+                && matches!(request_to_supersede.status, RemoteFollowupStatus::Open)
+            {
+                request_to_supersede.status = RemoteFollowupStatus::Superseded;
+                request_to_supersede.updated_at = now_timestamp();
+                request_to_supersede.superseded_by = Some(followup.id.clone());
+                self.store
+                    .upsert_remote_followup_request(&request_to_supersede)
+                    .await?;
+            }
+        }
+
+        let dispatched_at = now_timestamp();
+        followup.status = RemoteFollowupStatus::Dispatched;
+        followup.dispatched_at = Some(dispatched_at.clone());
+        followup.dispatched_by = Some(request.dispatcher_ref.clone());
+        if let Some(note) = request.note.clone() {
+            followup.operator_note = Some(note);
+        }
+        followup.updated_at = dispatched_at;
+        self.store.upsert_remote_followup_request(&followup).await?;
+
+        action.phase = ActionPhase::Accepted;
+        action.started_at = None;
+        action.finished_at = None;
+        action.failure_reason = None;
+        action.failure_code = None;
+        action.checkpoint_ref = None;
+        action.selected_executor = None;
+        action.recovery_stage = None;
+        action.continuity_mode = None;
+        action.degradation_profile = None;
+        action.lock_detail = None;
+        action.external_refs = Vec::new();
+        action.outputs = ActionOutputs::default();
+        action.inputs.insert(
+            "remote_followup".to_string(),
+            serde_json::json!({
+                "request_id": followup.id,
+                "reason_code": followup.reason_code,
+                "requested_evidence": followup.requested_evidence,
+                "operator_note": followup.operator_note,
+                "prior_remote_attempt_refs": prior_attempts
+                    .iter()
+                    .map(|attempt| attempt.id.clone())
+                    .collect::<Vec<_>>(),
+                "prior_remote_evidence_refs": prior_evidence
+                    .iter()
+                    .map(|bundle| bundle.id.clone())
+                    .collect::<Vec<_>>(),
+                "previous_remote_task_ref": followup.remote_task_ref,
+            }),
+        );
+        self.store.upsert_action(&action).await?;
+        self.store
+            .append_action_event(
+                &action.id,
+                "remote_followup_dispatched",
+                serde_json::json!({
+                    "followup_request_id": followup.id,
+                    "dispatcher_ref": request.dispatcher_ref,
+                    "requested_evidence": followup.requested_evidence,
+                }),
+            )
+            .await?;
+
+        Ok(DispatchRemoteFollowupResponse {
+            action: SubmittedAction {
+                action_id: action.id,
+                phase: "accepted".to_string(),
+            },
+            followup,
+        })
     }
 
     async fn acknowledge_alert(
@@ -8779,6 +9340,23 @@ impl SupervisorControl for Supervisor {
                         .await?;
                 }
                 "needs_followup" => {
+                    let treaty_summary =
+                        external_ref_value(&action.external_refs, "a2a.treaty_pack").and_then(
+                            |treaty_id| self.config.treaties.packs.get(&treaty_id).cloned(),
+                        );
+                    if let Some(federation_pack_id) = federation_pack_id_for_action(&action) {
+                        if let Some(federation_pack) = self.resolve_federation_pack_by_id(
+                            &federation_pack_id,
+                            treaty_summary.as_ref(),
+                        ) {
+                            if !federation_pack.followup_allowed {
+                                anyhow::bail!(
+                                    "federation pack {} does not allow remote follow-up dispatch",
+                                    federation_pack.id
+                                );
+                            }
+                        }
+                    }
                     action.phase = ActionPhase::Blocked;
                     action.finished_at = None;
                     action.failure_reason =
@@ -8806,32 +9384,38 @@ impl SupervisorControl for Supervisor {
                             }),
                         )
                         .await?;
-                    let followup_item = ReviewQueueItem {
-                        id: Uuid::new_v4().to_string(),
-                        action_id: action.id.clone(),
-                        source: item.source.clone(),
-                        kind: ReviewQueueKind::RemoteResultReview,
-                        status: ReviewQueueStatus::Open,
-                        priority: item.priority.clone(),
-                        reason_code: "remote_result_followup".to_string(),
-                        summary: "remote result requires additional follow-up review".to_string(),
-                        treaty_pack_id: item.treaty_pack_id.clone(),
-                        federation_pack_id: item.federation_pack_id.clone(),
-                        remote_evidence_status: item.remote_evidence_status.clone(),
-                        remote_evidence_ref: item.remote_evidence_ref.clone(),
-                        remote_task_ref: item.remote_task_ref.clone(),
-                        remote_review_disposition: Some(RemoteReviewDisposition::NeedsFollowup),
-                        evaluation_ref: item.evaluation_ref.clone(),
-                        dataset_case_ref: item.dataset_case_ref.clone(),
-                        pairwise_run_ref: None,
-                        pairwise_case_ref: None,
-                        left_case_result_ref: None,
-                        right_case_result_ref: None,
-                        created_at: now_timestamp(),
-                        resolved_at: None,
-                        resolution: None,
-                    };
-                    self.store.insert_review_queue_item(&followup_item).await?;
+                    let remote_evidence_ref =
+                        item.remote_evidence_ref.clone().ok_or_else(|| {
+                            anyhow::anyhow!("needs_followup requires remote evidence lineage")
+                        })?;
+                    let remote_bundle = self
+                        .store
+                        .get_remote_evidence_bundle(&remote_evidence_ref)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "remote evidence bundle not found: {remote_evidence_ref}"
+                            )
+                        })?;
+                    let followup = self
+                        .create_remote_followup_request(
+                            &action,
+                            &remote_bundle,
+                            "remote_result_followup".to_string(),
+                            request.note.clone(),
+                        )
+                        .await?;
+                    self.store
+                        .append_action_event(
+                            &action.id,
+                            "remote_followup_requested",
+                            serde_json::json!({
+                                "followup_request_id": followup.id,
+                                "remote_evidence_ref": followup.remote_evidence_ref,
+                                "reason_code": followup.reason_code,
+                            }),
+                        )
+                        .await?;
                 }
                 other => anyhow::bail!("unsupported remote review resolution: {other}"),
             }
@@ -9027,6 +9611,8 @@ impl SupervisorControl for Supervisor {
             .as_ref()
             .map(|receipt| receipt.remote_principal.clone());
         let remote_evidence_bundles = self.store.list_remote_evidence_bundles(action_id).await?;
+        let remote_followups = self.store.list_remote_followup_requests(action_id).await?;
+        let remote_attempts = self.store.list_remote_attempt_records(action_id).await?;
         let latest_remote_evidence = remote_evidence_bundles.last().cloned();
         let pending_remote_review_ref = review_queue_items
             .iter()
@@ -9035,6 +9621,10 @@ impl SupervisorControl for Supervisor {
                     && item.status == ReviewQueueStatus::Open
             })
             .map(|item| item.id.clone());
+        let active_remote_followup_ref = remote_followups
+            .iter()
+            .find(|followup| followup.status == RemoteFollowupStatus::Open)
+            .map(|followup| followup.id.clone());
         Ok(Some(ActionDetail {
             artifact_refs: action.outputs.artifacts.clone(),
             selected_executor: action.selected_executor.clone(),
@@ -9086,6 +9676,13 @@ impl SupervisorControl for Supervisor {
                 },
             ),
             pending_remote_review_ref,
+            remote_followup_refs: remote_followups
+                .iter()
+                .map(|followup| followup.id.clone())
+                .collect(),
+            active_remote_followup_ref,
+            remote_attempt_count: remote_attempts.len() as u32,
+            latest_remote_attempt_ref: remote_attempts.last().map(|attempt| attempt.id.clone()),
             remote_state_disposition: remote_state_disposition_for_action(&action),
             treaty_violations: treaty_violations_for_action(&action),
             delegation_depth: delegation_depth_for_action(&action),
@@ -9711,6 +10308,14 @@ fn api_router(supervisor: Arc<Supervisor>) -> Router {
             "/v1/actions/{id}/remote-evidence",
             get(action_remote_evidence_handler),
         )
+        .route(
+            "/v1/actions/{id}/remote-followups",
+            get(action_remote_followups_handler),
+        )
+        .route(
+            "/v1/actions/{id}/remote-followups/{followup_id}/dispatch",
+            post(action_remote_followup_dispatch_handler),
+        )
         .route("/v1/actions/{id}/trace", get(action_trace_handler))
         .route(
             "/v1/actions/{id}/evaluations",
@@ -9850,6 +10455,39 @@ async fn action_remote_evidence_handler(
         .map_err(RuntimeError::Internal)?
         .map(Json)
         .ok_or_else(|| RuntimeError::NotFound(format!("action not found: {id}")))
+}
+
+async fn action_remote_followups_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ActionRemoteFollowupsResponse>, RuntimeError> {
+    supervisor
+        .get_action_remote_followups(&id)
+        .await
+        .map_err(RuntimeError::Internal)?
+        .map(Json)
+        .ok_or_else(|| RuntimeError::NotFound(format!("action not found: {id}")))
+}
+
+async fn action_remote_followup_dispatch_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath((id, followup_id)): AxumPath<(String, String)>,
+    Json(request): Json<DispatchRemoteFollowupRequest>,
+) -> Result<Json<DispatchRemoteFollowupResponse>, RuntimeError> {
+    match supervisor
+        .dispatch_remote_followup(&id, &followup_id, request)
+        .await
+    {
+        Ok(response) => Ok(Json(response)),
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("not found") {
+                Err(RuntimeError::NotFound(message))
+            } else {
+                Err(RuntimeError::BadRequest(message))
+            }
+        }
+    }
 }
 
 async fn action_trace_handler(
@@ -12329,7 +12967,7 @@ EOF
                 ResolveReviewQueueItemRequest {
                     resolver_ref: "operator".to_string(),
                     resolution: "needs_followup".to_string(),
-                    note: None,
+                    note: Some("remote result still needs admissibility evidence".to_string()),
                 },
             )
             .await
@@ -12345,12 +12983,208 @@ EOF
             detail.remote_review_disposition,
             Some(RemoteReviewDisposition::NeedsFollowup)
         );
+        assert!(detail.pending_remote_review_ref.is_none());
+        let followups = supervisor
+            .get_action_remote_followups(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("remote followups");
+        assert_eq!(followups.followups.len(), 1);
+        assert_eq!(followups.followups[0].status, RemoteFollowupStatus::Open);
+        assert_eq!(
+            followups.followups[0].operator_note.as_deref(),
+            Some("remote result still needs admissibility evidence")
+        );
         let review_queue = supervisor.list_review_queue().await.unwrap();
-        assert!(review_queue.items.iter().any(|item| {
+        assert!(!review_queue.items.iter().any(|item| {
             item.action_id == submitted.action_id
                 && item.kind == ReviewQueueKind::RemoteResultReview
                 && item.status == ReviewQueueStatus::Open
         }));
+    }
+
+    #[tokio::test]
+    async fn dispatching_remote_followup_creates_fresh_attempt_on_same_action() {
+        let dir = tempdir().unwrap();
+        let a2a_url = spawn_runtime_a2a_server(RuntimeA2aMode::StreamingMissingTaskRef).await;
+        std::env::set_var("A2A_REMOTE_TOKEN", "remote-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace(
+            "preferred_harnesses = [\"claude_code\", \"codex\", \"a2a\", \"openclaw\"]",
+            "preferred_harnesses = [\"a2a\"]",
+        )
+        .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
+            .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Trigger remote follow-up redispatch on the same action",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let review_item = supervisor
+            .list_review_queue()
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| {
+                item.action_id == submitted.action_id
+                    && item.kind == ReviewQueueKind::RemoteResultReview
+                    && item.status == ReviewQueueStatus::Open
+            })
+            .expect("remote review item");
+        supervisor
+            .resolve_review_queue_item(
+                &review_item.id,
+                ResolveReviewQueueItemRequest {
+                    resolver_ref: "operator".to_string(),
+                    resolution: "needs_followup".to_string(),
+                    note: Some("request clearer remote evidence".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let followups = supervisor
+            .get_action_remote_followups(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("remote followups");
+        assert_eq!(followups.attempts.len(), 1);
+        let followup = followups
+            .followups
+            .iter()
+            .find(|followup| followup.status == RemoteFollowupStatus::Open)
+            .cloned()
+            .expect("open followup request");
+
+        supervisor
+            .dispatch_remote_followup(
+                &submitted.action_id,
+                &followup.id,
+                DispatchRemoteFollowupRequest {
+                    dispatcher_ref: "operator".to_string(),
+                    note: Some("retry with admissible evidence".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.action.id, submitted.action_id);
+        assert_eq!(detail.remote_attempt_count, 2);
+        assert!(detail.latest_remote_attempt_ref.is_some());
+
+        let followups = supervisor
+            .get_action_remote_followups(&submitted.action_id)
+            .await
+            .unwrap()
+            .expect("remote followups");
+        assert_eq!(followups.attempts.len(), 2);
+        assert!(followups
+            .attempts
+            .iter()
+            .any(|attempt| attempt.followup_request_ref.as_deref() == Some(followup.id.as_str())));
+        assert!(followups
+            .followups
+            .iter()
+            .any(|request| request.id == followup.id
+                && request.status == RemoteFollowupStatus::Closed));
+
+        let events = supervisor
+            .list_action_events(&submitted.action_id)
+            .await
+            .unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.event_type == "remote_followup_dispatched"));
+    }
+
+    #[tokio::test]
+    async fn federation_pack_can_disable_followup_dispatch() {
+        let dir = tempdir().unwrap();
+        let a2a_url = spawn_runtime_a2a_server(RuntimeA2aMode::StreamingMissingTaskRef).await;
+        std::env::set_var("A2A_REMOTE_TOKEN", "remote-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace(
+            "preferred_harnesses = [\"claude_code\", \"codex\", \"a2a\", \"openclaw\"]",
+            "preferred_harnesses = [\"a2a\"]",
+        )
+        .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
+            .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url)
+            .replace("followup_allowed = true", "followup_allowed = false");
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Trigger a remote follow-up and deny redispatch by pack policy",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let review_item = supervisor
+            .list_review_queue()
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| {
+                item.action_id == submitted.action_id
+                    && item.kind == ReviewQueueKind::RemoteResultReview
+                    && item.status == ReviewQueueStatus::Open
+            })
+            .expect("remote review item");
+        let error = supervisor
+            .resolve_review_queue_item(
+                &review_item.id,
+                ResolveReviewQueueItemRequest {
+                    resolver_ref: "operator".to_string(),
+                    resolution: "needs_followup".to_string(),
+                    note: Some("should be denied by federation pack".to_string()),
+                },
+            )
+            .await
+            .expect_err("follow-up resolution should be denied");
+        assert!(error
+            .to_string()
+            .contains("does not allow remote follow-up dispatch"));
     }
 
     #[tokio::test]
