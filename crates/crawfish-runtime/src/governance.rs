@@ -394,3 +394,248 @@ pub fn summarize_capabilities(manifest: &AgentManifest) -> Vec<CapabilityDescrip
         })
         .collect()
 }
+
+impl Supervisor {
+    pub(crate) fn authorize(
+        &self,
+        manifest: &AgentManifest,
+        request: &EncounterRequest,
+    ) -> EncounterDecision {
+        authorize_encounter(
+            &GovernanceContext {
+                system_defaults: self.config.governance.system_defaults.clone(),
+                owner_policy: neutral_policy(),
+                trust_domain_defaults: trust_domain_defaults(request.caller.trust_domain.clone()),
+                manifest_policy: owner_policy_for_manifest(manifest),
+            },
+            request,
+        )
+    }
+
+    pub(crate) async fn preflight_submission(
+        &self,
+        request: &SubmitActionRequest,
+    ) -> anyhow::Result<(
+        AgentManifest,
+        CompiledExecutionPlan,
+        EncounterRequest,
+        EncounterDecision,
+        bool,
+    )> {
+        let manifest = self
+            .store
+            .get_agent_manifest(&request.target_agent_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("agent not found: {}", request.target_agent_id))?;
+        self.validate_submit_action_request(&manifest, request)?;
+
+        let compiled = compile_execution_plan(
+            &self.config.contracts.org_defaults,
+            &manifest.contract_defaults,
+            &request.contract_overrides.clone().unwrap_or_default(),
+            &manifest.strategy_defaults,
+            &request.capability,
+            request.execution_strategy.clone(),
+        )
+        .map_err(|error| anyhow::anyhow!("invalid action request: {error}"))?;
+
+        let caller = request
+            .counterparty_refs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| CounterpartyRef {
+                agent_id: None,
+                session_id: Some("local".to_string()),
+                owner: request.initiator_owner.clone(),
+                trust_domain: TrustDomain::SameOwnerLocal,
+            });
+        let encounter_request = EncounterRequest {
+            caller,
+            target_agent_id: request.target_agent_id.clone(),
+            target_owner: manifest.owner.clone(),
+            requested_capabilities: vec![request.capability.clone()],
+            requests_workspace_write: request.workspace_write,
+            requests_secret_access: request.secret_access,
+            requests_mutating_capability: request.mutating,
+        };
+        let decision = self.authorize(&manifest, &encounter_request);
+        let requires_approval = self.action_requires_approval(
+            request,
+            &manifest,
+            &request.capability,
+            &compiled.contract.safety.approval_policy,
+        );
+
+        Ok((
+            manifest,
+            compiled,
+            encounter_request,
+            decision,
+            requires_approval,
+        ))
+    }
+
+    pub(crate) fn action_requires_approval(
+        &self,
+        request: &SubmitActionRequest,
+        manifest: &AgentManifest,
+        capability: &str,
+        approval_policy: &ApprovalPolicy,
+    ) -> bool {
+        if capability == "workspace.patch.apply" {
+            return true;
+        }
+
+        if request.workspace_write || request.secret_access || request.mutating {
+            return !matches!(approval_policy, ApprovalPolicy::None)
+                || matches!(
+                    manifest.workspace_policy.write_mode,
+                    crawfish_types::WorkspaceWriteMode::ApprovalGated
+                );
+        }
+
+        matches!(approval_policy, ApprovalPolicy::Always)
+    }
+
+    pub(crate) async fn create_encounter(
+        &self,
+        manifest: &AgentManifest,
+        request: &EncounterRequest,
+        _decision: &EncounterDecision,
+        state: EncounterState,
+    ) -> anyhow::Result<EncounterRecord> {
+        let encounter = EncounterRecord {
+            id: Uuid::new_v4().to_string(),
+            initiator_ref: request.caller.clone(),
+            target_agent_id: request.target_agent_id.clone(),
+            target_owner: manifest.owner.clone(),
+            trust_domain: request.caller.trust_domain.clone(),
+            requested_capabilities: request.requested_capabilities.clone(),
+            applied_policy_source: "system>owner>trust-domain>manifest".to_string(),
+            state,
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            created_at: now_timestamp(),
+        };
+        self.store.insert_encounter(&encounter).await?;
+        Ok(encounter)
+    }
+
+    pub(crate) async fn emit_audit_receipt(
+        &self,
+        encounter_ref: &str,
+        grant_refs: Vec<String>,
+        lease_ref: Option<String>,
+        outcome: AuditOutcome,
+        reason: String,
+        approver_ref: Option<String>,
+    ) -> anyhow::Result<AuditReceipt> {
+        let receipt = AuditReceipt {
+            id: Uuid::new_v4().to_string(),
+            encounter_ref: encounter_ref.to_string(),
+            grant_refs,
+            lease_ref,
+            outcome,
+            reason,
+            approver_ref,
+            emitted_at: now_timestamp(),
+        };
+        self.store.insert_audit_receipt(&receipt).await?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn approval_expiry_for_action(&self, action: &Action) -> String {
+        let base = action.created_at.parse::<u64>().unwrap_or_default();
+        let deadline = action.contract.delivery.deadline_ms.unwrap_or(900_000);
+        (base.saturating_add(deadline / 1000)).to_string()
+    }
+
+    pub(crate) async fn issue_grant_and_lease(
+        &self,
+        action: &Action,
+        manifest: &AgentManifest,
+        encounter: &mut EncounterRecord,
+        approver_ref: Option<String>,
+        reason: String,
+    ) -> anyhow::Result<(ConsentGrant, CapabilityLease, AuditReceipt)> {
+        let expires_at = self.approval_expiry_for_action(action);
+        let grant = ConsentGrant {
+            id: Uuid::new_v4().to_string(),
+            grantor: manifest.owner.clone(),
+            grantee: action.initiator_owner.clone(),
+            purpose: action.goal.summary.clone(),
+            scope: vec![action.capability.clone()],
+            issued_at: now_timestamp(),
+            expires_at: expires_at.clone(),
+            revocable: true,
+            approver_ref: approver_ref.clone(),
+        };
+        self.store.upsert_consent_grant(&grant).await?;
+
+        let lease = CapabilityLease {
+            id: Uuid::new_v4().to_string(),
+            grant_ref: grant.id.clone(),
+            lessor: manifest.owner.clone(),
+            lessee: action.initiator_owner.clone(),
+            capability_refs: vec![action.capability.clone()],
+            scope: if action.contract.safety.tool_scope.is_empty() {
+                vec![action.capability.clone()]
+            } else {
+                action.contract.safety.tool_scope.clone()
+            },
+            issued_at: now_timestamp(),
+            expires_at,
+            revocation_reason: None,
+            audit_receipt_ref: String::new(),
+        };
+        self.store.upsert_capability_lease(&lease).await?;
+
+        encounter.state = EncounterState::Leased;
+        encounter.grant_refs = vec![grant.id.clone()];
+        encounter.lease_ref = Some(lease.id.clone());
+        self.store.insert_encounter(encounter).await?;
+
+        let receipt = self
+            .emit_audit_receipt(
+                &encounter.id,
+                vec![grant.id.clone()],
+                Some(lease.id.clone()),
+                AuditOutcome::Allowed,
+                reason,
+                approver_ref,
+            )
+            .await?;
+
+        let mut persisted_lease = lease;
+        persisted_lease.audit_receipt_ref = receipt.id.clone();
+        self.store.upsert_capability_lease(&persisted_lease).await?;
+
+        Ok((grant, persisted_lease, receipt))
+    }
+
+    pub(crate) async fn ensure_pre_execution_lease_valid(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<()> {
+        let Some(lease_ref) = &action.lease_ref else {
+            if action.capability == "workspace.patch.apply" {
+                anyhow::bail!("mutation action requires an active capability lease");
+            }
+            return Ok(());
+        };
+        let lease = self
+            .store
+            .get_capability_lease(lease_ref)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("capability lease not found: {lease_ref}"))?;
+        if lease.revocation_reason.is_some() {
+            anyhow::bail!("capability lease {} has been revoked", lease.id);
+        }
+        let now = current_timestamp_seconds();
+        let expires_at = lease.expires_at.parse::<u64>().unwrap_or_default();
+        if expires_at > 0 && now >= expires_at {
+            anyhow::bail!("capability lease {} has expired", lease.id);
+        }
+        Ok(())
+    }
+}

@@ -932,3 +932,2232 @@ pub(crate) fn metadata_string_array(metadata: &crawfish_types::Metadata, key: &s
         .map(ToString::to_string)
         .collect()
 }
+
+impl Supervisor {
+    pub(crate) async fn write_checkpoint_for_action(
+        &self,
+        action: &mut Action,
+        checkpoint: &DeterministicCheckpoint,
+    ) -> anyhow::Result<()> {
+        let checkpoint_ref = checkpoint_ref_for_executor(&checkpoint.executor_kind);
+        let payload = serde_json::to_vec_pretty(checkpoint)?;
+        self.store
+            .put_checkpoint(&action.id, &checkpoint_ref, &payload)
+            .await?;
+        action.checkpoint_ref = Some(checkpoint_ref);
+        action.recovery_stage = Some(checkpoint.stage.clone());
+        self.store.upsert_action(action).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn load_deterministic_checkpoint(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<Option<DeterministicCheckpoint>> {
+        let Some(bytes) = self.store.get_checkpoint(&action.id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    pub(crate) async fn run_deterministic_executor<E>(
+        &self,
+        action: &mut Action,
+        executor_kind: &str,
+        running_stage: &str,
+        external_refs: Vec<ExternalRef>,
+        executor: &E,
+    ) -> anyhow::Result<ExecutionOutcome>
+    where
+        E: DeterministicExecutor,
+    {
+        let digest = input_digest(&action.inputs)?;
+        if let Some(checkpoint) = self.load_deterministic_checkpoint(action).await? {
+            if checkpoint.executor_kind == executor_kind
+                && checkpoint.input_digest == digest
+                && checkpoint.stage == "completed"
+                && artifact_refs_exist(&checkpoint.artifact_refs)
+            {
+                action.selected_executor = Some(executor_kind.to_string());
+                action.recovery_stage = Some(checkpoint.stage.clone());
+                action.external_refs = external_refs.clone();
+                return Ok(ExecutionOutcome::Completed {
+                    outputs: recovered_outputs_from_checkpoint(&checkpoint),
+                    selected_executor: executor_kind.to_string(),
+                    checkpoint: Some(checkpoint),
+                    external_refs,
+                    surface_events: Vec::new(),
+                });
+            }
+        }
+
+        let running_checkpoint =
+            build_checkpoint(action, executor_kind, running_stage, Vec::new())?;
+        self.write_checkpoint_for_action(action, &running_checkpoint)
+            .await?;
+        self.store
+            .append_action_event(
+                &action.id,
+                "checkpointed",
+                serde_json::json!({
+                    "stage": running_checkpoint.stage,
+                    "checkpoint_ref": action.checkpoint_ref,
+                }),
+            )
+            .await?;
+
+        let outputs = executor.execute(action).await?;
+        let completed_checkpoint = build_checkpoint(
+            action,
+            executor_kind,
+            "completed",
+            outputs.artifacts.clone(),
+        )?;
+
+        Ok(ExecutionOutcome::Completed {
+            outputs,
+            selected_executor: executor_kind.to_string(),
+            checkpoint: Some(completed_checkpoint),
+            external_refs,
+            surface_events: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn execute_task_plan(
+        &self,
+        action: &mut Action,
+        manifest: &AgentManifest,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        match action
+            .execution_strategy
+            .as_ref()
+            .map(|strategy| strategy.mode.clone())
+            .unwrap_or(ExecutionStrategyMode::SinglePass)
+        {
+            ExecutionStrategyMode::VerifyLoop => {
+                let strategy = action
+                    .execution_strategy
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("verify_loop requires an execution strategy"))?;
+                self.execute_task_plan_verify_loop(action, manifest, &strategy)
+                    .await
+            }
+            ExecutionStrategyMode::SinglePass => {
+                self.execute_task_plan_single_pass(action, manifest).await
+            }
+        }
+    }
+
+    pub(crate) async fn execute_task_plan_verify_loop(
+        &self,
+        action: &mut Action,
+        manifest: &AgentManifest,
+        strategy: &ExecutionStrategy,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        if strategy
+            .verification_spec
+            .as_ref()
+            .map(|spec| !spec.checks.is_empty())
+            .unwrap_or(false)
+        {
+            return Ok(ExecutionOutcome::Failed {
+                reason: "task.plan verify_loop only supports built-in verification checks in alpha"
+                    .to_string(),
+                failure_code: failure_code_verification_spec_invalid().to_string(),
+                outputs: ActionOutputs::default(),
+                checkpoint: None,
+                external_refs: Vec::new(),
+                surface_events: Vec::new(),
+            });
+        }
+
+        let max_iterations = strategy
+            .stop_budget
+            .as_ref()
+            .map(|budget| budget.max_iterations)
+            .unwrap_or(3)
+            .max(1);
+        let on_failure = strategy
+            .verification_spec
+            .as_ref()
+            .map(|spec| spec.on_failure.clone())
+            .unwrap_or(VerifyLoopFailureMode::RetryWithFeedback);
+
+        let mut start_iteration = 1;
+        let mut carried_feedback = None;
+        let mut previous_artifact_refs = Vec::new();
+        let mut aggregated_external_refs = action.external_refs.clone();
+
+        if let Some(checkpoint) = self.load_deterministic_checkpoint(action).await? {
+            if let Some(strategy_state) = checkpoint.strategy_state.clone() {
+                aggregated_external_refs =
+                    merge_external_refs(aggregated_external_refs, action.external_refs.clone());
+                match (
+                    checkpoint.stage.as_str(),
+                    strategy_state
+                        .verification_summary
+                        .as_ref()
+                        .map(|summary| summary.status.clone()),
+                ) {
+                    ("completed", Some(VerificationStatus::Passed))
+                        if artifact_refs_exist(&checkpoint.artifact_refs) =>
+                    {
+                        action.selected_executor = Some(checkpoint.executor_kind.clone());
+                        action.recovery_stage = Some(checkpoint.stage.clone());
+                        action.external_refs = aggregated_external_refs.clone();
+                        return Ok(ExecutionOutcome::Completed {
+                            outputs: recovered_outputs_from_checkpoint(&checkpoint),
+                            selected_executor: checkpoint.executor_kind.clone(),
+                            checkpoint: Some(checkpoint),
+                            external_refs: aggregated_external_refs,
+                            surface_events: Vec::new(),
+                        });
+                    }
+                    ("completed", Some(VerificationStatus::Failed)) => {
+                        start_iteration = strategy_state.iteration.saturating_add(1);
+                        carried_feedback = strategy_state.verification_feedback.clone();
+                        previous_artifact_refs = merge_artifact_refs(
+                            strategy_state.previous_artifact_refs.clone(),
+                            checkpoint.artifact_refs.clone(),
+                        );
+                    }
+                    ("verification_failed", Some(VerificationStatus::Failed)) => {
+                        start_iteration = strategy_state.iteration.saturating_add(1);
+                        carried_feedback = strategy_state.verification_feedback.clone();
+                        previous_artifact_refs = merge_artifact_refs(
+                            strategy_state.previous_artifact_refs.clone(),
+                            checkpoint.artifact_refs.clone(),
+                        );
+                    }
+                    ("planning", _) | ("completed", None) => {
+                        start_iteration = strategy_state.iteration.max(1);
+                        carried_feedback = strategy_state.verification_feedback.clone();
+                        previous_artifact_refs = merge_artifact_refs(
+                            strategy_state.previous_artifact_refs.clone(),
+                            checkpoint.artifact_refs.clone(),
+                        );
+                    }
+                    (
+                        "verification_budget_exhausted",
+                        Some(VerificationStatus::BudgetExhausted),
+                    ) => {
+                        start_iteration = strategy_state.iteration.saturating_add(1);
+                        carried_feedback = strategy_state.verification_feedback.clone();
+                        previous_artifact_refs = merge_artifact_refs(
+                            strategy_state.previous_artifact_refs.clone(),
+                            checkpoint.artifact_refs.clone(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if start_iteration > max_iterations {
+            let summary = VerificationSummary {
+                status: VerificationStatus::BudgetExhausted,
+                iterations_completed: max_iterations,
+                last_feedback: carried_feedback.clone(),
+                last_failure_code: Some(failure_code_verification_budget_exhausted().to_string()),
+            };
+            let mut outputs = ActionOutputs {
+                summary: Some(
+                    "Verification budget exhausted before a fresh iteration could start"
+                        .to_string(),
+                ),
+                artifacts: previous_artifact_refs.clone(),
+                ..ActionOutputs::default()
+            };
+            outputs.metadata.insert(
+                "strategy_mode".to_string(),
+                serde_json::json!("verify_loop"),
+            );
+            outputs.metadata.insert(
+                "verification_summary".to_string(),
+                serde_json::to_value(&summary)?,
+            );
+            let mut checkpoint = build_checkpoint(
+                action,
+                action
+                    .selected_executor
+                    .as_deref()
+                    .unwrap_or("verify_loop.task_plan"),
+                "verification_budget_exhausted",
+                previous_artifact_refs,
+            )?;
+            checkpoint.strategy_state = Some(StrategyCheckpointState {
+                mode: ExecutionStrategyMode::VerifyLoop,
+                iteration: max_iterations,
+                verification_feedback: carried_feedback.clone(),
+                previous_artifact_refs: Vec::new(),
+                verification_summary: Some(summary),
+            });
+            return Ok(ExecutionOutcome::Failed {
+                reason: carried_feedback
+                    .unwrap_or_else(|| "task.plan exhausted its verification budget".to_string()),
+                failure_code: failure_code_verification_budget_exhausted().to_string(),
+                outputs,
+                checkpoint: Some(checkpoint),
+                external_refs: aggregated_external_refs,
+                surface_events: Vec::new(),
+            });
+        }
+
+        for iteration in start_iteration..=max_iterations {
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "verify_loop_iteration_started",
+                    serde_json::json!({
+                        "iteration": iteration,
+                        "max_iterations": max_iterations,
+                        "strategy_mode": "verify_loop",
+                        "feedback_present": carried_feedback.is_some(),
+                    }),
+                )
+                .await?;
+
+            let mut iteration_action = action.clone();
+            if let Some(feedback) = &carried_feedback {
+                iteration_action.inputs.insert(
+                    "verification_feedback".to_string(),
+                    serde_json::json!(feedback),
+                );
+            } else {
+                iteration_action.inputs.remove("verification_feedback");
+            }
+
+            let outcome = self
+                .execute_task_plan_single_pass(&mut iteration_action, manifest)
+                .await?;
+
+            match outcome {
+                ExecutionOutcome::Completed {
+                    mut outputs,
+                    selected_executor,
+                    checkpoint,
+                    external_refs,
+                    surface_events,
+                } => {
+                    aggregated_external_refs =
+                        merge_external_refs(aggregated_external_refs, external_refs);
+                    for event in surface_events {
+                        self.store
+                            .append_action_event(&action.id, &event.event_type, event.payload)
+                            .await?;
+                    }
+
+                    let verification = verify_task_plan_outputs(
+                        &iteration_action,
+                        &outputs,
+                        iteration,
+                        &strategy.feedback_policy,
+                    )
+                    .await?;
+                    let mut checkpoint = checkpoint.unwrap_or(build_checkpoint(
+                        &iteration_action,
+                        &selected_executor,
+                        "completed",
+                        outputs.artifacts.clone(),
+                    )?);
+
+                    checkpoint.stage = if verification.passed {
+                        "completed".to_string()
+                    } else {
+                        "verification_failed".to_string()
+                    };
+                    checkpoint.strategy_state = Some(StrategyCheckpointState {
+                        mode: ExecutionStrategyMode::VerifyLoop,
+                        iteration,
+                        verification_feedback: verification.feedback.clone(),
+                        previous_artifact_refs: previous_artifact_refs.clone(),
+                        verification_summary: Some(verification.summary.clone()),
+                    });
+                    self.write_checkpoint_for_action(action, &checkpoint)
+                        .await?;
+
+                    self.store
+                        .append_action_event(
+                            &action.id,
+                            "verify_loop_iteration_completed",
+                            serde_json::json!({
+                                "iteration": iteration,
+                                "selected_executor": selected_executor,
+                                "status": if verification.passed { "passed" } else { "failed" },
+                            }),
+                        )
+                        .await?;
+
+                    if verification.passed {
+                        self.record_verification_evaluation(
+                            action,
+                            iteration,
+                            &verification.summary,
+                            verification.feedback.as_ref(),
+                        )
+                        .await?;
+                        self.store
+                            .append_action_event(
+                                &action.id,
+                                "verification_passed",
+                                serde_json::json!({
+                                    "iteration": iteration,
+                                    "summary": verification.summary.clone(),
+                                }),
+                            )
+                            .await?;
+                        outputs.metadata.insert(
+                            "strategy_mode".to_string(),
+                            serde_json::json!("verify_loop"),
+                        );
+                        outputs.metadata.insert(
+                            "strategy_iteration".to_string(),
+                            serde_json::json!(iteration),
+                        );
+                        outputs.metadata.insert(
+                            "verification_summary".to_string(),
+                            serde_json::to_value(
+                                checkpoint
+                                    .strategy_state
+                                    .as_ref()
+                                    .and_then(|state| state.verification_summary.clone())
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("missing verification summary")
+                                    })?,
+                            )?,
+                        );
+                        return Ok(ExecutionOutcome::Completed {
+                            outputs,
+                            selected_executor,
+                            checkpoint: Some(checkpoint),
+                            external_refs: aggregated_external_refs,
+                            surface_events: Vec::new(),
+                        });
+                    }
+
+                    self.store
+                        .append_action_event(
+                            &action.id,
+                            "verification_failed",
+                            serde_json::json!({
+                                "iteration": iteration,
+                                "summary": verification.summary.clone(),
+                                "feedback": verification.feedback.clone(),
+                            }),
+                        )
+                        .await?;
+                    self.record_verification_evaluation(
+                        action,
+                        iteration,
+                        &verification.summary,
+                        verification.feedback.as_ref(),
+                    )
+                    .await?;
+
+                    previous_artifact_refs =
+                        merge_artifact_refs(previous_artifact_refs, outputs.artifacts.clone());
+                    carried_feedback = verification.feedback.clone();
+
+                    match on_failure {
+                        VerifyLoopFailureMode::RetryWithFeedback if iteration < max_iterations => {
+                            continue;
+                        }
+                        VerifyLoopFailureMode::HumanHandoff => {
+                            return Ok(ExecutionOutcome::Blocked {
+                                reason: carried_feedback.clone().unwrap_or_else(|| {
+                                    "task.plan requires human handoff after verification failed"
+                                        .to_string()
+                                }),
+                                failure_code: failure_code_verification_failed().to_string(),
+                                continuity_mode: Some(ContinuityModeName::HumanHandoff),
+                                outputs,
+                                external_refs: aggregated_external_refs,
+                                surface_events: Vec::new(),
+                            });
+                        }
+                        VerifyLoopFailureMode::Fail => {
+                            outputs.metadata.insert(
+                                "strategy_mode".to_string(),
+                                serde_json::json!("verify_loop"),
+                            );
+                            outputs.metadata.insert(
+                                "strategy_iteration".to_string(),
+                                serde_json::json!(iteration),
+                            );
+                            outputs.metadata.insert(
+                                "verification_summary".to_string(),
+                                serde_json::to_value(
+                                    checkpoint
+                                        .strategy_state
+                                        .as_ref()
+                                        .and_then(|state| state.verification_summary.clone())
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!("missing verification summary")
+                                        })?,
+                                )?,
+                            );
+                            return Ok(ExecutionOutcome::Failed {
+                                reason: carried_feedback.clone().unwrap_or_else(|| {
+                                    "task.plan failed deterministic verification".to_string()
+                                }),
+                                failure_code: failure_code_verification_failed().to_string(),
+                                outputs,
+                                checkpoint: Some(checkpoint),
+                                external_refs: aggregated_external_refs,
+                                surface_events: Vec::new(),
+                            });
+                        }
+                        VerifyLoopFailureMode::RetryWithFeedback => {}
+                    }
+                }
+                ExecutionOutcome::Blocked {
+                    reason,
+                    failure_code,
+                    continuity_mode,
+                    outputs,
+                    external_refs,
+                    surface_events,
+                } => {
+                    return Ok(ExecutionOutcome::Blocked {
+                        reason,
+                        failure_code,
+                        continuity_mode,
+                        outputs,
+                        external_refs: merge_external_refs(aggregated_external_refs, external_refs),
+                        surface_events,
+                    });
+                }
+                ExecutionOutcome::Failed {
+                    reason,
+                    failure_code,
+                    outputs,
+                    checkpoint,
+                    external_refs,
+                    surface_events,
+                } => {
+                    return Ok(ExecutionOutcome::Failed {
+                        reason,
+                        failure_code,
+                        outputs,
+                        checkpoint,
+                        external_refs: merge_external_refs(aggregated_external_refs, external_refs),
+                        surface_events,
+                    });
+                }
+            }
+        }
+
+        let summary = VerificationSummary {
+            status: VerificationStatus::BudgetExhausted,
+            iterations_completed: max_iterations,
+            last_feedback: carried_feedback.clone(),
+            last_failure_code: Some(failure_code_verification_budget_exhausted().to_string()),
+        };
+        self.store
+            .append_action_event(
+                &action.id,
+                "verification_budget_exhausted",
+                serde_json::json!({
+                    "iterations_completed": max_iterations,
+                    "summary": summary,
+                }),
+            )
+            .await?;
+        self.record_verification_evaluation(
+            action,
+            max_iterations,
+            &summary,
+            carried_feedback.as_ref(),
+        )
+        .await?;
+        let mut outputs = ActionOutputs {
+            summary: Some("task.plan exhausted its verification budget".to_string()),
+            artifacts: previous_artifact_refs.clone(),
+            ..ActionOutputs::default()
+        };
+        outputs.metadata.insert(
+            "strategy_mode".to_string(),
+            serde_json::json!("verify_loop"),
+        );
+        outputs.metadata.insert(
+            "strategy_iteration".to_string(),
+            serde_json::json!(max_iterations),
+        );
+        outputs.metadata.insert(
+            "verification_summary".to_string(),
+            serde_json::to_value(&summary)?,
+        );
+        let mut checkpoint = build_checkpoint(
+            action,
+            action
+                .selected_executor
+                .as_deref()
+                .unwrap_or("verify_loop.task_plan"),
+            "verification_budget_exhausted",
+            previous_artifact_refs,
+        )?;
+        checkpoint.strategy_state = Some(StrategyCheckpointState {
+            mode: ExecutionStrategyMode::VerifyLoop,
+            iteration: max_iterations,
+            verification_feedback: carried_feedback.clone(),
+            previous_artifact_refs: Vec::new(),
+            verification_summary: Some(summary),
+        });
+        Ok(ExecutionOutcome::Failed {
+            reason: carried_feedback
+                .unwrap_or_else(|| "task.plan exhausted its verification budget".to_string()),
+            failure_code: failure_code_verification_budget_exhausted().to_string(),
+            outputs,
+            checkpoint: Some(checkpoint),
+            external_refs: aggregated_external_refs,
+            surface_events: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn execute_task_plan_single_pass(
+        &self,
+        action: &mut Action,
+        manifest: &AgentManifest,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        let has_active_followup = active_remote_followup_ref_for_action(action).is_some();
+        let deterministic_fallback = !has_active_followup
+            && action
+                .contract
+                .execution
+                .fallback_chain
+                .iter()
+                .any(|route| route == "deterministic");
+        let mut attempted_agentic_route = false;
+        let mut last_reason: Option<String> = None;
+        let mut last_external_refs = Vec::new();
+        let preferred_routes = if has_active_followup {
+            vec!["a2a".to_string()]
+        } else {
+            action.contract.execution.preferred_harnesses.clone()
+        };
+
+        for route in preferred_routes {
+            match route.as_str() {
+                "claude_code" | "codex" => {
+                    attempted_agentic_route = true;
+                    let harness = if route == "claude_code" {
+                        LocalHarnessKind::ClaudeCode
+                    } else {
+                        LocalHarnessKind::Codex
+                    };
+                    match self.resolve_local_harness_adapter(manifest, harness)? {
+                        Some((adapter, base_refs)) => {
+                            if adapter.binding().lease_required {
+                                self.ensure_required_lease_valid(action, &base_refs).await?;
+                            }
+                            match adapter.run(action).await {
+                                Ok(result) => {
+                                    return Ok(ExecutionOutcome::Completed {
+                                        outputs: result.outputs,
+                                        selected_executor: format!(
+                                            "local_harness.{}",
+                                            adapter.name()
+                                        ),
+                                        checkpoint: None,
+                                        external_refs: merge_external_refs(
+                                            base_refs,
+                                            result.external_refs,
+                                        ),
+                                        surface_events: result.events,
+                                    });
+                                }
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": route,
+                                                "reason": reason,
+                                                "code": local_harness_failure_code(&error),
+                                                "fallback": next_fallback_label(deterministic_fallback, "deterministic"),
+                                            }),
+                                        )
+                                        .await?;
+                                    last_reason = Some(error.to_string());
+                                    last_external_refs = base_refs;
+                                }
+                            }
+                        }
+                        None => {
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": route,
+                                        "reason": format!("no local harness binding is configured for {route}"),
+                                        "code": failure_code_route_unavailable(),
+                                        "fallback": next_fallback_label(deterministic_fallback, "deterministic"),
+                                    }),
+                                )
+                                .await?;
+                        }
+                    }
+                }
+                "a2a" => {
+                    attempted_agentic_route = true;
+                    match self.resolve_a2a_adapter(manifest) {
+                        Ok(Some((adapter, mut base_refs))) => {
+                            let treaty_decision = match self.compile_treaty_decision(
+                                action,
+                                adapter.binding(),
+                                adapter.treaty_pack(),
+                            ) {
+                                Ok(decision) => decision,
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "a2a",
+                                                "reason": reason,
+                                                "code": failure_code_treaty_denied(),
+                                                "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                            }),
+                                        )
+                                        .await?;
+                                    self.store
+                                        .insert_policy_incident(&PolicyIncident {
+                                            id: Uuid::new_v4().to_string(),
+                                            action_id: action.id.clone(),
+                                            doctrine_pack_id: "swarm_frontier_v1".to_string(),
+                                            jurisdiction: JurisdictionClass::ExternalUnknown,
+                                            reason_code: "treaty_denied".to_string(),
+                                            summary: reason.clone(),
+                                            severity: PolicyIncidentSeverity::Critical,
+                                            checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                            created_at: now_timestamp(),
+                                        })
+                                        .await?;
+                                    last_reason = Some(reason);
+                                    last_external_refs = base_refs;
+                                    continue;
+                                }
+                            };
+                            let federation_pack = match self
+                                .resolve_federation_pack(adapter.binding(), adapter.treaty_pack())
+                            {
+                                Ok(pack) => pack,
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "a2a",
+                                                "reason": reason,
+                                                "code": "frontier_enforcement_gap",
+                                                "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                            }),
+                                        )
+                                        .await?;
+                                    self.store
+                                        .insert_policy_incident(&PolicyIncident {
+                                            id: Uuid::new_v4().to_string(),
+                                            action_id: action.id.clone(),
+                                            doctrine_pack_id: "remote_agent_treaty_v1".to_string(),
+                                            jurisdiction: JurisdictionClass::ExternalUnknown,
+                                            reason_code: "frontier_enforcement_gap".to_string(),
+                                            summary: reason.clone(),
+                                            severity: PolicyIncidentSeverity::Critical,
+                                            checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                            created_at: now_timestamp(),
+                                        })
+                                        .await?;
+                                    last_reason = Some(reason);
+                                    last_external_refs = base_refs;
+                                    continue;
+                                }
+                            };
+                            let federation_decision = match self.compile_federation_decision(
+                                action,
+                                &treaty_decision,
+                                &federation_pack,
+                            ) {
+                                Ok(decision) => decision,
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "a2a",
+                                                "reason": reason,
+                                                "code": "frontier_enforcement_gap",
+                                                "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                            }),
+                                        )
+                                        .await?;
+                                    self.store
+                                        .insert_policy_incident(&PolicyIncident {
+                                            id: Uuid::new_v4().to_string(),
+                                            action_id: action.id.clone(),
+                                            doctrine_pack_id: "remote_agent_treaty_v1".to_string(),
+                                            jurisdiction: JurisdictionClass::ExternalUnknown,
+                                            reason_code: "frontier_enforcement_gap".to_string(),
+                                            summary: reason.clone(),
+                                            severity: PolicyIncidentSeverity::Critical,
+                                            checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                            created_at: now_timestamp(),
+                                        })
+                                        .await?;
+                                    last_reason = Some(reason);
+                                    last_external_refs = base_refs;
+                                    continue;
+                                }
+                            };
+                            let mut receipt = crawfish_types::DelegationReceipt {
+                                id: Uuid::new_v4().to_string(),
+                                action_id: action.id.clone(),
+                                treaty_pack_id: treaty_decision.treaty_pack_id.clone(),
+                                remote_principal: treaty_decision.remote_principal.clone(),
+                                capability: action.capability.clone(),
+                                requested_scopes: treaty_decision.requested_scopes.clone(),
+                                delegated_data_scopes: treaty_decision
+                                    .delegated_data_scopes
+                                    .clone(),
+                                decision: crawfish_types::DelegationDecision::Allowed,
+                                remote_agent_card_url: adapter.binding().agent_card_url.clone(),
+                                remote_task_ref: None,
+                                delegation_depth: Some(treaty_decision.delegation_depth),
+                                created_at: now_timestamp(),
+                            };
+                            self.store.insert_delegation_receipt(&receipt).await?;
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.treaty_pack".to_string(),
+                                value: adapter.treaty_pack().id.clone(),
+                                endpoint: None,
+                            });
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.delegation_receipt".to_string(),
+                                value: receipt.id.clone(),
+                                endpoint: None,
+                            });
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.delegation_depth".to_string(),
+                                value: treaty_decision.delegation_depth.to_string(),
+                                endpoint: None,
+                            });
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.federation_pack".to_string(),
+                                value: federation_pack.id.clone(),
+                                endpoint: None,
+                            });
+                            let followup_request_ref =
+                                active_remote_followup_ref_for_action(action);
+                            let attempt_created_at = now_timestamp();
+                            let mut attempt_record = RemoteAttemptRecord {
+                                id: Uuid::new_v4().to_string(),
+                                action_id: action.id.clone(),
+                                attempt: self
+                                    .store
+                                    .list_remote_attempt_records(&action.id)
+                                    .await?
+                                    .len() as u32
+                                    + 1,
+                                capability: action.capability.clone(),
+                                interaction_model: Some(
+                                    crawfish_types::InteractionModel::RemoteAgent,
+                                ),
+                                executor: Some("a2a".to_string()),
+                                remote_principal: Some(treaty_decision.remote_principal.clone()),
+                                treaty_pack_id: Some(treaty_decision.treaty_pack_id.clone()),
+                                federation_pack_id: Some(federation_pack.id.clone()),
+                                remote_task_ref: None,
+                                remote_evidence_ref: None,
+                                followup_request_ref: followup_request_ref.clone(),
+                                created_at: attempt_created_at,
+                                completed_at: None,
+                            };
+                            self.store
+                                .upsert_remote_attempt_record(&attempt_record)
+                                .await?;
+                            base_refs.push(ExternalRef {
+                                kind: "a2a.remote_attempt".to_string(),
+                                value: attempt_record.id.clone(),
+                                endpoint: None,
+                            });
+                            match adapter.run(action).await {
+                                Ok(mut result) => {
+                                    let merged_external_refs =
+                                        merge_external_refs(base_refs, result.external_refs);
+                                    attempt_record.remote_task_ref =
+                                        external_ref_value(&merged_external_refs, "a2a.task_id");
+                                    attempt_record.completed_at = Some(now_timestamp());
+                                    self.store
+                                        .upsert_remote_attempt_record(&attempt_record)
+                                        .await?;
+                                    receipt.remote_task_ref =
+                                        external_ref_value(&merged_external_refs, "a2a.task_id");
+                                    self.store.insert_delegation_receipt(&receipt).await?;
+                                    match result
+                                        .outputs
+                                        .metadata
+                                        .get("a2a_remote_state")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("completed")
+                                    {
+                                        "blocked" => {
+                                            let mut decision = federation_decision.clone();
+                                            decision.remote_state_disposition =
+                                                Some(federation_pack.blocked_remote_policy.clone());
+                                            let mut outputs = result.outputs;
+                                            set_federation_result_metadata(
+                                                &mut outputs,
+                                                &decision,
+                                                None,
+                                                decision.remote_state_disposition.as_ref(),
+                                                None,
+                                            );
+                                            let mut surface_events = result.events;
+                                            surface_events.push(
+                                                crawfish_core::SurfaceActionEvent {
+                                                    event_type: "federation_state_escalated"
+                                                        .to_string(),
+                                                    payload: serde_json::json!({
+                                                        "timestamp": now_timestamp(),
+                                                        "federation_pack_id": federation_pack.id.clone(),
+                                                        "remote_state": "input-required",
+                                                        "disposition": runtime_enum_to_snake(
+                                                            decision
+                                                                .remote_state_disposition
+                                                                .as_ref()
+                                                                .expect("remote state disposition"),
+                                                        ),
+                                                    }),
+                                                },
+                                            );
+                                            let reason =
+                                                outputs.summary.clone().unwrap_or_else(|| {
+                                                    "remote A2A agent requested additional input"
+                                                        .to_string()
+                                                });
+                                            return match decision
+                                                .remote_state_disposition
+                                                .clone()
+                                                .unwrap_or(RemoteStateDisposition::Blocked)
+                                            {
+                                                RemoteStateDisposition::Blocked => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_input_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::AwaitingApproval => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_auth_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Failed => {
+                                                    Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: "remote_state_escalated"
+                                                            .to_string(),
+                                                        outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Running => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_input_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                            };
+                                        }
+                                        "awaiting_approval" => {
+                                            let mut decision = federation_decision.clone();
+                                            decision.remote_state_disposition =
+                                                Some(federation_pack.auth_required_policy.clone());
+                                            let mut outputs = result.outputs;
+                                            set_federation_result_metadata(
+                                                &mut outputs,
+                                                &decision,
+                                                None,
+                                                decision.remote_state_disposition.as_ref(),
+                                                None,
+                                            );
+                                            let mut surface_events = result.events;
+                                            surface_events.push(
+                                                crawfish_core::SurfaceActionEvent {
+                                                    event_type: "federation_state_escalated"
+                                                        .to_string(),
+                                                    payload: serde_json::json!({
+                                                        "timestamp": now_timestamp(),
+                                                        "federation_pack_id": federation_pack.id.clone(),
+                                                        "remote_state": "auth-required",
+                                                        "disposition": runtime_enum_to_snake(
+                                                            decision
+                                                                .remote_state_disposition
+                                                                .as_ref()
+                                                                .expect("remote state disposition"),
+                                                        ),
+                                                    }),
+                                                },
+                                            );
+                                            let reason =
+                                                outputs.summary.clone().unwrap_or_else(|| {
+                                                    "remote A2A agent requested authorization"
+                                                        .to_string()
+                                                });
+                                            return match decision
+                                                .remote_state_disposition
+                                                .clone()
+                                                .unwrap_or(RemoteStateDisposition::AwaitingApproval)
+                                            {
+                                                RemoteStateDisposition::AwaitingApproval => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_auth_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Blocked => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_input_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Failed => {
+                                                    Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: "remote_state_escalated"
+                                                            .to_string(),
+                                                        outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Running => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_auth_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                            };
+                                        }
+                                        "failed" => {
+                                            let mut decision = federation_decision.clone();
+                                            decision.remote_state_disposition =
+                                                Some(federation_pack.remote_failure_policy.clone());
+                                            let mut outputs = result.outputs;
+                                            set_federation_result_metadata(
+                                                &mut outputs,
+                                                &decision,
+                                                None,
+                                                decision.remote_state_disposition.as_ref(),
+                                                None,
+                                            );
+                                            let mut surface_events = result.events;
+                                            surface_events.push(
+                                                crawfish_core::SurfaceActionEvent {
+                                                    event_type: "federation_state_escalated"
+                                                        .to_string(),
+                                                    payload: serde_json::json!({
+                                                        "timestamp": now_timestamp(),
+                                                        "federation_pack_id": federation_pack.id.clone(),
+                                                        "remote_state": "failed",
+                                                        "disposition": runtime_enum_to_snake(
+                                                            decision
+                                                                .remote_state_disposition
+                                                                .as_ref()
+                                                                .expect("remote state disposition"),
+                                                        ),
+                                                    }),
+                                                },
+                                            );
+                                            let reason =
+                                                outputs.summary.clone().unwrap_or_else(|| {
+                                                    "remote A2A task failed".to_string()
+                                                });
+                                            return match decision
+                                                .remote_state_disposition
+                                                .clone()
+                                                .unwrap_or(RemoteStateDisposition::Failed)
+                                            {
+                                                RemoteStateDisposition::Failed => {
+                                                    Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: failure_code_a2a_task_failed(
+                                                        )
+                                                        .to_string(),
+                                                        outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Blocked => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_input_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::AwaitingApproval => {
+                                                    Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: "a2a_auth_required"
+                                                            .to_string(),
+                                                        continuity_mode: None,
+                                                        outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                                RemoteStateDisposition::Running => {
+                                                    Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: failure_code_a2a_task_failed(
+                                                        )
+                                                        .to_string(),
+                                                        outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    })
+                                                }
+                                            };
+                                        }
+                                        _ => {
+                                            let (disposition, evidence_status, violations) = self
+                                                .evaluate_federation_post_result(
+                                                    &result.outputs,
+                                                    &receipt,
+                                                    &treaty_decision,
+                                                    adapter.treaty_pack(),
+                                                    &federation_pack,
+                                                );
+                                            let mut decision = federation_decision.clone();
+                                            decision.remote_evidence_status =
+                                                Some(evidence_status.clone());
+                                            decision.remote_result_acceptance = Some(match disposition {
+                                                crawfish_types::RemoteOutcomeDisposition::Accepted => {
+                                                    RemoteResultAcceptance::Accepted
+                                                }
+                                                crawfish_types::RemoteOutcomeDisposition::ReviewRequired => {
+                                                    RemoteResultAcceptance::ReviewRequired
+                                                }
+                                                crawfish_types::RemoteOutcomeDisposition::Rejected => {
+                                                    RemoteResultAcceptance::Rejected
+                                                }
+                                            });
+                                            set_treaty_result_metadata(
+                                                &mut result.outputs,
+                                                &disposition,
+                                                &violations,
+                                            );
+                                            set_federation_result_metadata(
+                                                &mut result.outputs,
+                                                &decision,
+                                                Some(&evidence_status),
+                                                None,
+                                                decision.remote_result_acceptance.as_ref(),
+                                            );
+                                            let mut surface_events = result.events.clone();
+                                            surface_events.push(crawfish_core::SurfaceActionEvent {
+                                                event_type: "treaty_post_result_assessed".to_string(),
+                                                payload: serde_json::json!({
+                                                    "timestamp": now_timestamp(),
+                                                    "disposition": runtime_enum_to_snake(&disposition),
+                                                    "violation_count": violations.len(),
+                                                    "treaty_pack_id": treaty_decision.treaty_pack_id,
+                                                }),
+                                            });
+                                            surface_events.push(crawfish_core::SurfaceActionEvent {
+                                                event_type: "federation_post_result_assessed".to_string(),
+                                                payload: serde_json::json!({
+                                                    "timestamp": now_timestamp(),
+                                                    "federation_pack_id": federation_pack.id.clone(),
+                                                    "remote_evidence_status": runtime_enum_to_snake(&evidence_status),
+                                                    "remote_result_acceptance": runtime_enum_to_snake(
+                                                        decision
+                                                            .remote_result_acceptance
+                                                            .as_ref()
+                                                            .expect("remote result acceptance"),
+                                                    ),
+                                                    "violation_count": violations.len(),
+                                                }),
+                                            });
+                                            match disposition {
+                                                crawfish_types::RemoteOutcomeDisposition::Accepted => {
+                                                    return Ok(ExecutionOutcome::Completed {
+                                                        outputs: result.outputs,
+                                                        selected_executor: format!(
+                                                            "a2a.{}",
+                                                            adapter.name()
+                                                        ),
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    });
+                                                }
+                                                crawfish_types::RemoteOutcomeDisposition::ReviewRequired => {
+                                                    let reason = violations
+                                                        .first()
+                                                        .map(|violation| violation.summary.clone())
+                                                        .unwrap_or_else(|| {
+                                                            "remote result requires treaty review before acceptance".to_string()
+                                                        });
+                                                    let code = violations
+                                                        .first()
+                                                        .map(|violation| violation.code.clone())
+                                                        .unwrap_or_else(|| {
+                                                            "frontier_enforcement_gap".to_string()
+                                                        });
+                                                    return Ok(ExecutionOutcome::Blocked {
+                                                        reason,
+                                                        failure_code: code,
+                                                        continuity_mode: None,
+                                                        outputs: result.outputs,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    });
+                                                }
+                                                crawfish_types::RemoteOutcomeDisposition::Rejected => {
+                                                    let reason = violations
+                                                        .first()
+                                                        .map(|violation| violation.summary.clone())
+                                                        .unwrap_or_else(|| {
+                                                            "remote result was rejected by treaty governance".to_string()
+                                                        });
+                                                    let code = violations
+                                                        .first()
+                                                        .map(|violation| violation.code.clone())
+                                                        .unwrap_or_else(|| "treaty_scope_violation".to_string());
+                                                    return Ok(ExecutionOutcome::Failed {
+                                                        reason,
+                                                        failure_code: code,
+                                                        outputs: result.outputs,
+                                                        checkpoint: None,
+                                                        external_refs: merged_external_refs,
+                                                        surface_events,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    let code = a2a_failure_code(&error);
+                                    attempt_record.remote_task_ref =
+                                        external_ref_value(&base_refs, "a2a.task_id");
+                                    attempt_record.completed_at = Some(now_timestamp());
+                                    self.store
+                                        .upsert_remote_attempt_record(&attempt_record)
+                                        .await?;
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "a2a",
+                                                "reason": reason,
+                                                "code": code,
+                                                "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                            }),
+                                        )
+                                        .await?;
+                                    if code == failure_code_treaty_denied() {
+                                        self.store
+                                            .insert_policy_incident(&PolicyIncident {
+                                                id: Uuid::new_v4().to_string(),
+                                                action_id: action.id.clone(),
+                                                doctrine_pack_id: "swarm_frontier_v1".to_string(),
+                                                jurisdiction: JurisdictionClass::ExternalUnknown,
+                                                reason_code: "treaty_denied".to_string(),
+                                                summary: error.to_string(),
+                                                severity: PolicyIncidentSeverity::Critical,
+                                                checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                                created_at: now_timestamp(),
+                                            })
+                                            .await?;
+                                    }
+                                    last_reason = Some(error.to_string());
+                                    last_external_refs = base_refs;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": "a2a",
+                                        "reason": "no A2A binding is configured for task.plan",
+                                        "code": failure_code_route_unavailable(),
+                                        "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                    }),
+                                )
+                                .await?;
+                        }
+                        Err(error) => {
+                            let code = failure_code_treaty_denied();
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": "a2a",
+                                        "reason": error.to_string(),
+                                        "code": code,
+                                        "fallback": next_fallback_label(deterministic_fallback, "openclaw"),
+                                    }),
+                                )
+                                .await?;
+                            self.store
+                                .insert_policy_incident(&PolicyIncident {
+                                    id: Uuid::new_v4().to_string(),
+                                    action_id: action.id.clone(),
+                                    doctrine_pack_id: "swarm_frontier_v1".to_string(),
+                                    jurisdiction: JurisdictionClass::ExternalUnknown,
+                                    reason_code: "treaty_denied".to_string(),
+                                    summary: error.to_string(),
+                                    severity: PolicyIncidentSeverity::Critical,
+                                    checkpoint: Some(OversightCheckpoint::PreDispatch),
+                                    created_at: now_timestamp(),
+                                })
+                                .await?;
+                            last_reason = Some(error.to_string());
+                        }
+                    }
+                }
+                "openclaw" => {
+                    attempted_agentic_route = true;
+                    match self.resolve_openclaw_adapter(manifest)? {
+                        Some((adapter, base_refs)) => {
+                            if adapter.binding().lease_required {
+                                self.ensure_required_lease_valid(action, &base_refs).await?;
+                            }
+                            match adapter.run(action).await {
+                                Ok(result) => {
+                                    return Ok(ExecutionOutcome::Completed {
+                                        outputs: result.outputs,
+                                        selected_executor: format!("openclaw.{}", adapter.name()),
+                                        checkpoint: None,
+                                        external_refs: merge_external_refs(
+                                            base_refs,
+                                            result.external_refs,
+                                        ),
+                                        surface_events: result.events,
+                                    });
+                                }
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    self.store
+                                        .append_action_event(
+                                            &action.id,
+                                            "route_degraded",
+                                            serde_json::json!({
+                                                "selected_surface": "openclaw",
+                                                "reason": reason,
+                                                "code": openclaw_failure_code(&error),
+                                                "fallback": next_fallback_label(deterministic_fallback, "deterministic"),
+                                            }),
+                                        )
+                                        .await?;
+                                    last_reason = Some(error.to_string());
+                                    last_external_refs = base_refs;
+                                }
+                            }
+                        }
+                        None => {
+                            self.store
+                                .append_action_event(
+                                    &action.id,
+                                    "route_degraded",
+                                    serde_json::json!({
+                                        "selected_surface": "openclaw",
+                                        "reason": "no OpenClaw binding is configured for task.plan",
+                                        "code": failure_code_route_unavailable(),
+                                        "fallback": next_fallback_label(deterministic_fallback, "deterministic"),
+                                    }),
+                                )
+                                .await?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if deterministic_fallback {
+            let executor = TaskPlannerDeterministicExecutor::new(self.state_dir());
+            let mut outcome = self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.task_plan",
+                    "planning",
+                    last_external_refs.clone(),
+                    &executor,
+                )
+                .await?;
+            if attempted_agentic_route {
+                if let ExecutionOutcome::Completed { surface_events, .. } = &mut outcome {
+                    surface_events.push(crawfish_core::SurfaceActionEvent {
+                        event_type: "continuity_selected".to_string(),
+                        payload: serde_json::json!({
+                            "selected_surface": "deterministic",
+                            "reason": last_reason.unwrap_or_else(|| "agentic route unavailable".to_string()),
+                            "continuity_mode": "deterministic_only",
+                        }),
+                    });
+                }
+            }
+            return Ok(outcome);
+        }
+
+        Ok(self.continuity_blocked_outcome(
+            action,
+            last_reason.unwrap_or_else(|| {
+                "no supported task.plan execution route is configured".to_string()
+            }),
+            false,
+            last_external_refs,
+        ))
+    }
+
+    pub(crate) async fn ensure_required_lease_valid(
+        &self,
+        action: &Action,
+        external_refs: &[ExternalRef],
+    ) -> anyhow::Result<()> {
+        let Some(_) = action.lease_ref else {
+            let route = external_refs
+                .iter()
+                .find(|reference| {
+                    reference.kind == "local_harness.harness"
+                        || reference.kind == "openclaw.target_agent"
+                })
+                .map(|reference| reference.value.clone())
+                .unwrap_or_else(|| "requested surface".to_string());
+            anyhow::bail!("dispatch route requires an active capability lease: {route}");
+        };
+        self.ensure_pre_execution_lease_valid(action).await
+    }
+
+    pub(crate) fn continuity_blocked_outcome(
+        &self,
+        action: &Action,
+        reason: impl Into<String>,
+        deterministic_available: bool,
+        external_refs: Vec<ExternalRef>,
+    ) -> ExecutionOutcome {
+        let reason = reason.into();
+        let continuity_mode = select_continuity_mode(
+            &action.contract.recovery.continuity_preference,
+            deterministic_available,
+        );
+        let mut outputs = ActionOutputs {
+            summary: Some(format!(
+                "Action {} entered continuity mode {:?}: {}",
+                action.id, continuity_mode, reason
+            )),
+            ..ActionOutputs::default()
+        };
+        outputs.metadata.insert(
+            "continuity_mode".to_string(),
+            serde_json::json!(format!("{continuity_mode:?}").to_lowercase()),
+        );
+        outputs.metadata.insert(
+            "route_failure".to_string(),
+            serde_json::json!(reason.clone()),
+        );
+        ExecutionOutcome::Blocked {
+            reason,
+            failure_code: failure_code_route_unavailable().to_string(),
+            continuity_mode: Some(continuity_mode),
+            outputs,
+            external_refs,
+            surface_events: Vec::new(),
+        }
+    }
+
+    pub(crate) async fn ensure_repo_index_for_workspace(
+        &self,
+        workspace_root: &str,
+    ) -> anyhow::Result<(
+        crawfish_types::ArtifactRef,
+        crawfish_types::RepoIndexArtifact,
+    )> {
+        if let Some(action) = self
+            .store
+            .latest_completed_action("repo_indexer", "repo.index")
+            .await?
+        {
+            if action
+                .outputs
+                .metadata
+                .get("workspace_root")
+                .and_then(|value| value.as_str())
+                == Some(workspace_root)
+            {
+                if let Some(artifact_ref) = action.outputs.artifacts.first() {
+                    let artifact =
+                        load_json_artifact::<crawfish_types::RepoIndexArtifact>(artifact_ref)
+                            .await?;
+                    return Ok((artifact_ref.clone(), artifact));
+                }
+            }
+        }
+
+        let bootstrap_action = Action {
+            id: format!("inline-index-{}", Uuid::new_v4()),
+            target_agent_id: "repo_indexer".to_string(),
+            requester: action_requester("system"),
+            initiator_owner: self.synthetic_owner(),
+            counterparty_refs: Vec::new(),
+            goal: crawfish_types::GoalSpec {
+                summary: "inline repo index bootstrap".to_string(),
+                details: None,
+            },
+            capability: "repo.index".to_string(),
+            inputs: std::collections::BTreeMap::from([(
+                "workspace_root".to_string(),
+                serde_json::json!(workspace_root),
+            )]),
+            contract: self.config.contracts.org_defaults.clone(),
+            execution_strategy: None,
+            grant_refs: Vec::new(),
+            lease_ref: None,
+            encounter_ref: None,
+            audit_receipt_ref: None,
+            data_boundary: "owner_local".to_string(),
+            schedule: crawfish_types::ScheduleSpec::default(),
+            phase: ActionPhase::Running,
+            created_at: now_timestamp(),
+            started_at: Some(now_timestamp()),
+            finished_at: None,
+            checkpoint_ref: None,
+            continuity_mode: None,
+            degradation_profile: None,
+            failure_reason: None,
+            failure_code: None,
+            selected_executor: Some("deterministic.repo_index".to_string()),
+            recovery_stage: None,
+            lock_detail: None,
+            external_refs: Vec::new(),
+            outputs: ActionOutputs::default(),
+        };
+
+        let executor = RepoIndexerDeterministicExecutor::new(self.state_dir());
+        let outputs = executor.execute(&bootstrap_action).await?;
+        let artifact_ref = outputs
+            .artifacts
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("repo.index did not emit an artifact"))?;
+        let artifact =
+            load_json_artifact::<crawfish_types::RepoIndexArtifact>(&artifact_ref).await?;
+        Ok((artifact_ref, artifact))
+    }
+
+    pub(crate) async fn process_action_queue_once(&self) -> anyhow::Result<()> {
+        if self.store.is_draining().await? {
+            return Ok(());
+        }
+
+        self.expire_awaiting_approval_actions().await?;
+
+        while let Some(action) = self.store.claim_next_accepted_action().await? {
+            self.process_claimed_action(action).await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn process_claimed_action(&self, mut action: Action) -> anyhow::Result<()> {
+        let manifest = self
+            .store
+            .get_agent_manifest(&action.target_agent_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("target agent not found: {}", action.target_agent_id))?;
+        let lifecycle = self
+            .store
+            .get_lifecycle_record(&action.target_agent_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("lifecycle record missing for {}", action.target_agent_id)
+            })?;
+
+        if matches!(
+            lifecycle.observed_state,
+            AgentState::Inactive
+                | AgentState::Draining
+                | AgentState::Failed
+                | AgentState::Finalized
+        ) {
+            set_action_blocked(
+                &mut action,
+                failure_code_route_unavailable(),
+                format!(
+                    "target agent {} is not executable in state {:?}",
+                    manifest.id, lifecycle.observed_state
+                ),
+            );
+            self.store.upsert_action(&action).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "blocked",
+                    serde_json::json!({
+                        "reason": action.failure_reason,
+                        "code": action.failure_code,
+                    }),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        if let Err(error) = self.ensure_pre_execution_lease_valid(&action).await {
+            let reason = error.to_string();
+            set_action_failed(&mut action, lease_failure_code(&reason), reason.clone());
+            if let Some(encounter_ref) = &action.encounter_ref {
+                if let Some(mut encounter) = self.store.get_encounter(encounter_ref).await? {
+                    encounter.state = EncounterState::Denied;
+                    self.store.insert_encounter(&encounter).await?;
+                }
+                let receipt = self
+                    .emit_audit_receipt(
+                        encounter_ref,
+                        action.grant_refs.clone(),
+                        action.lease_ref.clone(),
+                        AuditOutcome::Denied,
+                        reason.clone(),
+                        None,
+                    )
+                    .await?;
+                action.audit_receipt_ref = Some(receipt.id);
+            }
+            self.store.upsert_action(&action).await?;
+            self.store
+                .append_action_event(
+                    &action.id,
+                    "failed",
+                    serde_json::json!({
+                        "reason": reason,
+                        "code": action.failure_code,
+                        "finished_at": action.finished_at
+                    }),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        match self.execute_action(&mut action, &manifest).await {
+            Ok(ExecutionOutcome::Completed {
+                outputs,
+                selected_executor,
+                checkpoint,
+                external_refs,
+                surface_events,
+            }) => {
+                action.phase = ActionPhase::Completed;
+                action.outputs = outputs;
+                action.finished_at = Some(now_timestamp());
+                action.failure_reason = None;
+                action.failure_code = None;
+                action.selected_executor = Some(selected_executor);
+                action.external_refs = external_refs;
+                if let Some(checkpoint) = checkpoint {
+                    self.write_checkpoint_for_action(&mut action, &checkpoint)
+                        .await?;
+                }
+                self.store.upsert_action(&action).await?;
+                for event in surface_events {
+                    self.store
+                        .append_action_event(&action.id, &event.event_type, event.payload)
+                        .await?;
+                }
+                self.store
+                    .append_action_event(
+                        &action.id,
+                        "completed",
+                        serde_json::json!({
+                            "finished_at": action.finished_at,
+                            "checkpoint_ref": action.checkpoint_ref,
+                            "recovery_stage": action.recovery_stage,
+                        }),
+                    )
+                    .await?;
+                self.postprocess_terminal_action(&mut action).await?;
+            }
+            Ok(ExecutionOutcome::Blocked {
+                reason,
+                failure_code,
+                continuity_mode,
+                outputs,
+                external_refs,
+                surface_events,
+            }) => {
+                set_action_blocked(&mut action, &failure_code, reason.clone());
+                action.continuity_mode = continuity_mode;
+                action.outputs = outputs;
+                action.selected_executor = selected_executor_from_external_refs(&external_refs);
+                action.external_refs = external_refs;
+                self.store.upsert_action(&action).await?;
+                for event in surface_events {
+                    self.store
+                        .append_action_event(&action.id, &event.event_type, event.payload)
+                        .await?;
+                }
+                self.store
+                    .append_action_event(
+                        &action.id,
+                        "blocked",
+                        serde_json::json!({
+                            "reason": reason,
+                            "code": action.failure_code,
+                            "continuity_mode": action.continuity_mode.as_ref().map(|mode| format!("{mode:?}").to_lowercase())
+                        }),
+                    )
+                    .await?;
+                self.postprocess_terminal_action(&mut action).await?;
+            }
+            Ok(ExecutionOutcome::Failed {
+                reason,
+                failure_code,
+                outputs,
+                checkpoint,
+                external_refs,
+                surface_events,
+            }) => {
+                set_action_failed(&mut action, &failure_code, reason.clone());
+                action.outputs = outputs;
+                action.selected_executor = selected_executor_from_external_refs(&external_refs);
+                action.external_refs = external_refs;
+                if let Some(checkpoint) = checkpoint {
+                    self.write_checkpoint_for_action(&mut action, &checkpoint)
+                        .await?;
+                }
+                self.store.upsert_action(&action).await?;
+                for event in surface_events {
+                    self.store
+                        .append_action_event(&action.id, &event.event_type, event.payload)
+                        .await?;
+                }
+                self.store
+                    .append_action_event(
+                        &action.id,
+                        "failed",
+                        serde_json::json!({
+                            "reason": reason,
+                            "code": action.failure_code,
+                            "checkpoint_ref": action.checkpoint_ref,
+                            "recovery_stage": action.recovery_stage,
+                            "finished_at": action.finished_at
+                        }),
+                    )
+                    .await?;
+                self.postprocess_terminal_action(&mut action).await?;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                set_action_failed(&mut action, failure_code_executor_error(), reason.clone());
+                self.store.upsert_action(&action).await?;
+                self.store
+                    .append_action_event(
+                        &action.id,
+                        "failed",
+                        serde_json::json!({
+                            "reason": reason,
+                            "code": action.failure_code,
+                            "finished_at": action.finished_at
+                        }),
+                    )
+                    .await?;
+                self.postprocess_terminal_action(&mut action).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn execute_action(
+        &self,
+        action: &mut Action,
+        manifest: &AgentManifest,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        if action.capability == "repo.index" {
+            let executor = RepoIndexerDeterministicExecutor::new(self.state_dir());
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.repo_index",
+                    "scanning",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
+        }
+
+        if action.capability == "repo.review" {
+            let workspace_root = required_input_string(action, "workspace_root")?;
+            let (repo_index_ref, repo_index) = self
+                .ensure_repo_index_for_workspace(&workspace_root)
+                .await?;
+            let executor = RepoReviewerDeterministicExecutor::new(
+                self.state_dir(),
+                repo_index,
+                Some(repo_index_ref),
+            );
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.repo_review",
+                    "reviewing",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
+        }
+
+        if action.capability == "ci.triage" {
+            if !has_log_input(action) && action.inputs.contains_key("mcp_resource_ref") {
+                let (adapter, external_refs) = match self.resolve_mcp_adapter(manifest, action) {
+                    Ok(Some(binding)) => binding,
+                    Ok(None) => {
+                        return Ok(self.continuity_blocked_outcome(
+                            action,
+                            "no MCP adapter is configured for ci.triage",
+                            false,
+                            mcp_input_external_refs(action),
+                        ));
+                    }
+                    Err(error) => {
+                        return Ok(self.continuity_blocked_outcome(
+                            action,
+                            error.to_string(),
+                            false,
+                            mcp_input_external_refs(action),
+                        ));
+                    }
+                };
+
+                match adapter.run(action).await {
+                    Ok(remote_result) => {
+                        let mut derived_action = action.clone();
+                        let log_text =
+                            extract_mcp_log_text(&remote_result.outputs).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "mcp result did not contain log_text, log_excerpt, or textual content"
+                            )
+                        })?;
+                        derived_action
+                            .inputs
+                            .insert("log_text".to_string(), serde_json::json!(log_text));
+                        let executor = CiTriageDeterministicExecutor::new(self.state_dir());
+                        let mut outcome = self
+                            .run_deterministic_executor(
+                                &mut derived_action,
+                                "deterministic.ci_triage",
+                                "classifying",
+                                merge_external_refs(
+                                    external_refs.clone(),
+                                    remote_result.external_refs.clone(),
+                                ),
+                                &executor,
+                            )
+                            .await?;
+                        if let ExecutionOutcome::Completed {
+                            outputs,
+                            checkpoint,
+                            external_refs: refs,
+                            surface_events,
+                            ..
+                        } = &mut outcome
+                        {
+                            outputs.metadata.insert(
+                                "mcp_summary".to_string(),
+                                serde_json::json!(remote_result.outputs.summary.clone()),
+                            );
+                            outputs.metadata.insert(
+                                "mcp_result".to_string(),
+                                remote_result
+                                    .outputs
+                                    .metadata
+                                    .get("mcp_result")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                            );
+                            *refs = merge_external_refs(
+                                external_refs.clone(),
+                                remote_result.external_refs.clone(),
+                            );
+                            surface_events.extend(remote_result.events.clone());
+                            if let Some(checkpoint) = checkpoint {
+                                checkpoint.last_updated_at = now_timestamp();
+                            }
+                        }
+                        return Ok(outcome);
+                    }
+                    Err(error) => {
+                        return Ok(self.continuity_blocked_outcome(
+                            action,
+                            error.to_string(),
+                            false,
+                            external_refs,
+                        ));
+                    }
+                }
+            }
+
+            let executor = CiTriageDeterministicExecutor::new(self.state_dir());
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.ci_triage",
+                    "classifying",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
+        }
+
+        if action.capability == "workspace.patch.apply" {
+            let acquired_lock = match self.try_acquire_workspace_lock(action, manifest).await? {
+                Some(WorkspaceLockAttempt::Acquired(acquisition)) => {
+                    action.lock_detail = Some(acquisition.detail.clone());
+                    self.store.upsert_action(action).await?;
+                    self.store
+                        .append_action_event(
+                            &action.id,
+                            "lock_acquired",
+                            serde_json::json!({
+                                "lock_detail": action.lock_detail.clone(),
+                            }),
+                        )
+                        .await?;
+                    Some(acquisition)
+                }
+                Some(WorkspaceLockAttempt::Conflict(detail)) => {
+                    action.lock_detail = Some(detail.clone());
+                    return Ok(ExecutionOutcome::Blocked {
+                        reason: format!(
+                            "workspace lock is held by {}",
+                            detail
+                                .owner_action_id
+                                .clone()
+                                .unwrap_or_else(|| "another action".to_string())
+                        ),
+                        failure_code: failure_code_lock_conflict().to_string(),
+                        continuity_mode: None,
+                        outputs: ActionOutputs {
+                            summary: Some("Mutation action blocked by workspace lock".to_string()),
+                            artifacts: Vec::new(),
+                            metadata: std::collections::BTreeMap::from([(
+                                "lock_path".to_string(),
+                                serde_json::json!(detail.lock_path),
+                            )]),
+                        },
+                        external_refs: Vec::new(),
+                        surface_events: Vec::new(),
+                    });
+                }
+                None => None,
+            };
+
+            if let Err(error) = self.ensure_pre_execution_lease_valid(action).await {
+                if let Some(acquisition) = &acquired_lock {
+                    self.release_workspace_lock(action, &acquisition.lock_path)
+                        .await?;
+                    action.lock_detail = Some(crawfish_types::WorkspaceLockDetail {
+                        status: "released".to_string(),
+                        ..acquisition.detail.clone()
+                    });
+                }
+                return Err(error);
+            }
+
+            let executor = WorkspacePatchApplyDeterministicExecutor::new(self.state_dir());
+            let outcome = self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.workspace_patch_apply",
+                    "applying",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
+            if let Some(acquisition) = &acquired_lock {
+                self.release_workspace_lock(action, &acquisition.lock_path)
+                    .await?;
+                action.lock_detail = Some(crawfish_types::WorkspaceLockDetail {
+                    status: "released".to_string(),
+                    ..acquisition.detail.clone()
+                });
+                self.store.upsert_action(action).await?;
+                self.store
+                    .append_action_event(
+                        &action.id,
+                        "lock_released",
+                        serde_json::json!({
+                            "lock_detail": action.lock_detail.clone(),
+                        }),
+                    )
+                    .await?;
+            }
+            return outcome;
+        }
+
+        if action.capability == "incident.enrich" {
+            let executor = IncidentEnricherDeterministicExecutor::new(self.state_dir());
+            return self
+                .run_deterministic_executor(
+                    action,
+                    "deterministic.incident_enrich",
+                    "enriching",
+                    Vec::new(),
+                    &executor,
+                )
+                .await;
+        }
+
+        if is_task_plan_capability(&action.capability) {
+            return self.execute_task_plan(action, manifest).await;
+        }
+
+        if let Some((adapter, external_refs)) = self.resolve_mcp_adapter(manifest, action)? {
+            match adapter.run(action).await {
+                Ok(result) => {
+                    return Ok(ExecutionOutcome::Completed {
+                        outputs: result.outputs,
+                        selected_executor: format!("mcp.{}", adapter.name()),
+                        checkpoint: None,
+                        external_refs: merge_external_refs(external_refs, result.external_refs),
+                        surface_events: result.events,
+                    });
+                }
+                Err(error) => {
+                    return Ok(self.continuity_blocked_outcome(
+                        action,
+                        error.to_string(),
+                        false,
+                        external_refs,
+                    ));
+                }
+            }
+        }
+
+        Ok(self.continuity_blocked_outcome(
+            action,
+            "no execution surface was available",
+            false,
+            Vec::new(),
+        ))
+    }
+
+    pub(crate) fn lock_file_path(&self, workspace_root: &str) -> PathBuf {
+        self.state_dir()
+            .join("locks")
+            .join(format!("workspace-{}.lock", stable_id(workspace_root)))
+    }
+
+    pub(crate) async fn try_acquire_workspace_lock(
+        &self,
+        action: &Action,
+        manifest: &AgentManifest,
+    ) -> anyhow::Result<Option<WorkspaceLockAttempt>> {
+        if action.capability != "workspace.patch.apply"
+            || !matches!(
+                manifest.workspace_policy.lock_mode,
+                crawfish_types::WorkspaceLockMode::File
+            )
+        {
+            return Ok(None);
+        }
+
+        let workspace_root = required_input_string(action, "workspace_root")?;
+        let lock_path = self.lock_file_path(&workspace_root);
+        if let Some(parent) = lock_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        self.try_acquire_workspace_lock_path(action, workspace_root, lock_path, true)
+            .await
+            .map(Some)
+    }
+
+    pub(crate) async fn try_acquire_workspace_lock_path(
+        &self,
+        action: &Action,
+        workspace_root: String,
+        lock_path: PathBuf,
+        retry_stale: bool,
+    ) -> anyhow::Result<WorkspaceLockAttempt> {
+        let record = WorkspaceLockRecord {
+            workspace_root: workspace_root.clone(),
+            owner_action_id: action.id.clone(),
+            acquired_at: now_timestamp(),
+        };
+        let serialized = serde_json::to_vec_pretty(&record)?;
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .await
+        {
+            Ok(mut file) => {
+                file.write_all(&serialized).await?;
+                file.flush().await?;
+                Ok(WorkspaceLockAttempt::Acquired(WorkspaceLockAcquisition {
+                    lock_path: lock_path.clone(),
+                    detail: crawfish_types::WorkspaceLockDetail {
+                        mode: crawfish_types::WorkspaceLockMode::File,
+                        scope: workspace_root,
+                        lock_path: lock_path.display().to_string(),
+                        status: "acquired".to_string(),
+                        owner_action_id: Some(action.id.clone()),
+                        acquired_at: Some(record.acquired_at),
+                    },
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let contents = tokio::fs::read_to_string(&lock_path).await.ok();
+                let existing = contents
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<WorkspaceLockRecord>(value).ok());
+
+                if let Some(existing) = existing {
+                    if existing.owner_action_id == action.id {
+                        return Ok(WorkspaceLockAttempt::Acquired(WorkspaceLockAcquisition {
+                            lock_path: lock_path.clone(),
+                            detail: crawfish_types::WorkspaceLockDetail {
+                                mode: crawfish_types::WorkspaceLockMode::File,
+                                scope: workspace_root,
+                                lock_path: lock_path.display().to_string(),
+                                status: "acquired".to_string(),
+                                owner_action_id: Some(action.id.clone()),
+                                acquired_at: Some(existing.acquired_at),
+                            },
+                        }));
+                    }
+
+                    if retry_stale && self.is_stale_lock_owner(&existing.owner_action_id).await? {
+                        let _ = tokio::fs::remove_file(&lock_path).await;
+                        return Box::pin(self.try_acquire_workspace_lock_path(
+                            action,
+                            workspace_root,
+                            lock_path,
+                            false,
+                        ))
+                        .await;
+                    }
+
+                    return Ok(WorkspaceLockAttempt::Conflict(
+                        crawfish_types::WorkspaceLockDetail {
+                            mode: crawfish_types::WorkspaceLockMode::File,
+                            scope: workspace_root,
+                            lock_path: lock_path.display().to_string(),
+                            status: "conflicted".to_string(),
+                            owner_action_id: Some(existing.owner_action_id),
+                            acquired_at: Some(existing.acquired_at),
+                        },
+                    ));
+                }
+
+                if retry_stale {
+                    let _ = tokio::fs::remove_file(&lock_path).await;
+                    return Box::pin(self.try_acquire_workspace_lock_path(
+                        action,
+                        workspace_root,
+                        lock_path,
+                        false,
+                    ))
+                    .await;
+                }
+
+                Ok(WorkspaceLockAttempt::Conflict(
+                    crawfish_types::WorkspaceLockDetail {
+                        mode: crawfish_types::WorkspaceLockMode::File,
+                        scope: workspace_root,
+                        lock_path: lock_path.display().to_string(),
+                        status: "conflicted".to_string(),
+                        owner_action_id: None,
+                        acquired_at: None,
+                    },
+                ))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) async fn is_stale_lock_owner(&self, owner_action_id: &str) -> anyhow::Result<bool> {
+        let action = self.store.get_action(owner_action_id).await?;
+        Ok(match action {
+            Some(action) => matches!(
+                action.phase,
+                ActionPhase::Completed | ActionPhase::Failed | ActionPhase::Expired
+            ),
+            None => true,
+        })
+    }
+
+    pub(crate) async fn release_workspace_lock(
+        &self,
+        action: &Action,
+        lock_path: &Path,
+    ) -> anyhow::Result<()> {
+        let contents = match tokio::fs::read_to_string(lock_path).await {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let existing: WorkspaceLockRecord = serde_json::from_str(&contents)?;
+        if existing.owner_action_id == action.id {
+            tokio::fs::remove_file(lock_path).await?;
+        }
+        Ok(())
+    }
+}
