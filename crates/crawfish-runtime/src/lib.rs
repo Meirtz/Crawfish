@@ -4786,8 +4786,11 @@ impl Supervisor {
         &self,
         manifest: &AgentManifest,
     ) -> anyhow::Result<LifecycleRecord> {
+        let previous = self.store.get_lifecycle_record(&manifest.id).await?;
+
         let is_draining = self.store.is_draining().await?;
         if is_draining {
+            let prev_failure_count = previous.as_ref().map_or(0, |r| r.failure_count);
             return Ok(LifecycleRecord {
                 agent_id: manifest.id.clone(),
                 desired_state: AgentState::Inactive,
@@ -4797,7 +4800,7 @@ impl Supervisor {
                 last_transition_at: now_timestamp(),
                 degradation_profile: None,
                 continuity_mode: None,
-                failure_count: 0,
+                failure_count: prev_failure_count,
             });
         }
 
@@ -4835,20 +4838,54 @@ impl Supervisor {
             None
         };
 
+        // Carry forward and accumulate failure_count from previous record.
+        // Increment when transitioning into a failure/degraded state;
+        // preserve the count otherwise so it reflects lifetime failures.
+        let failure_count = match &previous {
+            Some(prev) => {
+                let was_healthy = matches!(
+                    prev.observed_state,
+                    AgentState::Active | AgentState::Activating
+                );
+                let now_unhealthy = matches!(
+                    observed_state,
+                    AgentState::Degraded | AgentState::Failed
+                );
+                if was_healthy && now_unhealthy {
+                    prev.failure_count.saturating_add(1)
+                } else {
+                    prev.failure_count
+                }
+            }
+            None => 0,
+        };
+
+        // Only update the transition timestamp when the observed state
+        // actually changes, so that stable agents keep their original
+        // transition time.
+        let last_transition_at = match &previous {
+            Some(prev) if prev.observed_state == observed_state => {
+                prev.last_transition_at.clone()
+            }
+            _ => now_timestamp(),
+        };
+
+        let transition_reason = if dependency_missing {
+            Some("dependency missing during reconcile".to_string())
+        } else {
+            Some("reconciled successfully".to_string())
+        };
+
         Ok(LifecycleRecord {
             agent_id: manifest.id.clone(),
             desired_state: AgentState::Active,
             observed_state,
             health,
-            transition_reason: if dependency_missing {
-                Some("dependency missing during reconcile".to_string())
-            } else {
-                Some("reconciled successfully".to_string())
-            },
-            last_transition_at: now_timestamp(),
+            transition_reason,
+            last_transition_at,
             degradation_profile,
             continuity_mode,
-            failure_count: 0,
+            failure_count,
         })
     }
 
@@ -4859,11 +4896,63 @@ impl Supervisor {
 
         self.expire_awaiting_approval_actions().await?;
 
+        // Pre-compute which agents are already at their concurrency limit so
+        // that we do not claim (and immediately re-queue) actions for them.
+        let mut saturated_agents: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         while let Some(action) = self.store.claim_next_accepted_action().await? {
+            if saturated_agents.contains(&action.target_agent_id) {
+                // Already known to be at capacity — put back without processing.
+                let mut requeued = action;
+                requeued.phase = ActionPhase::Accepted;
+                requeued.started_at = None;
+                self.store.upsert_action(&requeued).await?;
+                // Stop: remaining accepted actions for this pass are also
+                // ordered by created_at, so we would keep hitting the same
+                // saturated agents. Break and let the next reconcile cycle
+                // retry.
+                break;
+            }
+
+            let at_capacity = self.check_agent_at_capacity(&action).await?;
+            if at_capacity {
+                saturated_agents.insert(action.target_agent_id.clone());
+                // Re-queue the claimed action.
+                let mut requeued = action;
+                requeued.phase = ActionPhase::Accepted;
+                requeued.started_at = None;
+                self.store.upsert_action(&requeued).await?;
+                continue;
+            }
+
             self.process_claimed_action(action).await?;
         }
 
         Ok(())
+    }
+
+    /// Returns true if the agent for this action has reached its
+    /// max_parallel_actions limit.
+    async fn check_agent_at_capacity(&self, action: &Action) -> anyhow::Result<bool> {
+        let manifest = self
+            .store
+            .get_agent_manifest(&action.target_agent_id)
+            .await?;
+        let Some(manifest) = manifest else {
+            return Ok(false);
+        };
+        let max_parallel = manifest.runtime.max_parallel_actions;
+        if max_parallel == 0 {
+            return Ok(false);
+        }
+        let running = self
+            .store
+            .count_running_actions_for_agent(&action.target_agent_id)
+            .await?;
+        // The action was already claimed (marked running), so the count
+        // includes it. At-capacity means count > limit.
+        Ok(running > max_parallel as u64)
     }
 
     async fn process_claimed_action(&self, mut action: Action) -> anyhow::Result<()> {
@@ -4872,6 +4961,7 @@ impl Supervisor {
             .get_agent_manifest(&action.target_agent_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("target agent not found: {}", action.target_agent_id))?;
+
         let lifecycle = self
             .store
             .get_lifecycle_record(&action.target_agent_id)
