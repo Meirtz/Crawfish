@@ -1200,6 +1200,7 @@ The built-in defaults are:
 | Capability | Profile | Scorecard | Dataset |
 | --- | --- | --- | --- |
 | `task.plan` | `task_plan_default` | `task_plan_scorecard` | `task_plan_dataset` |
+| `task.plan` over `remote_agent` | `task_plan_remote_default` | `task_plan_remote_scorecard` | `task_plan_dataset` |
 | `repo.review` | `repo_review_default` | `repo_review_scorecard` | `repo_review_dataset` |
 | `incident.enrich` | `incident_enrich_default` | `incident_enrich_scorecard` | `incident_enrich_dataset` |
 
@@ -1231,6 +1232,10 @@ The first deterministic criterion kinds are:
 - `token_coverage`
 - `checkpoint_passed`
 - `incident_absent`
+- `external_ref_present`
+- `interaction_model_is`
+- `remote_outcome_disposition_is`
+- `treaty_violation_absent`
 
 The initial capability set remains:
 
@@ -1239,6 +1244,14 @@ The initial capability set remains:
 - `incident.enrich`
 
 `verify_loop` is part of the same spine. Verification failures are recorded as evaluations, not only as action events.
+
+The remote-agent plane now has a distinct evaluator path as well. When `task.plan` crosses into the A2A plane, the runtime switches to `task_plan_remote_default`, which scores:
+
+- remote interaction model classification
+- delegation receipt and remote task lineage
+- accepted vs escalated remote outcome disposition
+- treaty-violation absence
+- the same plan-quality artifacts and schema checks used for local planning
 
 LangSmith's [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [pairwise evaluation](https://docs.langchain.com/langsmith/evaluate-pairwise), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules), and [experiment comparison](https://docs.langchain.com/langsmith/compare-experiment-results) are useful reference shapes here. Anthropic's [Claude's Constitution](https://www.anthropic.com/constitution) and [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) are useful reference shapes for rule-guided behavior. Crawfish lifts both ideas into runtime governance: checkpoints, evidence, incidents, review, escalation, datasets, replay experiments, and side-by-side executor comparison.
 
@@ -1285,10 +1298,11 @@ Current pairwise comparison is executor-first, not prompt-first and not strategy
 
 The winner selection order is fixed:
 
-1. fewer doctrine or policy incidents wins
-2. successful terminal status beats failed status
-3. higher normalized evaluation score wins when the delta exceeds the configured margin
-4. otherwise the result is `needs_review`
+1. fewer treaty-governance violations wins
+2. fewer doctrine or policy incidents wins
+3. successful terminal status beats failed status
+4. higher normalized evaluation score wins when the delta exceeds the configured margin
+5. otherwise the result is `needs_review`
 
 Review queue items can now be opened in two kinds:
 

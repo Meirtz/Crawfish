@@ -185,6 +185,12 @@ And when the frontier evidence chain is incomplete, the runtime records that exp
 - `treaty_scope_violation`
 - `frontier_enforcement_gap`
 
+Those remote outcomes are now evaluated as part of the same learning loop, not left as transport metadata.
+
+- `task.plan` automatically switches to a remote-aware evaluation profile when it crosses into the A2A agent plane
+- treaty evidence, remote task lineage, outcome disposition, and frontier gaps are scored as part of the result
+- remote results can therefore fail quality review even when the remote call itself technically returned
+
 ## Verified Execution Strategies
 
 `verify_loop` is the first implemented execution strategy beyond `single_pass`.
@@ -237,6 +243,12 @@ In Crawfish:
 - `DatasetCase` freezes completed actions into replayable evaluation datasets with doctrine and jurisdiction metadata
 - `ExperimentRun` replays those cases against one executor surface so the swarm can learn without polluting production review queues
 
+For remote-agent work, that spine now treats the returned result as a governance event:
+
+- `task_plan_remote_default` scores remote outcome disposition, delegation receipt evidence, remote task lineage, and treaty-violation absence
+- A2A outcomes that come back as `review_required` or `rejected` are visible in the same trace, review, and alert substrate as local failures
+- remote-agent quality is therefore judged on both proposal quality and treaty evidence quality
+
 ## Pairwise Review
 
 Single-run evaluation tells you whether one executor met the bar. Pairwise review tells you whether one route is actually better than another.
@@ -256,6 +268,8 @@ The important product choice is what Crawfish does **not** do here:
 - no prompt arena disconnected from runtime doctrine
 
 Instead, pairwise outcomes are driven by doctrine incidents, terminal status, normalized evaluation score, and explicit review resolution when automation should stop pretending certainty.
+
+Remote-agent comparisons inherit the same rule: a route that returns weaker frontier evidence or more treaty violations does not get to hide behind a technically successful transport call.
 
 ## Philosophy
 

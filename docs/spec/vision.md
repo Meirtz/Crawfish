@@ -180,6 +180,8 @@ That does not mean Crawfish should start with marketplaces or reputation systems
 
 This is the same design lesson behind the distinction between Anthropic's [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) and runtime governance: principles can guide behavior, but they do not decide whether a concrete boundary crossing was lawful, inspectable, and adequately evidenced. Crawfish therefore treats treaties as the first control-plane primitive for remote-agent federation, not as optional metadata around A2A.
 
+That distinction now extends to result quality as well. A remote result is not judged only by whether it returns plausible content. It is judged by whether the treaty evidence, remote lineage, and frontier checkpoint proof are strong enough for the control plane to accept the result lawfully.
+
 ## Why OpenClaw Looks Like The Wild West, And Why Crawfish Should Be The Law Layer
 
 OpenClaw makes the modern agent environment easier to see clearly: powerful agents can move across local environments and network surfaces with real capability, but with relatively little built-in law.
@@ -239,6 +241,8 @@ That means:
 - replay experiments should compare execution surfaces without generating normal production noise
 
 In other words, evaluation is how a swarm learns without becoming opaque.
+
+For remote-agent work, that learning loop now has to stay frontier-aware. `task.plan` therefore switches into a remote-aware evaluation profile whenever it crosses into the A2A plane, so the scorecard can judge remote outcome disposition, delegation receipt presence, treaty-violation absence, and frontier evidence quality alongside the returned plan artifacts.
 
 This is also where the distinction between constitutional guidance and runtime governance becomes concrete:
 
