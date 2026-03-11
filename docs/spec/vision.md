@@ -61,6 +61,15 @@ This category matters because production agents are not just request handlers an
 
 For platform engineers and AI product teams running high-value agent systems, Crawfish is the runtime that adds lifecycle control, contract enforcement, and operational resilience. Unlike agent SDKs, it does not stop at model and tool orchestration. Unlike workflow engines, it is model-native, protocol-native, and policy-aware.
 
+## Current Delivery Tracks
+
+Crawfish now distinguishes between two delivery tracks:
+
+- **mainline alpha**: the supported public path centered on local swarm control, local harness routing, deterministic fallback, approval-gated local mutation, and inspectable runtime state
+- **experimental alpha**: implemented but retained experimental surfaces for OpenClaw, A2A, treaty-governed remote delegation, federation packs, remote evidence, and same-action remote follow-up
+
+This distinction matters because the product philosophy remains broad, but the public onboarding path should stay narrow and reliable.
+
 ## Protocol Planes
 
 Crawfish should talk about interoperability in three planes:

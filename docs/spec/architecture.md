@@ -32,6 +32,15 @@ The architecture follows seven product-level commitments:
 - **safe contraction beats silent drift**: when the system is under pressure, it should enter a declared degraded profile rather than behave unpredictably
 - **continuity must outlive any single reasoning provider**: the control plane should remain useful even when every external model or harness is unreachable
 
+## Delivery Tracks
+
+The repository currently ships two explicit delivery tracks:
+
+- **mainline alpha**: local swarm control, local harness routing, deterministic fallback, approval-gated local mutation, and inspectable operator surfaces
+- **experimental alpha**: OpenClaw, A2A, treaty packs, federation packs, remote evidence, and remote follow-up flows
+
+Both tracks remain compiled and tested. Only the mainline alpha path is the public happy path and default project template.
+
 ## Runtime Model
 
 ### Component Topology

@@ -91,7 +91,23 @@ Harnesses are execution surfaces. Crawfish governs them.
 
 Crawfish does not compete by being one more reasoning loop. It competes by making many volatile reasoning loops behave like **one inspectable system**.
 
-## Why Remote Agents Are Not Just Another Harness
+## Start With Mainline Alpha
+
+The current supported getting-started path is deliberately narrow:
+
+- local swarm control
+- `repo.index`, `repo.review`, `ci.triage`, `incident.enrich`
+- approval-gated local `workspace.patch.apply`
+- `task.plan` routed through `claude_code -> codex -> deterministic`
+- inspectable events, traces, evaluations, alerts, and restart recovery
+
+OpenClaw, A2A, treaties, federation packs, remote evidence, and remote follow-up remain in the repository as **experimental alpha** surfaces. They still compile and run under CI, but they are not the public happy path and they are not what `crawfish init` generates by default.
+
+## Experimental Alpha: Remote-Agent Governance
+
+The sections below describe retained but experimental remote-governance surfaces rather than the recommended onboarding path.
+
+### Why Remote Agents Are Not Just Another Harness
 
 Remote agents are not only remote processes. They are separate authorities.
 
@@ -105,7 +121,7 @@ That is why Crawfish treats remote delegation differently:
 - doctrine still applies, but treaties decide whether cross-system delegation is allowed at all
 - remote task lineage, remote principal identity, and delegation receipts must remain inspectable
 
-## Why Treaties Precede Marketplaces
+### Why Treaties Precede Marketplaces
 
 Before reputation systems, marketplaces, or federation policy packs, a swarm needs a lawful basis for remote delegation.
 
@@ -124,7 +140,7 @@ That is why the current [A2A](https://github.com/a2aproject/A2A) line is treaty-
 
 Markets can come later. The treaty has to come first.
 
-## Why Federation Packs Matter After The Treaty
+### Why Federation Packs Matter After The Treaty
 
 Treaties answer the first question: **may this swarm delegate across the boundary at all?**
 
@@ -144,7 +160,7 @@ So Crawfish now separates the two responsibilities:
 
 That is how a control plane turns remote delegation from “we made an HTTP call” into governable swarm behavior.
 
-## Why Evidence Bundles Decide Admissibility
+### Why Evidence Bundles Decide Admissibility
 
 Treaties decide whether remote delegation is lawful. Federation packs decide how remote state and remote results should be interpreted. But neither is enough unless the runtime can produce an admissible evidence bundle when the remote side replies.
 
@@ -185,71 +201,27 @@ Crawfish is opinionated about what must survive model churn.
 
 ## What Runs Today
 
-The current alpha is not a mock architecture. It runs.
+The current public happy path is **mainline alpha**: local swarm control, local harnesses, deterministic fallback, approval-gated local mutation, and inspectable evaluation.
 
-### Read-Only Swarm Path
+### Mainline Alpha
 
 - `repo.index` emits `repo_index.json`
 - `repo.review` emits `review_findings.json` and `review_summary.md`
 - `ci.triage` emits `ci_triage.json` and `ci_triage_summary.md`
 - `incident.enrich` emits `incident_enrichment.json` and `incident_summary.md`
+- `workspace.patch.apply` performs local deterministic edits under approval, grants, leases, revocation, workspace locks, and audit receipts
+- `task.plan` runs as a **local-first** planning path: `claude_code -> codex -> deterministic`
+- `task.plan` also runs under the implemented `verify_loop`, so local harness output and deterministic fallback are both forced through the same bounded verifier
 
-### Approval-Gated Mutation Path
+### Experimental Alpha Surfaces
 
-- `workspace.patch.apply` performs local deterministic edits
-- mutation stays approval-gated
-- grants, leases, revocation, workspace locks, and audit receipts are enforced by the runtime
+The repository also contains implemented but **experimental alpha** surfaces:
 
-### Harness Paths
+- OpenClaw inbound and outbound
+- A2A outbound remote-agent delegation
+- treaty / federation / remote evidence / remote follow-up lines
 
-- **Local-first harness routing**: `task.plan` now prefers local Claude Code and Codex wrappers before any remote route
-- **A2A outbound remote delegation**: `task.plan` can delegate to a remote agent over [A2A](https://github.com/a2aproject/A2A) when a treaty pack allows it
-- **OpenClaw inbound**: a thin Gateway RPC bridge can submit and inspect Crawfish work without becoming a second policy engine
-- **OpenClaw outbound**: `task.plan` can still route out through OpenClaw as a proposal-only execution surface when local harnesses are absent or unsuitable
-- **Deterministic fallback**: if no approved harness route is available, `task.plan` can degrade into local planning when the compiled contract allows it
-- **Verified execution strategy**: local wrappers, OpenClaw, and deterministic fallback are all forced through the same deterministic verifier
-
-### Treaty-Governed Remote Results And Federation Escalation
-
-Remote delegation is now governed at both ends.
-
-- **before dispatch**: Crawfish compiles a treaty decision and rejects remote work if the principal, capability, data scope, or delegation depth falls outside treaty bounds
-- **after result**: Crawfish compiles a federation decision and checks whether the returned artifact classes, data scopes, and result evidence satisfy both treaty scope and remote escalation policy before it accepts the outcome
-
-Remote outcomes therefore do not collapse into one naive success state. They now resolve as:
-
-- `accepted`
-- `review_required`
-- `rejected`
-
-When an outcome is `review_required`, the control plane can now preserve and continue the admissibility story instead of forcing a premature terminal choice:
-
-- preserve the exact remote evidence bundle that triggered review
-- create a structured follow-up request that names the missing treaty or federation evidence
-- require an explicit same-action re-delegation so the next remote attempt remains attributable to the same local action
-
-And the runtime now keeps the decision legible:
-
-- which treaty pack allowed delegation
-- which federation pack interpreted the remote state and result
-- which checkpoints were required
-- which evidence was present or missing
-- why the action was blocked, accepted, or failed
-- which remote attempt produced the current evidence bundle
-- whether the action is blocked on an open remote follow-up request
-
-And when the frontier evidence chain is incomplete, the runtime records that explicitly instead of hiding it:
-
-- `treaty_denied`
-- `treaty_scope_violation`
-- `frontier_enforcement_gap`
-
-Those remote outcomes are now evaluated as part of the same learning loop, not left as transport metadata.
-
-- `task.plan` automatically switches to a remote-aware evaluation profile when it crosses into the A2A agent plane
-- treaty evidence, remote task lineage, outcome disposition, and frontier gaps are scored as part of the result
-- remote results can therefore fail quality review even when the remote call itself technically returned
-- unresolved remote follow-up requests now remain visible in trace, dataset, and evaluation lineage so admissibility history is not erased by later attempts
+They remain compiled and tested, but they are **not** the recommended getting-started path and they are no longer the default example or `crawfish init` template.
 
 ## Verified Execution Strategies
 
@@ -398,16 +370,9 @@ cargo run -p crawfish-cli --bin crawfish -- alert list --json
 
 For the full reference walkthrough, run [`examples/hero-swarm/demo.sh`](examples/hero-swarm/demo.sh).
 
-If `claude` or `codex` is installed locally, `task_planner` will prefer those harnesses first. If neither local wrapper is available, Crawfish now tries treaty-governed A2A remote delegation before OpenClaw, then falls back to deterministic planning when the contract allows it.
+If `claude` or `codex` is installed locally, `task_planner` will prefer those harnesses first. If neither local wrapper is available, Crawfish falls back to deterministic planning when the compiled contract allows it.
 
-Useful operator checks for the remote-agent line now include:
-
-```bash
-cargo run -p crawfish-cli --bin crawfish -- treaty list --json
-cargo run -p crawfish-cli --bin crawfish -- treaty show remote_task_plan_treaty --json
-cargo run -p crawfish-cli --bin crawfish -- federation list --json
-cargo run -p crawfish-cli --bin crawfish -- federation show remote_task_plan_default --json
-```
+Experimental remote and federation examples live under [`examples/experimental/`](examples/experimental/).
 
 ## Public Status
 
@@ -426,6 +391,8 @@ Current support baseline:
 - implementation posture: Rust-first, not Rust-only
 - supported runtime environments: macOS and Linux
 - supported MCP transport in the current codebase: SSE only
+- supported **mainline alpha** path: local swarm control and local-first `task.plan`
+- implemented but **experimental alpha** surfaces: OpenClaw, A2A, treaty/federation remote governance
 
 Breaking alpha changes are allowed, but they must ship with:
 

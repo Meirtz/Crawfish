@@ -17,6 +17,8 @@ This document defines the forward-looking philosophy that the rest of the spec s
 
 It also adopts one hard lesson from frontier history: a constitution can define a lawful order without actually producing one. When capability expands faster than institutions, the gap between stated rules and enforceable order becomes a systems problem. Crawfish is designed for that gap.
 
+The current public support center is still the **mainline alpha** local swarm path. Remote-agent governance, treaty escalation, and federation evidence work remain **experimental alpha** even when implemented, because the project should not confuse forward-looking philosophy with today's default onboarding path.
+
 ## Principle 1: Build For Swarm-Age Governance, Not Single-Agent Demos
 
 The future category is not the single assistant with a convenient shell. It is the governed swarm: many bounded workers, many execution surfaces, many owners, many risk envelopes, and many possible encounter paths.

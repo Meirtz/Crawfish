@@ -63,7 +63,10 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 ### Changed
 
 - `Cargo.lock` is now tracked because Crawfish publishes binaries
+- `crawfish-runtime` is now organized around runtime-spine modules such as `supervisor`, `api`, `execution`, `governance`, `evaluation`, `remote`, and `hero` instead of one giant orchestrator file
 - the runnable example under `examples/hero-swarm/` is now the reference public example, not a loose demo
+- the public project now distinguishes between **mainline alpha** and **experimental alpha** surfaces
+- `crawfish init` and `examples/hero-swarm/` now default to the local mainline path, while remote/protocol examples are retained under `examples/experimental/` and `docs/experimental/`
 - public terminology now uses `agent swarm` as the primary term, with `fleet` retained only as a temporary alpha migration alias
 - `policy validate` is now a strict dry-run with no runtime persistence side effects
 - action phase persistence now uses canonical snake_case values such as `awaiting_approval`
