@@ -81,6 +81,34 @@ pub trait ActionStore: Send + Sync {
         &self,
         run_id: &str,
     ) -> anyhow::Result<Vec<crawfish_types::ExperimentCaseResult>>;
+    async fn insert_pairwise_experiment_run(
+        &self,
+        run: &crawfish_types::PairwiseExperimentRun,
+    ) -> anyhow::Result<()>;
+    async fn get_pairwise_experiment_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<crawfish_types::PairwiseExperimentRun>>;
+    async fn update_pairwise_experiment_run(
+        &self,
+        run: &crawfish_types::PairwiseExperimentRun,
+    ) -> anyhow::Result<()>;
+    async fn insert_pairwise_case_result(
+        &self,
+        result: &crawfish_types::PairwiseCaseResult,
+    ) -> anyhow::Result<()>;
+    async fn get_pairwise_case_result(
+        &self,
+        case_result_id: &str,
+    ) -> anyhow::Result<Option<crawfish_types::PairwiseCaseResult>>;
+    async fn update_pairwise_case_result(
+        &self,
+        result: &crawfish_types::PairwiseCaseResult,
+    ) -> anyhow::Result<()>;
+    async fn list_pairwise_case_results(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<crawfish_types::PairwiseCaseResult>>;
     async fn insert_alert_event(&self, alert: &crawfish_types::AlertEvent) -> anyhow::Result<()>;
     async fn list_alert_events(&self) -> anyhow::Result<Vec<crawfish_types::AlertEvent>>;
     async fn acknowledge_alert_event(
@@ -180,6 +208,14 @@ pub trait SupervisorControl: Send + Sync {
         &self,
         run_id: &str,
     ) -> anyhow::Result<Option<crate::ExperimentRunDetailResponse>>;
+    async fn start_pairwise_evaluation_run(
+        &self,
+        request: crate::StartPairwiseEvaluationRunRequest,
+    ) -> anyhow::Result<crate::StartPairwiseEvaluationRunResponse>;
+    async fn get_pairwise_evaluation_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<crate::PairwiseExperimentRunDetailResponse>>;
     async fn list_alerts(&self) -> anyhow::Result<crate::AlertListResponse>;
     async fn acknowledge_alert(
         &self,

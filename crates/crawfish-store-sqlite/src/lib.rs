@@ -3,7 +3,8 @@ use crawfish_core::{ActionEventRecord, ActionStore, CheckpointStore, QueueSummar
 use crawfish_types::{
     Action, AgentManifest, AlertEvent, AuditReceipt, CapabilityLease, ConsentGrant, DatasetCase,
     DelegationReceipt, EncounterRecord, EvaluationRecord, ExperimentCaseResult, ExperimentRun,
-    FeedbackNote, LifecycleRecord, PolicyIncident, ReviewQueueItem, TraceBundle,
+    FeedbackNote, LifecycleRecord, PairwiseCaseResult, PairwiseExperimentRun, PolicyIncident,
+    ReviewQueueItem, TraceBundle,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, Pool, Row, Sqlite, SqlitePool};
@@ -666,6 +667,106 @@ impl SqliteStore {
             .collect()
     }
 
+    pub async fn insert_pairwise_experiment_run(
+        &self,
+        run: &PairwiseExperimentRun,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(run)?;
+        sqlx::query(
+            r#"
+            INSERT INTO pairwise_experiment_runs (id, dataset_name, status, created_at, run_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              dataset_name = excluded.dataset_name,
+              status = excluded.status,
+              created_at = excluded.created_at,
+              run_json = excluded.run_json
+            "#,
+        )
+        .bind(&run.id)
+        .bind(&run.dataset_name)
+        .bind(format!("{:?}", run.status).to_lowercase())
+        .bind(&run.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_pairwise_experiment_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<PairwiseExperimentRun>> {
+        let row = sqlx::query("SELECT run_json FROM pairwise_experiment_runs WHERE id = ?1")
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("run_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn insert_pairwise_case_result(
+        &self,
+        result: &PairwiseCaseResult,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(result)?;
+        sqlx::query(
+            r#"
+            INSERT INTO pairwise_case_results (id, pairwise_run_id, dataset_case_id, created_at, result_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              pairwise_run_id = excluded.pairwise_run_id,
+              dataset_case_id = excluded.dataset_case_id,
+              created_at = excluded.created_at,
+              result_json = excluded.result_json
+            "#,
+        )
+        .bind(&result.id)
+        .bind(&result.pairwise_run_id)
+        .bind(&result.dataset_case_id)
+        .bind(&result.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_pairwise_case_result(
+        &self,
+        case_result_id: &str,
+    ) -> anyhow::Result<Option<PairwiseCaseResult>> {
+        let row = sqlx::query("SELECT result_json FROM pairwise_case_results WHERE id = ?1")
+            .bind(case_result_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("result_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn list_pairwise_case_results(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<PairwiseCaseResult>> {
+        let rows = sqlx::query(
+            "SELECT result_json FROM pairwise_case_results WHERE pairwise_run_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("result_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
+    }
+
     pub async fn insert_alert_event(&self, alert: &AlertEvent) -> anyhow::Result<()> {
         let payload = serde_json::to_string(alert)?;
         sqlx::query(
@@ -1095,6 +1196,49 @@ impl ActionStore for SqliteStore {
         run_id: &str,
     ) -> anyhow::Result<Vec<ExperimentCaseResult>> {
         SqliteStore::list_experiment_case_results(self, run_id).await
+    }
+
+    async fn insert_pairwise_experiment_run(
+        &self,
+        run: &PairwiseExperimentRun,
+    ) -> anyhow::Result<()> {
+        SqliteStore::insert_pairwise_experiment_run(self, run).await
+    }
+
+    async fn get_pairwise_experiment_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<PairwiseExperimentRun>> {
+        SqliteStore::get_pairwise_experiment_run(self, run_id).await
+    }
+
+    async fn update_pairwise_experiment_run(
+        &self,
+        run: &PairwiseExperimentRun,
+    ) -> anyhow::Result<()> {
+        SqliteStore::insert_pairwise_experiment_run(self, run).await
+    }
+
+    async fn insert_pairwise_case_result(&self, result: &PairwiseCaseResult) -> anyhow::Result<()> {
+        SqliteStore::insert_pairwise_case_result(self, result).await
+    }
+
+    async fn get_pairwise_case_result(
+        &self,
+        case_result_id: &str,
+    ) -> anyhow::Result<Option<PairwiseCaseResult>> {
+        SqliteStore::get_pairwise_case_result(self, case_result_id).await
+    }
+
+    async fn update_pairwise_case_result(&self, result: &PairwiseCaseResult) -> anyhow::Result<()> {
+        SqliteStore::insert_pairwise_case_result(self, result).await
+    }
+
+    async fn list_pairwise_case_results(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<PairwiseCaseResult>> {
+        SqliteStore::list_pairwise_case_results(self, run_id).await
     }
 
     async fn insert_alert_event(&self, alert: &AlertEvent) -> anyhow::Result<()> {

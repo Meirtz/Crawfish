@@ -5,11 +5,12 @@ use crawfish_core::{
     ActionEventsResponse, ActionListResponse, ActionTraceResponse, AdminActionResponse,
     AgentDetail, AlertListResponse, ApproveActionRequest, CrawfishConfig,
     EvaluationDatasetDetailResponse, EvaluationDatasetsResponse, ExecutionContractPatch,
-    ExperimentRunDetailResponse, PolicyValidationRequest, PolicyValidationResponse,
-    RejectActionRequest, ResolveReviewQueueItemRequest, ResolveReviewQueueItemResponse,
-    ReviewQueueResponse, RevokeLeaseRequest, StartEvaluationRunRequest, StartEvaluationRunResponse,
-    SubmitActionRequest, SubmittedAction, SwarmStatusResponse, TreatyDetailResponse,
-    TreatyListResponse,
+    ExperimentRunDetailResponse, PairwiseExperimentRunDetailResponse, PolicyValidationRequest,
+    PolicyValidationResponse, RejectActionRequest, ResolveReviewQueueItemRequest,
+    ResolveReviewQueueItemResponse, ReviewQueueResponse, RevokeLeaseRequest,
+    StartEvaluationRunRequest, StartEvaluationRunResponse, StartPairwiseEvaluationRunRequest,
+    StartPairwiseEvaluationRunResponse, SubmitActionRequest, SubmittedAction, SwarmStatusResponse,
+    TreatyDetailResponse, TreatyListResponse,
 };
 use crawfish_runtime::Supervisor;
 use crawfish_types::{
@@ -93,6 +94,8 @@ pub enum EvalSubcommands {
     Dataset(EvalDatasetCommand),
     Run(EvalRunCommand),
     RunStatus(EvalRunStatusCommand),
+    Compare(EvalCompareCommand),
+    CompareStatus(EvalCompareStatusCommand),
 }
 
 #[derive(Debug, Args)]
@@ -341,6 +344,8 @@ pub struct ListReviewQueueCommand {
     #[arg(long, default_value = "Crawfish.toml")]
     pub config: PathBuf,
     #[arg(long)]
+    pub kind: Option<String>,
+    #[arg(long)]
     pub json: bool,
 }
 
@@ -389,6 +394,30 @@ pub struct EvalRunCommand {
 
 #[derive(Debug, Args)]
 pub struct EvalRunStatusCommand {
+    pub run_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvalCompareCommand {
+    pub dataset: String,
+    #[arg(long)]
+    pub left: String,
+    #[arg(long)]
+    pub right: String,
+    #[arg(long)]
+    pub profile: Option<String>,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvalCompareStatusCommand {
     pub run_id: String,
     #[arg(long, default_value = "Crawfish.toml")]
     pub config: PathBuf,
@@ -492,6 +521,8 @@ pub async fn run_cli() -> anyhow::Result<()> {
             },
             EvalSubcommands::Run(command) => eval_run_command(command).await,
             EvalSubcommands::RunStatus(command) => eval_run_status_command(command).await,
+            EvalSubcommands::Compare(command) => eval_compare_command(command).await,
+            EvalSubcommands::CompareStatus(command) => eval_compare_status_command(command).await,
         },
         Commands::Alert(alert) => match alert.command {
             AlertSubcommands::List(command) => alert_list_command(command).await,
@@ -765,7 +796,12 @@ async fn revoke_lease_command(command: RevokeLeaseCommand) -> anyhow::Result<()>
 
 async fn list_review_queue_command(command: ListReviewQueueCommand) -> anyhow::Result<()> {
     let client = DaemonClient::from_config(&command.config)?;
-    let response: ReviewQueueResponse = client.get_json("/v1/review-queue").await?;
+    let path = if let Some(kind) = &command.kind {
+        format!("/v1/review-queue?kind={kind}")
+    } else {
+        "/v1/review-queue".to_string()
+    };
+    let response: ReviewQueueResponse = client.get_json(&path).await?;
     print_output(serde_json::to_value(response)?, command.json)?;
     Ok(())
 }
@@ -821,6 +857,32 @@ async fn eval_run_status_command(command: EvalRunStatusCommand) -> anyhow::Resul
     let client = DaemonClient::from_config(&command.config)?;
     let response: ExperimentRunDetailResponse = client
         .get_json(&format!("/v1/evaluation/runs/{}", command.run_id))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn eval_compare_command(command: EvalCompareCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: StartPairwiseEvaluationRunResponse = client
+        .post_json(
+            "/v1/evaluation/compare",
+            &StartPairwiseEvaluationRunRequest {
+                dataset: command.dataset,
+                left_executor: command.left,
+                right_executor: command.right,
+                profile: command.profile,
+            },
+        )
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn eval_compare_status_command(command: EvalCompareStatusCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: PairwiseExperimentRunDetailResponse = client
+        .get_json(&format!("/v1/evaluation/compare/{}", command.run_id))
         .await?;
     print_output(serde_json::to_value(response)?, command.json)?;
     Ok(())

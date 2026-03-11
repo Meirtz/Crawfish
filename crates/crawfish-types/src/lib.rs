@@ -1520,9 +1520,19 @@ pub struct EvaluationRecord {
     pub summary: String,
     #[serde(default)]
     pub findings: Vec<String>,
+    #[serde(default)]
+    pub criterion_results: Vec<EvaluationCriterionResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback_note_id: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationCriterionResult {
+    pub criterion_id: String,
+    pub passed: bool,
+    pub score_contribution: f64,
+    pub evidence_summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1533,10 +1543,25 @@ pub enum ReviewQueueStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewQueueKind {
+    ActionEval,
+    PairwiseEval,
+}
+
+impl Default for ReviewQueueKind {
+    fn default() -> Self {
+        Self::ActionEval
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewQueueItem {
     pub id: String,
     pub action_id: String,
     pub source: String,
+    #[serde(default)]
+    pub kind: ReviewQueueKind,
     pub status: ReviewQueueStatus,
     pub priority: String,
     pub reason_code: String,
@@ -1545,6 +1570,14 @@ pub struct ReviewQueueItem {
     pub evaluation_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset_case_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairwise_run_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairwise_case_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_case_result_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_case_result_ref: Option<String>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<String>,
@@ -1558,6 +1591,8 @@ pub struct FeedbackNote {
     pub action_id: String,
     pub source: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairwise_case_result_ref: Option<String>,
     pub created_at: String,
 }
 
@@ -1571,16 +1606,31 @@ pub struct AlertRule {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum NumericComparison {
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Equal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ScorecardCriterionKind {
     ArtifactPresent,
+    ArtifactAbsent,
     JsonFieldNonempty,
+    JsonSchemaValid,
     ListMinLen,
+    RegexMatch,
+    NumericThreshold,
+    FieldEquals,
     TokenCoverage,
     CheckpointPassed,
     IncidentAbsent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScorecardCriterion {
     pub id: String,
     pub title: String,
@@ -1597,8 +1647,40 @@ pub struct ScorecardCriterion {
     pub checkpoint: Option<OversightCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incident_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex_pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_value: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numeric_threshold: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numeric_comparison: Option<NumericComparison>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<serde_json::Value>,
     #[serde(default = "default_scorecard_weight")]
     pub weight: u32,
+}
+
+impl Default for ScorecardCriterion {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            title: String::new(),
+            kind: ScorecardCriterionKind::ArtifactPresent,
+            artifact_name: None,
+            field_path: None,
+            source_path: None,
+            min_len: None,
+            checkpoint: None,
+            incident_code: None,
+            regex_pattern: None,
+            expected_value: None,
+            numeric_threshold: None,
+            numeric_comparison: None,
+            json_schema: None,
+            weight: default_scorecard_weight(),
+        }
+    }
 }
 
 fn default_scorecard_weight() -> u32 {
@@ -1630,6 +1712,38 @@ pub struct EvaluationProfile {
     pub dataset_capture: bool,
     #[serde(default)]
     pub post_result_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PairwiseProfile {
+    pub capability: String,
+    pub score_margin: f64,
+    #[serde(default)]
+    pub review_queue: bool,
+    #[serde(default = "default_pairwise_priority")]
+    pub review_priority: String,
+    #[serde(default = "default_pairwise_low_confidence_threshold")]
+    pub low_confidence_threshold: f64,
+    #[serde(default = "default_pairwise_regression_loss_rate_threshold")]
+    pub regression_loss_rate_threshold: f64,
+    #[serde(default = "default_pairwise_needs_review_rate_threshold")]
+    pub needs_review_rate_threshold: f64,
+}
+
+fn default_pairwise_priority() -> String {
+    "medium".to_string()
+}
+
+fn default_pairwise_low_confidence_threshold() -> f64 {
+    0.85
+}
+
+fn default_pairwise_regression_loss_rate_threshold() -> f64 {
+    0.3
+}
+
+fn default_pairwise_needs_review_rate_threshold() -> f64 {
+    0.25
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1724,16 +1838,91 @@ pub struct ExperimentCaseResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_executor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_status: Option<EvaluationStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     pub summary: String,
     #[serde(default)]
     pub findings: Vec<String>,
     #[serde(default)]
+    pub criterion_results: Vec<EvaluationCriterionResult>,
+    #[serde(default)]
     pub artifact_refs: Vec<ArtifactRef>,
     #[serde(default)]
     pub external_refs: Vec<ExternalRef>,
+    #[serde(default)]
+    pub policy_incident_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_code: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairwiseOutcome {
+    LeftWins,
+    RightWins,
+    NeedsReview,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairwiseExperimentRunStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PairwiseExperimentRun {
+    pub id: String,
+    pub dataset_name: String,
+    pub capability: String,
+    pub profile_name: String,
+    pub left_executor: String,
+    pub right_executor: String,
+    pub left_run_id: String,
+    pub right_run_id: String,
+    pub status: PairwiseExperimentRunStatus,
+    pub total_cases: u32,
+    pub completed_cases: u32,
+    pub left_wins: u32,
+    pub right_wins: u32,
+    pub needs_review_cases: u32,
+    #[serde(default)]
+    pub triggered_alert_rules: Vec<String>,
+    #[serde(default)]
+    pub alert_summaries: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PairwiseCaseResult {
+    pub id: String,
+    pub pairwise_run_id: String,
+    pub dataset_case_id: String,
+    pub outcome: PairwiseOutcome,
+    pub summary: String,
+    pub reason_code: String,
+    pub left_case_result_ref: String,
+    pub right_case_result_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_queue_item_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_note_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_resolution: Option<String>,
     pub created_at: String,
 }
 

@@ -22,6 +22,8 @@ crawfish-store-sqlite = { path = "../crawfish-store-sqlite" }
 crawfish-types = { path = "../crawfish-types" }
 http-body-util.workspace = true
 hyper.workspace = true
+jsonschema.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

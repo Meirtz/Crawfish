@@ -1,8 +1,8 @@
 use crawfish_types::{
     AlertRule, CallerOwnerMapping, CapabilityVisibility, DataBoundaryPolicy, DefaultDisposition,
     EncounterPolicy, EvaluationDataset, EvaluationProfile, ExecutionContract, McpServerConfig,
-    NetworkBoundaryPolicy, OwnerKind, ScorecardSpec, ToolBoundaryPolicy, TreatyPack, TrustDomain,
-    WorkspaceBoundaryPolicy,
+    NetworkBoundaryPolicy, OwnerKind, PairwiseProfile, ScorecardSpec, ToolBoundaryPolicy,
+    TreatyPack, TrustDomain, WorkspaceBoundaryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -99,6 +99,8 @@ pub struct EvaluationConfig {
     pub profiles: BTreeMap<String, EvaluationProfile>,
     #[serde(default)]
     pub scorecards: BTreeMap<String, ScorecardSpec>,
+    #[serde(default)]
+    pub pairwise_profiles: BTreeMap<String, PairwiseProfile>,
     #[serde(default)]
     pub datasets: BTreeMap<String, EvaluationDataset>,
     #[serde(default)]

@@ -18,11 +18,13 @@ use crawfish_core::{
     EvaluationDatasetDetailResponse, EvaluationDatasetsResponse, ExecutionContractPatch,
     ExecutionSurface, ExperimentRunDetailResponse, GovernanceContext, HealthResponse,
     OpenClawAgentStatusResponse, OpenClawCallerContext, OpenClawInboundActionRequest,
-    OpenClawInboundActionResponse, OpenClawInspectionContext, PolicyValidationRequest,
-    PolicyValidationResponse, RejectActionRequest, ResolveReviewQueueItemRequest,
-    ResolveReviewQueueItemResponse, ReviewQueueResponse, RevokeLeaseRequest,
-    StartEvaluationRunRequest, StartEvaluationRunResponse, SubmitActionRequest, SubmittedAction,
-    SupervisorControl, SwarmStatusResponse, TreatyDetailResponse, TreatyListResponse,
+    OpenClawInboundActionResponse, OpenClawInspectionContext, PairwiseExperimentRunDetailResponse,
+    PolicyValidationRequest, PolicyValidationResponse, RejectActionRequest,
+    ResolveReviewQueueItemRequest, ResolveReviewQueueItemResponse, ReviewQueueResponse,
+    RevokeLeaseRequest, StartEvaluationRunRequest, StartEvaluationRunResponse,
+    StartPairwiseEvaluationRunRequest, StartPairwiseEvaluationRunResponse, SubmitActionRequest,
+    SubmittedAction, SupervisorControl, SwarmStatusResponse, TreatyDetailResponse,
+    TreatyListResponse,
 };
 use crawfish_harness_local::{LocalHarnessAdapter, LocalHarnessError};
 use crawfish_mcp::McpAdapter;
@@ -37,11 +39,13 @@ use crawfish_types::{
     EvaluationDataset, EvaluationProfile, EvaluationRecord, EvaluationStatus, ExecutionStrategy,
     ExecutionStrategyMode, ExperimentCaseResult, ExperimentCaseStatus, ExperimentRun,
     ExperimentRunStatus, ExternalRef, FeedbackNote, FeedbackPolicy, HealthStatus,
-    JurisdictionClass, LifecycleRecord, LocalHarnessKind, Metadata, Mutability,
-    OversightCheckpoint, OwnerKind, OwnerRef, PolicyIncident, PolicyIncidentSeverity,
-    RequesterKind, ReviewQueueItem, ReviewQueueStatus, ScorecardCriterion, ScorecardCriterionKind,
-    ScorecardSpec, StrategyCheckpointState, TraceBundle, TrustDomain, VerificationStatus,
-    VerificationSummary, VerifyLoopFailureMode, WorkspaceEdit, WorkspaceEditOp,
+    JurisdictionClass, LifecycleRecord, LocalHarnessKind, Metadata, Mutability, NumericComparison,
+    OversightCheckpoint, OwnerKind, OwnerRef, PairwiseCaseResult, PairwiseExperimentRun,
+    PairwiseExperimentRunStatus, PairwiseOutcome, PairwiseProfile, PolicyIncident,
+    PolicyIncidentSeverity, RequesterKind, ReviewQueueItem, ReviewQueueKind, ReviewQueueStatus,
+    ScorecardCriterion, ScorecardCriterionKind, ScorecardSpec, StrategyCheckpointState,
+    TraceBundle, TrustDomain, VerificationStatus, VerificationSummary, VerifyLoopFailureMode,
+    WorkspaceEdit, WorkspaceEditOp,
 };
 use hero::{
     load_json_artifact, required_input_string, CiTriageDeterministicExecutor,
@@ -49,6 +53,8 @@ use hero::{
     RepoReviewerDeterministicExecutor, TaskPlannerDeterministicExecutor,
     WorkspacePatchApplyDeterministicExecutor,
 };
+use jsonschema::validator_for;
+use regex::Regex;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -84,6 +90,11 @@ struct ActionListQuery {
     phase: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ReviewQueueQuery {
+    kind: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct OpenClawResolvedCaller {
     caller_id: String,
@@ -102,11 +113,18 @@ struct ResolvedEvaluationProfile {
 }
 
 #[derive(Debug, Clone)]
+struct ResolvedPairwiseProfile {
+    name: String,
+    profile: PairwiseProfile,
+}
+
+#[derive(Debug, Clone)]
 struct ScorecardOutcome {
     status: EvaluationStatus,
     score: f64,
     summary: String,
     findings: Vec<String>,
+    criterion_results: Vec<crawfish_types::EvaluationCriterionResult>,
 }
 
 fn is_task_plan_capability(capability: &str) -> bool {
@@ -931,6 +949,7 @@ impl Supervisor {
             score: Some(outcome.score),
             summary: outcome.summary,
             findings: outcome.findings,
+            criterion_results: outcome.criterion_results,
             feedback_note_id: None,
             created_at: now_timestamp(),
         }])
@@ -955,15 +974,17 @@ impl Supervisor {
 
         let mut passed_weight = 0_u32;
         let mut findings = Vec::new();
+        let mut criterion_results = Vec::new();
         for criterion in &profile.scorecard.criteria {
-            if self
-                .scorecard_criterion_passed(action, doctrine, checkpoint_status, criterion)
-                .await?
-            {
+            let criterion_result = self
+                .scorecard_criterion_result(action, doctrine, checkpoint_status, criterion)
+                .await?;
+            if criterion_result.passed {
                 passed_weight = passed_weight.saturating_add(criterion.weight.max(1));
             } else {
                 findings.push(format!("{} failed", criterion.title));
             }
+            criterion_results.push(criterion_result);
         }
 
         let score = f64::from(passed_weight) / f64::from(total_weight);
@@ -982,6 +1003,7 @@ impl Supervisor {
             score,
             summary: format!("Deterministic scorecard for {}", action.capability),
             findings,
+            criterion_results,
         })
     }
 
@@ -1052,6 +1074,7 @@ impl Supervisor {
             source: profile
                 .map(|profile| profile.name.clone())
                 .unwrap_or_else(|| "policy_incident".to_string()),
+            kind: ReviewQueueKind::ActionEval,
             status: ReviewQueueStatus::Open,
             priority,
             reason_code,
@@ -1061,6 +1084,10 @@ impl Supervisor {
                 .unwrap_or_else(|| "operator review required".to_string()),
             evaluation_ref: evaluation.map(|evaluation| evaluation.id.clone()),
             dataset_case_ref: dataset_case.map(|case| case.id.clone()),
+            pairwise_run_ref: None,
+            pairwise_case_ref: None,
+            left_case_result_ref: None,
+            right_case_result_ref: None,
             created_at: now_timestamp(),
             resolved_at: None,
             resolution: None,
@@ -1285,6 +1312,12 @@ impl Supervisor {
         rules
     }
 
+    fn evaluation_pairwise_profiles(&self) -> BTreeMap<String, PairwiseProfile> {
+        let mut profiles = builtin_pairwise_profiles();
+        profiles.extend(self.config.evaluation.pairwise_profiles.clone());
+        profiles
+    }
+
     fn resolve_evaluation_profile(
         &self,
         action: &Action,
@@ -1333,19 +1366,56 @@ impl Supervisor {
         }))
     }
 
-    async fn scorecard_criterion_passed(
+    fn resolve_pairwise_profile(
+        &self,
+        dataset: &EvaluationDataset,
+        requested_name: Option<&str>,
+    ) -> anyhow::Result<Option<ResolvedPairwiseProfile>> {
+        let profile_name = if let Some(name) = requested_name {
+            name.to_string()
+        } else if let Some(name) = builtin_pairwise_profile_name_for_capability(&dataset.capability)
+        {
+            name.to_string()
+        } else {
+            return Ok(None);
+        };
+
+        let profiles = self.evaluation_pairwise_profiles();
+        let Some(profile) = profiles.get(&profile_name).cloned() else {
+            return Ok(None);
+        };
+        if profile.capability != dataset.capability {
+            anyhow::bail!(
+                "pairwise profile {} targets {}, not {}",
+                profile_name,
+                profile.capability,
+                dataset.capability
+            );
+        }
+        Ok(Some(ResolvedPairwiseProfile {
+            name: profile_name,
+            profile,
+        }))
+    }
+
+    async fn scorecard_criterion_result(
         &self,
         action: &Action,
         _doctrine: &DoctrinePack,
         checkpoint_status: &[CheckpointStatus],
         criterion: &ScorecardCriterion,
-    ) -> anyhow::Result<bool> {
-        match criterion.kind {
-            ScorecardCriterionKind::ArtifactPresent => Ok(criterion
+    ) -> anyhow::Result<crawfish_types::EvaluationCriterionResult> {
+        let passed = match criterion.kind {
+            ScorecardCriterionKind::ArtifactPresent => criterion
                 .artifact_name
                 .as_deref()
                 .and_then(|name| artifact_ref_by_name(action, name))
-                .is_some()),
+                .is_some(),
+            ScorecardCriterionKind::ArtifactAbsent => criterion
+                .artifact_name
+                .as_deref()
+                .map(|name| artifact_ref_by_name(action, name).is_none())
+                .unwrap_or(false),
             ScorecardCriterionKind::JsonFieldNonempty => {
                 let Some(target) = scorecard_target_value(
                     action,
@@ -1354,9 +1424,37 @@ impl Supervisor {
                 )
                 .await?
                 else {
-                    return Ok(false);
+                    return Ok(crawfish_types::EvaluationCriterionResult {
+                        criterion_id: criterion.id.clone(),
+                        passed: false,
+                        score_contribution: 0.0,
+                        evidence_summary: "target value missing".to_string(),
+                    });
                 };
-                Ok(json_value_is_nonempty(&target))
+                json_value_is_nonempty(&target)
+            }
+            ScorecardCriterionKind::JsonSchemaValid => {
+                let Some(target) = scorecard_target_value(
+                    action,
+                    criterion.artifact_name.as_deref(),
+                    criterion.field_path.as_deref(),
+                )
+                .await?
+                else {
+                    return Ok(crawfish_types::EvaluationCriterionResult {
+                        criterion_id: criterion.id.clone(),
+                        passed: false,
+                        score_contribution: 0.0,
+                        evidence_summary: "target value missing".to_string(),
+                    });
+                };
+                let Some(schema) = criterion.json_schema.as_ref() else {
+                    anyhow::bail!(
+                        "json_schema_valid criterion {} missing json_schema",
+                        criterion.id
+                    );
+                };
+                validator_for(schema)?.is_valid(&target)
             }
             ScorecardCriterionKind::ListMinLen => {
                 let Some(target) = scorecard_target_value(
@@ -1366,21 +1464,19 @@ impl Supervisor {
                 )
                 .await?
                 else {
-                    return Ok(false);
+                    return Ok(crawfish_types::EvaluationCriterionResult {
+                        criterion_id: criterion.id.clone(),
+                        passed: false,
+                        score_contribution: 0.0,
+                        evidence_summary: "target value missing".to_string(),
+                    });
                 };
-                Ok(target
+                target
                     .as_array()
                     .map(|items| items.len() >= criterion.min_len.unwrap_or(1) as usize)
-                    .unwrap_or(false))
+                    .unwrap_or(false)
             }
-            ScorecardCriterionKind::TokenCoverage => {
-                let Some(source_path) = criterion.source_path.as_deref() else {
-                    return Ok(false);
-                };
-                let source_tokens = scorecard_source_tokens(action, source_path);
-                if source_tokens.is_empty() {
-                    return Ok(true);
-                }
+            ScorecardCriterionKind::RegexMatch => {
                 let Some(target_text) = scorecard_target_text(
                     action,
                     criterion.artifact_name.as_deref(),
@@ -1388,33 +1484,149 @@ impl Supervisor {
                 )
                 .await?
                 else {
-                    return Ok(false);
+                    return Ok(crawfish_types::EvaluationCriterionResult {
+                        criterion_id: criterion.id.clone(),
+                        passed: false,
+                        score_contribution: 0.0,
+                        evidence_summary: "target text missing".to_string(),
+                    });
                 };
-                let target_text = target_text.to_ascii_lowercase();
-                Ok(source_tokens
-                    .into_iter()
-                    .all(|token| target_text.contains(&token)))
+                let Some(pattern) = criterion.regex_pattern.as_deref() else {
+                    anyhow::bail!(
+                        "regex_match criterion {} missing regex_pattern",
+                        criterion.id
+                    );
+                };
+                Regex::new(pattern)?.is_match(&target_text)
+            }
+            ScorecardCriterionKind::NumericThreshold => {
+                let Some(target) = scorecard_target_value(
+                    action,
+                    criterion.artifact_name.as_deref(),
+                    criterion.field_path.as_deref(),
+                )
+                .await?
+                else {
+                    return Ok(crawfish_types::EvaluationCriterionResult {
+                        criterion_id: criterion.id.clone(),
+                        passed: false,
+                        score_contribution: 0.0,
+                        evidence_summary: "target value missing".to_string(),
+                    });
+                };
+                let Some(number) = target.as_f64() else {
+                    return Ok(crawfish_types::EvaluationCriterionResult {
+                        criterion_id: criterion.id.clone(),
+                        passed: false,
+                        score_contribution: 0.0,
+                        evidence_summary: "target value was not numeric".to_string(),
+                    });
+                };
+                let threshold = criterion.numeric_threshold.unwrap_or_default();
+                match criterion
+                    .numeric_comparison
+                    .clone()
+                    .unwrap_or(NumericComparison::GreaterThanOrEqual)
+                {
+                    NumericComparison::GreaterThan => number > threshold,
+                    NumericComparison::GreaterThanOrEqual => number >= threshold,
+                    NumericComparison::LessThan => number < threshold,
+                    NumericComparison::LessThanOrEqual => number <= threshold,
+                    NumericComparison::Equal => (number - threshold).abs() < f64::EPSILON,
+                }
+            }
+            ScorecardCriterionKind::FieldEquals => {
+                let Some(target) = scorecard_target_value(
+                    action,
+                    criterion.artifact_name.as_deref(),
+                    criterion.field_path.as_deref(),
+                )
+                .await?
+                else {
+                    return Ok(crawfish_types::EvaluationCriterionResult {
+                        criterion_id: criterion.id.clone(),
+                        passed: false,
+                        score_contribution: 0.0,
+                        evidence_summary: "target value missing".to_string(),
+                    });
+                };
+                let Some(expected) = criterion.expected_value.as_ref() else {
+                    anyhow::bail!(
+                        "field_equals criterion {} missing expected_value",
+                        criterion.id
+                    );
+                };
+                target == *expected
+            }
+            ScorecardCriterionKind::TokenCoverage => {
+                let Some(source_path) = criterion.source_path.as_deref() else {
+                    return Ok(crawfish_types::EvaluationCriterionResult {
+                        criterion_id: criterion.id.clone(),
+                        passed: false,
+                        score_contribution: 0.0,
+                        evidence_summary: "source_path missing".to_string(),
+                    });
+                };
+                let source_tokens = scorecard_source_tokens(action, source_path);
+                if source_tokens.is_empty() {
+                    true
+                } else {
+                    let Some(target_text) = scorecard_target_text(
+                        action,
+                        criterion.artifact_name.as_deref(),
+                        criterion.field_path.as_deref(),
+                    )
+                    .await?
+                    else {
+                        return Ok(crawfish_types::EvaluationCriterionResult {
+                            criterion_id: criterion.id.clone(),
+                            passed: false,
+                            score_contribution: 0.0,
+                            evidence_summary: "target text missing".to_string(),
+                        });
+                    };
+                    let target_text = target_text.to_ascii_lowercase();
+                    source_tokens
+                        .into_iter()
+                        .all(|token| target_text.contains(&token))
+                }
             }
             ScorecardCriterionKind::CheckpointPassed => {
                 let Some(checkpoint) = criterion.checkpoint.as_ref() else {
-                    return Ok(false);
+                    return Ok(crawfish_types::EvaluationCriterionResult {
+                        criterion_id: criterion.id.clone(),
+                        passed: false,
+                        score_contribution: 0.0,
+                        evidence_summary: "checkpoint missing".to_string(),
+                    });
                 };
-                Ok(checkpoint_status.iter().any(|status| {
+                checkpoint_status.iter().any(|status| {
                     &status.checkpoint == checkpoint
                         && matches!(status.outcome, CheckpointOutcome::Passed)
-                }))
+                })
             }
             ScorecardCriterionKind::IncidentAbsent => {
                 let incidents = self.store.list_policy_incidents(&action.id).await?;
                 if let Some(code) = criterion.incident_code.as_deref() {
-                    Ok(!incidents
+                    !incidents
                         .iter()
-                        .any(|incident| incident.reason_code == code))
+                        .any(|incident| incident.reason_code == code)
                 } else {
-                    Ok(incidents.is_empty())
+                    incidents.is_empty()
                 }
             }
-        }
+        };
+
+        Ok(crawfish_types::EvaluationCriterionResult {
+            criterion_id: criterion.id.clone(),
+            passed,
+            score_contribution: if passed {
+                f64::from(criterion.weight.max(1))
+            } else {
+                0.0
+            },
+            evidence_summary: scorecard_evidence_summary(action, criterion, passed).await?,
+        })
     }
 
     async fn maybe_capture_dataset_case(
@@ -1507,8 +1719,9 @@ impl Supervisor {
             stop_budget: None,
             feedback_policy: crawfish_types::FeedbackPolicy::default(),
         });
-        action.contract.execution.fallback_chain = Vec::new();
-        action.contract.execution.preferred_harnesses = vec![run.executor.clone()];
+        let (preferred_harnesses, fallback_chain) = replay_routes_for_executor(&run.executor);
+        action.contract.execution.fallback_chain = fallback_chain;
+        action.contract.execution.preferred_harnesses = preferred_harnesses;
 
         let outcome = match case.capability.as_str() {
             "task.plan" => {
@@ -1612,6 +1825,12 @@ impl Supervisor {
                     .await?
                     .into_iter()
                     .last();
+                let incidents = self.policy_incidents_for_action(
+                    &action,
+                    resolved_profile.as_ref(),
+                    evaluation.as_ref(),
+                    &checkpoint_status,
+                );
                 Ok(ExperimentCaseResult {
                     id: Uuid::new_v4().to_string(),
                     run_id: run.id.clone(),
@@ -1622,6 +1841,9 @@ impl Supervisor {
                         _ => ExperimentCaseStatus::Passed,
                     },
                     selected_executor: Some(selected_executor),
+                    evaluation_status: evaluation
+                        .as_ref()
+                        .map(|evaluation| evaluation.status.clone()),
                     score: evaluation.as_ref().and_then(|evaluation| evaluation.score),
                     summary: evaluation
                         .as_ref()
@@ -1631,8 +1853,13 @@ impl Supervisor {
                         .as_ref()
                         .map(|evaluation| evaluation.findings.clone())
                         .unwrap_or_default(),
+                    criterion_results: evaluation
+                        .as_ref()
+                        .map(|evaluation| evaluation.criterion_results.clone())
+                        .unwrap_or_default(),
                     artifact_refs: outputs.artifacts,
                     external_refs,
+                    policy_incident_count: incidents.len() as u32,
                     failure_code: None,
                     created_at: now_timestamp(),
                 })
@@ -1657,11 +1884,14 @@ impl Supervisor {
                 capability: case.capability.clone(),
                 status: ExperimentCaseStatus::Failed,
                 selected_executor: action.selected_executor.clone(),
+                evaluation_status: None,
                 score: None,
                 summary: reason,
                 findings: Vec::new(),
+                criterion_results: Vec::new(),
                 artifact_refs: outputs.artifacts,
                 external_refs,
+                policy_incident_count: 0,
                 failure_code: Some(failure_code),
                 created_at: now_timestamp(),
             }),
@@ -1691,6 +1921,7 @@ impl Supervisor {
                 runtime_enum_to_snake(&summary.status)
             ),
             findings: feedback.into_iter().cloned().collect(),
+            criterion_results: Vec::new(),
             feedback_note_id: None,
             created_at: now_timestamp(),
         };
@@ -4604,6 +4835,14 @@ async fn scorecard_target_text(
     artifact_name: Option<&str>,
     field_path: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
+    if let Some(artifact_name) = artifact_name {
+        let Some(artifact_ref) = artifact_ref_by_name(action, artifact_name) else {
+            return Ok(None);
+        };
+        if field_path.is_none() {
+            return Ok(Some(tokio::fs::read_to_string(&artifact_ref.path).await?));
+        }
+    }
     let Some(value) = scorecard_target_value(action, artifact_name, field_path).await? else {
         return Ok(None);
     };
@@ -4611,6 +4850,109 @@ async fn scorecard_target_text(
         Value::String(text) => text,
         other => serde_json::to_string(&other)?,
     }))
+}
+
+async fn scorecard_evidence_summary(
+    action: &Action,
+    criterion: &ScorecardCriterion,
+    passed: bool,
+) -> anyhow::Result<String> {
+    let target_label = criterion
+        .artifact_name
+        .clone()
+        .unwrap_or_else(|| "inputs".to_string());
+    let path_label = criterion
+        .field_path
+        .as_deref()
+        .map(|path| format!(" at `{path}`"))
+        .unwrap_or_default();
+    let status = if passed { "passed" } else { "failed" };
+
+    let detail = match criterion.kind {
+        ScorecardCriterionKind::RegexMatch => criterion
+            .regex_pattern
+            .as_deref()
+            .map(|pattern| format!("pattern `{pattern}`"))
+            .unwrap_or_else(|| "regex pattern missing".to_string()),
+        ScorecardCriterionKind::NumericThreshold => format!(
+            "threshold {:?} {}",
+            criterion.numeric_comparison,
+            criterion.numeric_threshold.unwrap_or_default()
+        ),
+        ScorecardCriterionKind::FieldEquals => criterion
+            .expected_value
+            .as_ref()
+            .map(|value| format!("expected {value}"))
+            .unwrap_or_else(|| "expected value missing".to_string()),
+        ScorecardCriterionKind::JsonSchemaValid => "JSON schema validation".to_string(),
+        ScorecardCriterionKind::ListMinLen => {
+            format!("minimum length {}", criterion.min_len.unwrap_or(1))
+        }
+        ScorecardCriterionKind::TokenCoverage => criterion
+            .source_path
+            .as_deref()
+            .map(|path| format!("cover tokens from `{path}`"))
+            .unwrap_or_else(|| "token source missing".to_string()),
+        ScorecardCriterionKind::CheckpointPassed => criterion
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| format!("checkpoint `{}`", runtime_enum_to_snake(checkpoint)))
+            .unwrap_or_else(|| "checkpoint missing".to_string()),
+        ScorecardCriterionKind::IncidentAbsent => criterion
+            .incident_code
+            .as_deref()
+            .map(|code| format!("incident `{code}` absent"))
+            .unwrap_or_else(|| "no incidents present".to_string()),
+        ScorecardCriterionKind::ArtifactPresent => "artifact present".to_string(),
+        ScorecardCriterionKind::ArtifactAbsent => "artifact absent".to_string(),
+        ScorecardCriterionKind::JsonFieldNonempty => "field nonempty".to_string(),
+    };
+
+    if matches!(
+        criterion.kind,
+        ScorecardCriterionKind::ArtifactPresent | ScorecardCriterionKind::ArtifactAbsent
+    ) && criterion.artifact_name.is_some()
+    {
+        return Ok(format!("{status}: {detail} for `{target_label}`"));
+    }
+
+    let observed = if matches!(criterion.kind, ScorecardCriterionKind::RegexMatch) {
+        scorecard_target_text(
+            action,
+            criterion.artifact_name.as_deref(),
+            criterion.field_path.as_deref(),
+        )
+        .await?
+        .map(|text| format!(" observed {}", compact_json_value(&Value::String(text))))
+        .unwrap_or_else(|| " observed <missing>".to_string())
+    } else {
+        let current = scorecard_target_value(
+            action,
+            criterion.artifact_name.as_deref(),
+            criterion.field_path.as_deref(),
+        )
+        .await?;
+        current
+            .as_ref()
+            .map(|value| format!(" observed {}", compact_json_value(value)))
+            .unwrap_or_else(|| " observed <missing>".to_string())
+    };
+    Ok(format!(
+        "{status}: {detail} on `{target_label}`{path_label}.{observed}"
+    ))
+}
+
+fn compact_json_value(value: &Value) -> String {
+    let raw = match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let trimmed = raw.trim();
+    if trimmed.len() > 120 {
+        format!("{}...", &trimmed[..117])
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn json_value_at_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
@@ -5191,6 +5533,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "artifact_markdown".to_string(),
@@ -5203,6 +5546,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "ordered_steps".to_string(),
@@ -5215,6 +5559,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 2,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "risks".to_string(),
@@ -5227,6 +5572,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "assumptions".to_string(),
@@ -5239,6 +5585,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "confidence_summary".to_string(),
@@ -5251,6 +5598,34 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "task_plan_schema".to_string(),
+                        title: "task plan JSON matches the expected schema".to_string(),
+                        kind: ScorecardCriterionKind::JsonSchemaValid,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        json_schema: Some(serde_json::json!({
+                            "type": "object",
+                            "required": ["ordered_steps", "risks", "assumptions", "confidence_summary"],
+                            "properties": {
+                                "ordered_steps": {"type": "array"},
+                                "risks": {"type": "array"},
+                                "assumptions": {"type": "array"},
+                                "confidence_summary": {"type": "string"}
+                            }
+                        })),
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "task_plan_heading".to_string(),
+                        title: "task plan markdown keeps the expected heading".to_string(),
+                        kind: ScorecardCriterionKind::RegexMatch,
+                        artifact_name: Some("task_plan.md".to_string()),
+                        regex_pattern: Some(r"(?m)^# Task Plan$".to_string()),
+                        weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "objective_coverage".to_string(),
@@ -5263,6 +5638,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 2,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "desired_outputs".to_string(),
@@ -5275,6 +5651,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "pre_dispatch".to_string(),
@@ -5287,6 +5664,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: Some(OversightCheckpoint::PreDispatch),
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                 ],
                 minimum_score: Some(0.6),
@@ -5310,6 +5688,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "summary_md".to_string(),
@@ -5322,6 +5701,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "changed_files".to_string(),
@@ -5334,6 +5714,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 2,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "findings".to_string(),
@@ -5346,6 +5727,33 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "review_schema".to_string(),
+                        title: "review findings JSON matches the expected schema".to_string(),
+                        kind: ScorecardCriterionKind::JsonSchemaValid,
+                        artifact_name: Some("review_findings.json".to_string()),
+                        json_schema: Some(serde_json::json!({
+                            "type": "object",
+                            "required": ["risk_level", "changed_files", "findings"],
+                            "properties": {
+                                "risk_level": {"type": "string"},
+                                "changed_files": {"type": "array"},
+                                "findings": {"type": "array"}
+                            }
+                        })),
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "review_heading".to_string(),
+                        title: "review markdown keeps the expected heading".to_string(),
+                        kind: ScorecardCriterionKind::RegexMatch,
+                        artifact_name: Some("review_summary.md".to_string()),
+                        regex_pattern: Some(r"(?m)^# Review Summary$".to_string()),
+                        weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "pre_dispatch".to_string(),
@@ -5358,6 +5766,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: Some(OversightCheckpoint::PreDispatch),
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                 ],
                 minimum_score: Some(0.5),
@@ -5381,6 +5790,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "summary_md".to_string(),
@@ -5393,6 +5803,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "blast_radius".to_string(),
@@ -5405,6 +5816,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 2,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "next_steps".to_string(),
@@ -5417,6 +5829,34 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: None,
                         incident_code: None,
                         weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "incident_schema".to_string(),
+                        title: "incident enrichment JSON matches the expected schema".to_string(),
+                        kind: ScorecardCriterionKind::JsonSchemaValid,
+                        artifact_name: Some("incident_enrichment.json".to_string()),
+                        json_schema: Some(serde_json::json!({
+                            "type": "object",
+                            "required": ["probable_blast_radius", "error_signatures", "repeated_symptoms", "next_steps"],
+                            "properties": {
+                                "probable_blast_radius": {"type": "array"},
+                                "error_signatures": {"type": "array"},
+                                "repeated_symptoms": {"type": "array"},
+                                "next_steps": {"type": "array"}
+                            }
+                        })),
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "incident_heading".to_string(),
+                        title: "incident markdown keeps the expected heading".to_string(),
+                        kind: ScorecardCriterionKind::RegexMatch,
+                        artifact_name: Some("incident_summary.md".to_string()),
+                        regex_pattern: Some(r"(?m)^# Incident Summary$".to_string()),
+                        weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                     ScorecardCriterion {
                         id: "pre_dispatch".to_string(),
@@ -5429,6 +5869,7 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                         checkpoint: Some(OversightCheckpoint::PreDispatch),
                         incident_code: None,
                         weight: 1,
+                        ..ScorecardCriterion::default()
                     },
                 ],
                 minimum_score: Some(0.5),
@@ -5498,12 +5939,51 @@ fn builtin_alert_rules() -> BTreeMap<String, AlertRule> {
     ])
 }
 
+fn builtin_pairwise_profiles() -> BTreeMap<String, PairwiseProfile> {
+    BTreeMap::from([(
+        "task_plan_pairwise_default".to_string(),
+        PairwiseProfile {
+            capability: "task.plan".to_string(),
+            score_margin: 0.1,
+            review_queue: true,
+            review_priority: "medium".to_string(),
+            low_confidence_threshold: 0.85,
+            regression_loss_rate_threshold: 0.3,
+            needs_review_rate_threshold: 0.25,
+        },
+    )])
+}
+
 fn builtin_profile_name_for_capability(capability: &str) -> Option<&'static str> {
     match capability {
         "task.plan" | "coding.patch.plan" => Some("task_plan_default"),
         "repo.review" => Some("repo_review_default"),
         "incident.enrich" => Some("incident_enrich_default"),
         _ => None,
+    }
+}
+
+fn builtin_pairwise_profile_name_for_capability(capability: &str) -> Option<&'static str> {
+    match capability {
+        "task.plan" | "coding.patch.plan" => Some("task_plan_pairwise_default"),
+        _ => None,
+    }
+}
+
+fn replay_routes_for_executor(executor: &str) -> (Vec<String>, Vec<String>) {
+    match executor {
+        "deterministic" | "deterministic.task_plan" => {
+            (Vec::new(), vec!["deterministic".to_string()])
+        }
+        "claude_code" | "local_harness.claude_code" => {
+            (vec!["claude_code".to_string()], Vec::new())
+        }
+        "codex" | "local_harness.codex" => (vec!["codex".to_string()], Vec::new()),
+        "openclaw" => (vec!["openclaw".to_string()], Vec::new()),
+        "a2a" => (vec!["a2a".to_string()], Vec::new()),
+        other if other.starts_with("openclaw.") => (vec!["openclaw".to_string()], Vec::new()),
+        other if other.starts_with("a2a.") => (vec!["a2a".to_string()], Vec::new()),
+        other => (vec![other.to_string()], Vec::new()),
     }
 }
 
@@ -5611,6 +6091,389 @@ fn continuity_mode_name(mode: &ContinuityModeName) -> &'static str {
     }
 }
 
+fn build_pairwise_case_result(
+    pairwise_run_id: &str,
+    dataset_case: &DatasetCase,
+    left: &ExperimentCaseResult,
+    right: &ExperimentCaseResult,
+    profile: &PairwiseProfile,
+) -> PairwiseCaseResult {
+    let (outcome, reason_code, summary) =
+        if left.policy_incident_count < right.policy_incident_count {
+            (
+                PairwiseOutcome::LeftWins,
+                "fewer_policy_incidents".to_string(),
+                "left executor produced fewer doctrine/policy incidents".to_string(),
+            )
+        } else if right.policy_incident_count < left.policy_incident_count {
+            (
+                PairwiseOutcome::RightWins,
+                "fewer_policy_incidents".to_string(),
+                "right executor produced fewer doctrine/policy incidents".to_string(),
+            )
+        } else if left.status != right.status {
+            if matches!(left.status, ExperimentCaseStatus::Passed) {
+                (
+                    PairwiseOutcome::LeftWins,
+                    "successful_status".to_string(),
+                    "left executor succeeded while right failed".to_string(),
+                )
+            } else {
+                (
+                    PairwiseOutcome::RightWins,
+                    "successful_status".to_string(),
+                    "right executor succeeded while left failed".to_string(),
+                )
+            }
+        } else if let (Some(left_score), Some(right_score)) = (left.score, right.score) {
+            if left.policy_incident_count != right.policy_incident_count
+                && (left_score - right_score).abs() > profile.score_margin
+                && ((left.policy_incident_count > right.policy_incident_count
+                    && left_score > right_score)
+                    || (right.policy_incident_count > left.policy_incident_count
+                        && right_score > left_score))
+            {
+                (
+                    PairwiseOutcome::NeedsReview,
+                    "signal_conflict".to_string(),
+                    "doctrine and evaluation signals conflict across executors".to_string(),
+                )
+            } else if (left_score - right_score).abs() > profile.score_margin {
+                if left_score > right_score {
+                    (
+                        PairwiseOutcome::LeftWins,
+                        "higher_normalized_score".to_string(),
+                        "left executor achieved the higher normalized score".to_string(),
+                    )
+                } else {
+                    (
+                        PairwiseOutcome::RightWins,
+                        "higher_normalized_score".to_string(),
+                        "right executor achieved the higher normalized score".to_string(),
+                    )
+                }
+            } else {
+                (
+                    PairwiseOutcome::NeedsReview,
+                    "score_margin_needs_review".to_string(),
+                    "score delta stayed within the pairwise review margin".to_string(),
+                )
+            }
+        } else {
+            (
+                PairwiseOutcome::NeedsReview,
+                "insufficient_score_evidence".to_string(),
+                "pairwise comparison lacked sufficient score evidence".to_string(),
+            )
+        };
+
+    PairwiseCaseResult {
+        id: Uuid::new_v4().to_string(),
+        pairwise_run_id: pairwise_run_id.to_string(),
+        dataset_case_id: dataset_case.id.clone(),
+        outcome,
+        summary,
+        reason_code,
+        left_case_result_ref: left.id.clone(),
+        right_case_result_ref: right.id.clone(),
+        left_score: left.score,
+        right_score: right.score,
+        review_queue_item_ref: None,
+        feedback_note_id: None,
+        review_resolution: None,
+        created_at: now_timestamp(),
+    }
+}
+
+fn maybe_enqueue_pairwise_review_item(
+    dataset_case: &DatasetCase,
+    profile: &PairwiseProfile,
+    left_executor: &str,
+    right_executor: &str,
+    left: &ExperimentCaseResult,
+    right: &ExperimentCaseResult,
+    result: &PairwiseCaseResult,
+) -> Option<ReviewQueueItem> {
+    if !profile.review_queue {
+        return None;
+    }
+
+    let low_confidence = left
+        .score
+        .zip(right.score)
+        .map(|(left_score, right_score)| {
+            left_score < profile.low_confidence_threshold
+                && right_score < profile.low_confidence_threshold
+        })
+        .unwrap_or(false);
+    let signal_conflict = result.reason_code == "signal_conflict";
+    let within_margin = result.reason_code == "score_margin_needs_review";
+    let should_queue = matches!(result.outcome, PairwiseOutcome::NeedsReview)
+        || signal_conflict
+        || (low_confidence
+            && matches!(left.evaluation_status, Some(EvaluationStatus::Passed))
+                != matches!(right.evaluation_status, Some(EvaluationStatus::Passed)));
+    if !should_queue {
+        return None;
+    }
+
+    let reason_code = if signal_conflict {
+        "pairwise_signal_conflict".to_string()
+    } else if low_confidence {
+        "pairwise_low_confidence".to_string()
+    } else if within_margin {
+        "pairwise_margin_needs_review".to_string()
+    } else {
+        "pairwise_needs_review".to_string()
+    };
+
+    Some(ReviewQueueItem {
+        id: Uuid::new_v4().to_string(),
+        action_id: dataset_case.source_action_id.clone(),
+        source: "pairwise_compare".to_string(),
+        kind: ReviewQueueKind::PairwiseEval,
+        status: ReviewQueueStatus::Open,
+        priority: profile.review_priority.clone(),
+        reason_code,
+        summary: format!(
+            "Compare {} vs {} for dataset case {}",
+            left_executor, right_executor, dataset_case.id
+        ),
+        evaluation_ref: None,
+        dataset_case_ref: Some(dataset_case.id.clone()),
+        pairwise_run_ref: Some(result.pairwise_run_id.clone()),
+        pairwise_case_ref: Some(result.id.clone()),
+        left_case_result_ref: Some(left.id.clone()),
+        right_case_result_ref: Some(right.id.clone()),
+        created_at: now_timestamp(),
+        resolved_at: None,
+        resolution: None,
+    })
+}
+
+impl Supervisor {
+    async fn execute_evaluation_run_internal(
+        &self,
+        request: StartEvaluationRunRequest,
+    ) -> anyhow::Result<ExperimentRunDetailResponse> {
+        let datasets = self.evaluation_datasets();
+        let dataset = datasets
+            .get(&request.dataset)
+            .ok_or_else(|| anyhow::anyhow!("dataset not found: {}", request.dataset))?;
+        let cases = self.store.list_dataset_cases(&request.dataset).await?;
+        let run = ExperimentRun {
+            id: Uuid::new_v4().to_string(),
+            dataset_name: request.dataset.clone(),
+            executor: request.executor.clone(),
+            strategy_mode: ExecutionStrategyMode::SinglePass,
+            allow_fallback: false,
+            status: ExperimentRunStatus::Running,
+            total_cases: cases.len() as u32,
+            completed_cases: 0,
+            started_at: Some(now_timestamp()),
+            finished_at: None,
+            created_at: now_timestamp(),
+            summary: Some(format!(
+                "Replaying {} {} cases against {}",
+                cases.len(),
+                dataset.capability,
+                request.executor
+            )),
+        };
+        self.store.insert_experiment_run(&run).await?;
+
+        let mut completed = 0_u32;
+        let mut failed = 0_u32;
+        let mut results = Vec::new();
+        for case in cases {
+            let result = self.run_experiment_case(&run, &case).await?;
+            if matches!(result.status, ExperimentCaseStatus::Failed) {
+                failed = failed.saturating_add(1);
+            }
+            completed = completed.saturating_add(1);
+            self.store.insert_experiment_case_result(&result).await?;
+            results.push(result);
+            let mut updated = run.clone();
+            updated.completed_cases = completed;
+            updated.status = ExperimentRunStatus::Running;
+            self.store.update_experiment_run(&updated).await?;
+        }
+
+        let mut completed_run = run.clone();
+        completed_run.completed_cases = completed;
+        completed_run.finished_at = Some(now_timestamp());
+        completed_run.status = if failed > 0 {
+            ExperimentRunStatus::Failed
+        } else {
+            ExperimentRunStatus::Completed
+        };
+        completed_run.summary = Some(format!("{completed} cases replayed, {failed} failed"));
+        self.store.update_experiment_run(&completed_run).await?;
+        Ok(ExperimentRunDetailResponse {
+            run: completed_run,
+            cases: results,
+        })
+    }
+
+    async fn execute_pairwise_evaluation_run_internal(
+        &self,
+        request: StartPairwiseEvaluationRunRequest,
+    ) -> anyhow::Result<PairwiseExperimentRunDetailResponse> {
+        let datasets = self.evaluation_datasets();
+        let dataset = datasets
+            .get(&request.dataset)
+            .ok_or_else(|| anyhow::anyhow!("dataset not found: {}", request.dataset))?
+            .clone();
+        let resolved_profile = self
+            .resolve_pairwise_profile(&dataset, request.profile.as_deref())?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pairwise profile not found for dataset {} capability {}",
+                    request.dataset,
+                    dataset.capability
+                )
+            })?;
+        let dataset_cases = self.store.list_dataset_cases(&request.dataset).await?;
+
+        let left = self
+            .execute_evaluation_run_internal(StartEvaluationRunRequest {
+                dataset: request.dataset.clone(),
+                executor: request.left_executor.clone(),
+            })
+            .await?;
+        let right = self
+            .execute_evaluation_run_internal(StartEvaluationRunRequest {
+                dataset: request.dataset.clone(),
+                executor: request.right_executor.clone(),
+            })
+            .await?;
+
+        let mut run = PairwiseExperimentRun {
+            id: Uuid::new_v4().to_string(),
+            dataset_name: request.dataset.clone(),
+            capability: dataset.capability.clone(),
+            profile_name: resolved_profile.name.clone(),
+            left_executor: request.left_executor.clone(),
+            right_executor: request.right_executor.clone(),
+            left_run_id: left.run.id.clone(),
+            right_run_id: right.run.id.clone(),
+            status: PairwiseExperimentRunStatus::Running,
+            total_cases: dataset_cases.len() as u32,
+            completed_cases: 0,
+            left_wins: 0,
+            right_wins: 0,
+            needs_review_cases: 0,
+            triggered_alert_rules: Vec::new(),
+            alert_summaries: Vec::new(),
+            started_at: Some(now_timestamp()),
+            finished_at: None,
+            created_at: now_timestamp(),
+            summary: Some(format!(
+                "Comparing {} against {} on {} {} cases",
+                request.left_executor,
+                request.right_executor,
+                dataset_cases.len(),
+                dataset.capability
+            )),
+        };
+        self.store.insert_pairwise_experiment_run(&run).await?;
+
+        let left_results: BTreeMap<_, _> = left
+            .cases
+            .into_iter()
+            .map(|result| (result.dataset_case_id.clone(), result))
+            .collect();
+        let right_results: BTreeMap<_, _> = right
+            .cases
+            .into_iter()
+            .map(|result| (result.dataset_case_id.clone(), result))
+            .collect();
+
+        let mut pairwise_results = Vec::new();
+        for dataset_case in &dataset_cases {
+            let left_result = left_results
+                .get(&dataset_case.id)
+                .ok_or_else(|| anyhow::anyhow!("missing left case result for {}", dataset_case.id))?
+                .clone();
+            let right_result = right_results
+                .get(&dataset_case.id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing right case result for {}", dataset_case.id)
+                })?
+                .clone();
+
+            let mut result = build_pairwise_case_result(
+                &run.id,
+                dataset_case,
+                &left_result,
+                &right_result,
+                &resolved_profile.profile,
+            );
+
+            let review_item = maybe_enqueue_pairwise_review_item(
+                dataset_case,
+                &resolved_profile.profile,
+                &request.left_executor,
+                &request.right_executor,
+                &left_result,
+                &right_result,
+                &result,
+            );
+            if let Some(item) = review_item {
+                result.review_queue_item_ref = Some(item.id.clone());
+                self.store.insert_review_queue_item(&item).await?;
+            }
+
+            match result.outcome {
+                PairwiseOutcome::LeftWins => run.left_wins = run.left_wins.saturating_add(1),
+                PairwiseOutcome::RightWins => run.right_wins = run.right_wins.saturating_add(1),
+                PairwiseOutcome::NeedsReview => {
+                    run.needs_review_cases = run.needs_review_cases.saturating_add(1)
+                }
+            }
+            run.completed_cases = run.completed_cases.saturating_add(1);
+            self.store.insert_pairwise_case_result(&result).await?;
+            pairwise_results.push(result);
+            self.store.update_pairwise_experiment_run(&run).await?;
+        }
+
+        let total = run.total_cases.max(1) as f64;
+        let left_win_rate = f64::from(run.left_wins) / total;
+        let needs_review_rate = f64::from(run.needs_review_cases) / total;
+        if left_win_rate > resolved_profile.profile.regression_loss_rate_threshold {
+            run.triggered_alert_rules
+                .push("comparison_regression".to_string());
+            run.alert_summaries.push(format!(
+                "candidate {} lost to baseline {} in {:.0}% of cases",
+                run.right_executor,
+                run.left_executor,
+                left_win_rate * 100.0
+            ));
+        }
+        if needs_review_rate > resolved_profile.profile.needs_review_rate_threshold {
+            run.triggered_alert_rules
+                .push("comparison_attention_required".to_string());
+            run.alert_summaries.push(format!(
+                "{:.0}% of pairwise cases require human review",
+                needs_review_rate * 100.0
+            ));
+        }
+
+        run.status = PairwiseExperimentRunStatus::Completed;
+        run.finished_at = Some(now_timestamp());
+        run.summary = Some(format!(
+            "{} left wins, {} right wins, {} need review",
+            run.left_wins, run.right_wins, run.needs_review_cases
+        ));
+        self.store.update_pairwise_experiment_run(&run).await?;
+
+        Ok(PairwiseExperimentRunDetailResponse {
+            run,
+            cases: pairwise_results,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl SupervisorControl for Supervisor {
     async fn list_status(&self) -> anyhow::Result<SwarmStatusResponse> {
@@ -5708,58 +6571,8 @@ impl SupervisorControl for Supervisor {
         &self,
         request: StartEvaluationRunRequest,
     ) -> anyhow::Result<StartEvaluationRunResponse> {
-        let datasets = self.evaluation_datasets();
-        let dataset = datasets
-            .get(&request.dataset)
-            .ok_or_else(|| anyhow::anyhow!("dataset not found: {}", request.dataset))?;
-        let cases = self.store.list_dataset_cases(&request.dataset).await?;
-        let run = ExperimentRun {
-            id: Uuid::new_v4().to_string(),
-            dataset_name: request.dataset.clone(),
-            executor: request.executor.clone(),
-            strategy_mode: ExecutionStrategyMode::SinglePass,
-            allow_fallback: false,
-            status: ExperimentRunStatus::Running,
-            total_cases: cases.len() as u32,
-            completed_cases: 0,
-            started_at: Some(now_timestamp()),
-            finished_at: None,
-            created_at: now_timestamp(),
-            summary: Some(format!(
-                "Replaying {} {} cases against {}",
-                cases.len(),
-                dataset.capability,
-                request.executor
-            )),
-        };
-        self.store.insert_experiment_run(&run).await?;
-
-        let mut completed = 0_u32;
-        let mut failed = 0_u32;
-        for case in cases {
-            let result = self.run_experiment_case(&run, &case).await?;
-            if matches!(result.status, ExperimentCaseStatus::Failed) {
-                failed = failed.saturating_add(1);
-            }
-            completed = completed.saturating_add(1);
-            self.store.insert_experiment_case_result(&result).await?;
-            let mut updated = run.clone();
-            updated.completed_cases = completed;
-            updated.status = ExperimentRunStatus::Running;
-            self.store.update_experiment_run(&updated).await?;
-        }
-
-        let mut completed_run = run.clone();
-        completed_run.completed_cases = completed;
-        completed_run.finished_at = Some(now_timestamp());
-        completed_run.status = if failed > 0 {
-            ExperimentRunStatus::Failed
-        } else {
-            ExperimentRunStatus::Completed
-        };
-        completed_run.summary = Some(format!("{completed} cases replayed, {failed} failed"));
-        self.store.update_experiment_run(&completed_run).await?;
-        Ok(StartEvaluationRunResponse { run: completed_run })
+        let detail = self.execute_evaluation_run_internal(request).await?;
+        Ok(StartEvaluationRunResponse { run: detail.run })
     }
 
     async fn get_evaluation_run(
@@ -5771,6 +6584,27 @@ impl SupervisorControl for Supervisor {
         };
         let cases = self.store.list_experiment_case_results(run_id).await?;
         Ok(Some(ExperimentRunDetailResponse { run, cases }))
+    }
+
+    async fn start_pairwise_evaluation_run(
+        &self,
+        request: StartPairwiseEvaluationRunRequest,
+    ) -> anyhow::Result<StartPairwiseEvaluationRunResponse> {
+        let detail = self
+            .execute_pairwise_evaluation_run_internal(request)
+            .await?;
+        Ok(StartPairwiseEvaluationRunResponse { run: detail.run })
+    }
+
+    async fn get_pairwise_evaluation_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<PairwiseExperimentRunDetailResponse>> {
+        let Some(run) = self.store.get_pairwise_experiment_run(run_id).await? else {
+            return Ok(None);
+        };
+        let cases = self.store.list_pairwise_case_results(run_id).await?;
+        Ok(Some(PairwiseExperimentRunDetailResponse { run, cases }))
     }
 
     async fn list_alerts(&self) -> anyhow::Result<AlertListResponse> {
@@ -5829,15 +6663,41 @@ impl SupervisorControl for Supervisor {
         item.resolved_at = Some(now_timestamp());
         item.resolution = Some(request.resolution.clone());
         self.store.resolve_review_queue_item(&item).await?;
+        if let Some(pairwise_case_ref) = &item.pairwise_case_ref {
+            if let Some(mut pairwise_case) = self
+                .store
+                .get_pairwise_case_result(pairwise_case_ref)
+                .await?
+            {
+                pairwise_case.review_resolution = item.resolution.clone();
+                self.store
+                    .update_pairwise_case_result(&pairwise_case)
+                    .await?;
+            }
+        }
         if let Some(note) = request.note {
             let feedback = FeedbackNote {
                 id: Uuid::new_v4().to_string(),
                 action_id: item.action_id.clone(),
                 source: request.resolver_ref,
                 body: note,
+                pairwise_case_result_ref: item.pairwise_case_ref.clone(),
                 created_at: now_timestamp(),
             };
             self.store.insert_feedback_note(&feedback).await?;
+            if let Some(pairwise_case_ref) = &item.pairwise_case_ref {
+                if let Some(mut pairwise_case) = self
+                    .store
+                    .get_pairwise_case_result(pairwise_case_ref)
+                    .await?
+                {
+                    pairwise_case.feedback_note_id = Some(feedback.id.clone());
+                    pairwise_case.review_resolution = item.resolution.clone();
+                    self.store
+                        .update_pairwise_case_result(&pairwise_case)
+                        .await?;
+                }
+            }
             if let Some(evaluation_id) = &item.evaluation_ref {
                 if let Some(mut evaluation) = self
                     .store
@@ -6632,6 +7492,14 @@ fn api_router(supervisor: Arc<Supervisor>) -> Router {
             "/v1/evaluation/runs/{id}",
             get(evaluation_run_detail_handler),
         )
+        .route(
+            "/v1/evaluation/compare",
+            post(start_pairwise_evaluation_run_handler),
+        )
+        .route(
+            "/v1/evaluation/compare/{id}",
+            get(pairwise_evaluation_run_detail_handler),
+        )
         .route("/v1/alerts", get(alert_list_handler))
         .route("/v1/alerts/{id}/ack", post(alert_ack_handler))
         .route("/v1/treaties", get(treaty_list_handler))
@@ -6880,13 +7748,20 @@ async fn revoke_lease_handler(
 
 async fn review_queue_handler(
     State(supervisor): State<Arc<Supervisor>>,
+    Query(query): Query<ReviewQueueQuery>,
 ) -> Result<Json<ReviewQueueResponse>, RuntimeError> {
-    Ok(Json(
-        supervisor
-            .list_review_queue()
-            .await
-            .map_err(RuntimeError::Internal)?,
-    ))
+    let mut response = supervisor
+        .list_review_queue()
+        .await
+        .map_err(RuntimeError::Internal)?;
+    if let Some(kind) = query.kind.as_deref() {
+        response.items.retain(|item| match kind {
+            "action" | "action_eval" => item.kind == ReviewQueueKind::ActionEval,
+            "pairwise" | "pairwise_eval" => item.kind == ReviewQueueKind::PairwiseEval,
+            _ => true,
+        });
+    }
+    Ok(Json(response))
 }
 
 async fn resolve_review_queue_item_handler(
@@ -6957,6 +7832,35 @@ async fn evaluation_run_detail_handler(
         .map_err(RuntimeError::Internal)?
         .map(Json)
         .ok_or_else(|| RuntimeError::NotFound(format!("evaluation run not found: {id}")))
+}
+
+async fn start_pairwise_evaluation_run_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    Json(request): Json<StartPairwiseEvaluationRunRequest>,
+) -> Result<Json<StartPairwiseEvaluationRunResponse>, RuntimeError> {
+    match supervisor.start_pairwise_evaluation_run(request).await {
+        Ok(response) => Ok(Json(response)),
+        Err(error) => {
+            let message = error.to_string();
+            if message.starts_with("dataset not found:") {
+                Err(RuntimeError::NotFound(message))
+            } else {
+                Err(RuntimeError::BadRequest(message))
+            }
+        }
+    }
+}
+
+async fn pairwise_evaluation_run_detail_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<PairwiseExperimentRunDetailResponse>, RuntimeError> {
+    supervisor
+        .get_pairwise_evaluation_run(&id)
+        .await
+        .map_err(RuntimeError::Internal)?
+        .map(Json)
+        .ok_or_else(|| RuntimeError::NotFound(format!("pairwise evaluation run not found: {id}")))
 }
 
 async fn alert_list_handler(
@@ -10356,6 +11260,221 @@ depends_on = []
 
         let review_count_after = supervisor.list_review_queue().await.unwrap().items.len();
         assert_eq!(review_count_before, review_count_after);
+    }
+
+    #[tokio::test]
+    async fn richer_task_plan_evaluation_persists_criterion_evidence() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Plan an evaluation rollout with doctrine checkpoints and artifact coverage",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let evaluations = supervisor
+            .list_action_evaluations(&submitted.action_id)
+            .await
+            .unwrap();
+        let latest = evaluations
+            .evaluations
+            .iter()
+            .rev()
+            .find(|evaluation| !evaluation.criterion_results.is_empty())
+            .expect("latest scorecard evaluation");
+        assert!(!latest.criterion_results.is_empty());
+        assert!(latest
+            .criterion_results
+            .iter()
+            .any(|criterion| criterion.criterion_id == "task_plan_schema" && criterion.passed));
+        assert!(latest
+            .criterion_results
+            .iter()
+            .any(|criterion| criterion.criterion_id == "task_plan_heading"));
+        assert!(latest
+            .criterion_results
+            .iter()
+            .all(|criterion| !criterion.evidence_summary.trim().is_empty()));
+    }
+
+    #[tokio::test]
+    async fn pairwise_compare_creates_review_items_and_feedback_lineage() {
+        let dir = tempdir().unwrap();
+        let supervisor = build_supervisor(dir.path()).await.unwrap();
+
+        supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Plan a pairwise evaluation flow for the local swarm",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let review_count_before = supervisor.list_review_queue().await.unwrap().items.len();
+        let started = supervisor
+            .start_pairwise_evaluation_run(StartPairwiseEvaluationRunRequest {
+                dataset: "task_plan_dataset".to_string(),
+                left_executor: "deterministic".to_string(),
+                right_executor: "deterministic".to_string(),
+                profile: None,
+            })
+            .await
+            .unwrap();
+        let pairwise = supervisor
+            .get_pairwise_evaluation_run(&started.run.id)
+            .await
+            .unwrap()
+            .expect("pairwise detail");
+        assert_eq!(pairwise.run.status, PairwiseExperimentRunStatus::Completed);
+        assert!(!pairwise.cases.is_empty());
+        assert!(pairwise
+            .cases
+            .iter()
+            .all(|case| case.outcome == PairwiseOutcome::NeedsReview));
+
+        let review_queue = supervisor.list_review_queue().await.unwrap();
+        assert!(review_queue.items.len() > review_count_before);
+        let pairwise_item = review_queue
+            .items
+            .iter()
+            .find(|item| item.kind == ReviewQueueKind::PairwiseEval)
+            .expect("pairwise review item");
+        assert!(pairwise_item.pairwise_run_ref.is_some());
+        assert!(pairwise_item.pairwise_case_ref.is_some());
+
+        let resolved = supervisor
+            .resolve_review_queue_item(
+                &pairwise_item.id,
+                ResolveReviewQueueItemRequest {
+                    resolver_ref: "operator-2".to_string(),
+                    resolution: "prefer_left".to_string(),
+                    note: Some("Left executor stays the baseline.".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.item.status, ReviewQueueStatus::Resolved);
+
+        let pairwise_case = supervisor
+            .store()
+            .get_pairwise_case_result(
+                pairwise_item
+                    .pairwise_case_ref
+                    .as_deref()
+                    .expect("pairwise case ref"),
+            )
+            .await
+            .unwrap()
+            .expect("pairwise case");
+        assert_eq!(
+            pairwise_case.review_resolution.as_deref(),
+            Some("prefer_left")
+        );
+        let feedback_id = pairwise_case
+            .feedback_note_id
+            .as_deref()
+            .expect("feedback note id");
+        let feedback = supervisor
+            .store()
+            .get_feedback_note(feedback_id)
+            .await
+            .unwrap()
+            .expect("feedback note");
+        assert_eq!(
+            feedback.pairwise_case_result_ref.as_deref(),
+            Some(pairwise_case.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn pairwise_compare_flags_regression_without_emitting_production_alert_events() {
+        let dir = tempdir().unwrap();
+        let claude_script = write_executable_script(
+            dir.path(),
+            "claude-compare.sh",
+            r#"#!/bin/sh
+cat <<'EOF'
+- Review the task objective and the relevant context files.
+- Produce a rollout checklist and the operator handoff notes.
+Risk: local executor drift may still require human review.
+Assumption: the task remains proposal-only.
+Test: verify the desired outputs appear in the plan.
+Confidence: high confidence with the rollout checklist included
+EOF
+"#,
+        )
+        .await;
+        let codex_script = write_executable_script(
+            dir.path(),
+            "codex-compare.sh",
+            r#"#!/bin/sh
+cat <<'EOF'
+- Sketch a rough outline.
+Risk: the proposal may omit the requested outputs.
+Confidence: low confidence
+EOF
+"#,
+        )
+        .await;
+        let manifest = local_task_planner_manifest(
+            &claude_script.display().to_string(),
+            &codex_script.display().to_string(),
+            "ws://127.0.0.1:9988/gateway",
+        );
+        let supervisor = build_supervisor_with_task_planner_manifest(dir.path(), manifest, None)
+            .await
+            .unwrap();
+
+        supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Plan a regression-sensitive executor comparison for the swarm",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let alert_count_before = supervisor.list_alerts().await.unwrap().alerts.len();
+        let started = supervisor
+            .start_pairwise_evaluation_run(StartPairwiseEvaluationRunRequest {
+                dataset: "task_plan_dataset".to_string(),
+                left_executor: "local_harness.claude_code".to_string(),
+                right_executor: "local_harness.codex".to_string(),
+                profile: None,
+            })
+            .await
+            .unwrap();
+        let pairwise = supervisor
+            .get_pairwise_evaluation_run(&started.run.id)
+            .await
+            .unwrap()
+            .expect("pairwise detail");
+        assert_eq!(pairwise.run.status, PairwiseExperimentRunStatus::Completed);
+        assert_eq!(
+            pairwise.run.left_wins, pairwise.run.total_cases,
+            "pairwise detail: {pairwise:?}",
+        );
+        assert!(
+            pairwise
+                .run
+                .triggered_alert_rules
+                .iter()
+                .any(|rule| rule == "comparison_regression"),
+            "pairwise run: {:?}",
+            pairwise.run
+        );
+        assert!(pairwise
+            .cases
+            .iter()
+            .all(|case| case.outcome == PairwiseOutcome::LeftWins));
+
+        let alert_count_after = supervisor.list_alerts().await.unwrap().alerts.len();
+        assert_eq!(alert_count_before, alert_count_after);
     }
 
     #[tokio::test]

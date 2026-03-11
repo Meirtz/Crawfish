@@ -4,9 +4,9 @@ use crawfish_types::{
     CheckpointStatus, ConsentGrant, CounterpartyRef, DatasetCase, DelegationReceipt, DoctrinePack,
     EncounterRecord, EvaluationDataset, EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode,
     ExperimentCaseResult, ExperimentRun, ExternalRef, GoalSpec, InteractionModel,
-    JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PolicyIncident, RemotePrincipalRef,
-    RequesterRef, ReviewQueueItem, ScheduleSpec, TraceBundle, TreatyPack, TrustDomain,
-    VerificationSummary, WorkspaceLockDetail,
+    JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PairwiseCaseResult,
+    PairwiseExperimentRun, PolicyIncident, RemotePrincipalRef, RequesterRef, ReviewQueueItem,
+    ScheduleSpec, TraceBundle, TreatyPack, TrustDomain, VerificationSummary, WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -193,6 +193,27 @@ pub struct ExperimentRunDetailResponse {
     pub run: ExperimentRun,
     #[serde(default)]
     pub cases: Vec<ExperimentCaseResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartPairwiseEvaluationRunRequest {
+    pub dataset: String,
+    pub left_executor: String,
+    pub right_executor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StartPairwiseEvaluationRunResponse {
+    pub run: PairwiseExperimentRun,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PairwiseExperimentRunDetailResponse {
+    pub run: PairwiseExperimentRun,
+    #[serde(default)]
+    pub cases: Vec<PairwiseCaseResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
