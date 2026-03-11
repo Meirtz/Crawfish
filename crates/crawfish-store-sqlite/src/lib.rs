@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use crawfish_core::{ActionEventRecord, ActionStore, CheckpointStore, QueueSummary};
 use crawfish_types::{
     Action, AgentManifest, AlertEvent, AuditReceipt, CapabilityLease, ConsentGrant, DatasetCase,
-    EncounterRecord, EvaluationRecord, ExperimentCaseResult, ExperimentRun, FeedbackNote,
-    LifecycleRecord, PolicyIncident, ReviewQueueItem, TraceBundle,
+    DelegationReceipt, EncounterRecord, EvaluationRecord, ExperimentCaseResult, ExperimentRun,
+    FeedbackNote, LifecycleRecord, PolicyIncident, ReviewQueueItem, TraceBundle,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, Pool, Row, Sqlite, SqlitePool};
@@ -812,6 +812,47 @@ impl SqliteStore {
         .await?;
         Ok(())
     }
+
+    pub async fn insert_delegation_receipt(
+        &self,
+        receipt: &DelegationReceipt,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(receipt)?;
+        sqlx::query(
+            r#"
+            INSERT INTO delegation_receipts (id, action_id, treaty_pack_id, created_at, receipt_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              action_id = excluded.action_id,
+              treaty_pack_id = excluded.treaty_pack_id,
+              created_at = excluded.created_at,
+              receipt_json = excluded.receipt_json
+            "#,
+        )
+        .bind(&receipt.id)
+        .bind(&receipt.action_id)
+        .bind(&receipt.treaty_pack_id)
+        .bind(&receipt.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_delegation_receipt(
+        &self,
+        receipt_id: &str,
+    ) -> anyhow::Result<Option<DelegationReceipt>> {
+        let row = sqlx::query("SELECT receipt_json FROM delegation_receipts WHERE id = ?1")
+            .bind(receipt_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("receipt_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
 }
 
 #[async_trait]
@@ -1066,6 +1107,17 @@ impl ActionStore for SqliteStore {
 
     async fn acknowledge_alert_event(&self, alert: &AlertEvent) -> anyhow::Result<()> {
         SqliteStore::insert_alert_event(self, alert).await
+    }
+
+    async fn insert_delegation_receipt(&self, receipt: &DelegationReceipt) -> anyhow::Result<()> {
+        SqliteStore::insert_delegation_receipt(self, receipt).await
+    }
+
+    async fn get_delegation_receipt(
+        &self,
+        receipt_id: &str,
+    ) -> anyhow::Result<Option<DelegationReceipt>> {
+        SqliteStore::get_delegation_receipt(self, receipt_id).await
     }
 }
 

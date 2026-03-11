@@ -1,7 +1,7 @@
 use crawfish_types::{
     AlertRule, CallerOwnerMapping, CapabilityVisibility, DataBoundaryPolicy, DefaultDisposition,
     EncounterPolicy, EvaluationDataset, EvaluationProfile, ExecutionContract, McpServerConfig,
-    NetworkBoundaryPolicy, OwnerKind, ScorecardSpec, ToolBoundaryPolicy, TrustDomain,
+    NetworkBoundaryPolicy, OwnerKind, ScorecardSpec, ToolBoundaryPolicy, TreatyPack, TrustDomain,
     WorkspaceBoundaryPolicy,
 };
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,12 @@ pub struct EvaluationConfig {
     pub alerts: BTreeMap<String, AlertRule>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TreatiesConfig {
+    #[serde(default)]
+    pub packs: BTreeMap<String, TreatyPack>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CrawfishConfig {
     pub storage: StorageConfig,
@@ -122,6 +128,8 @@ pub struct CrawfishConfig {
     pub governance: GovernanceConfig,
     #[serde(default)]
     pub evaluation: EvaluationConfig,
+    #[serde(default)]
+    pub treaties: TreatiesConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
 }
@@ -228,6 +236,7 @@ mod tests {
             contracts: ContractDefaultsConfig::default(),
             governance: GovernanceConfig::default(),
             evaluation: EvaluationConfig::default(),
+            treaties: TreatiesConfig::default(),
             runtime: RuntimeConfig::default(),
         };
 

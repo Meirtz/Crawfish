@@ -8,7 +8,8 @@ use crawfish_core::{
     ExperimentRunDetailResponse, PolicyValidationRequest, PolicyValidationResponse,
     RejectActionRequest, ResolveReviewQueueItemRequest, ResolveReviewQueueItemResponse,
     ReviewQueueResponse, RevokeLeaseRequest, StartEvaluationRunRequest, StartEvaluationRunResponse,
-    SubmitActionRequest, SubmittedAction, SwarmStatusResponse,
+    SubmitActionRequest, SubmittedAction, SwarmStatusResponse, TreatyDetailResponse,
+    TreatyListResponse,
 };
 use crawfish_runtime::Supervisor;
 use crawfish_types::{
@@ -44,6 +45,7 @@ pub enum Commands {
     Review(ReviewCommand),
     Eval(EvalCommand),
     Alert(AlertCommand),
+    Treaty(TreatyCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -121,6 +123,18 @@ pub enum AlertSubcommands {
 pub struct AlertCommand {
     #[command(subcommand)]
     pub command: AlertSubcommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TreatySubcommands {
+    List(TreatyListCommand),
+    Show(TreatyShowCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct TreatyCommand {
+    #[command(subcommand)]
+    pub command: TreatySubcommands,
 }
 
 #[derive(Debug, Args)]
@@ -401,6 +415,23 @@ pub struct AlertAckCommand {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct TreatyListCommand {
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TreatyShowCommand {
+    pub treaty_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
 impl From<OwnerKindArg> for OwnerKind {
     fn from(value: OwnerKindArg) -> Self {
         match value {
@@ -465,6 +496,10 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Commands::Alert(alert) => match alert.command {
             AlertSubcommands::List(command) => alert_list_command(command).await,
             AlertSubcommands::Ack(command) => alert_ack_command(command).await,
+        },
+        Commands::Treaty(treaty) => match treaty.command {
+            TreatySubcommands::List(command) => treaty_list_command(command).await,
+            TreatySubcommands::Show(command) => treaty_show_command(command).await,
         },
     }
 }
@@ -807,6 +842,22 @@ async fn alert_ack_command(command: AlertAckCommand) -> anyhow::Result<()> {
                 actor: command.actor,
             },
         )
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn treaty_list_command(command: TreatyListCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: TreatyListResponse = client.get_json("/v1/treaties").await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn treaty_show_command(command: TreatyShowCommand) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: TreatyDetailResponse = client
+        .get_json(&format!("/v1/treaties/{}", command.treaty_id))
         .await?;
     print_output(serde_json::to_value(response)?, command.json)?;
     Ok(())

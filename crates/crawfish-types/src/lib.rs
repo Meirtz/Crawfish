@@ -1021,8 +1021,109 @@ pub struct AcpHarnessBinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct A2ARemoteAgentBinding {
     pub capability: String,
-    pub endpoint: String,
+    #[serde(alias = "endpoint")]
+    pub agent_card_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_ref: Option<String>,
+    pub treaty_pack: String,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+    #[serde(default)]
+    pub streaming_mode: A2AStreamingMode,
+    #[serde(default)]
+    pub allow_in_task_auth: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum A2AStreamingMode {
+    PreferStreaming,
+    PollOnly,
+}
+
+impl Default for A2AStreamingMode {
+    fn default() -> Self {
+        Self::PreferStreaming
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TreatyAuthForwardingMode {
+    None,
+    InTaskBearer,
+}
+
+impl Default for TreatyAuthForwardingMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemotePrincipalRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub agent_card_url: String,
     pub trust_domain: TrustDomain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreatyClause {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub required_checkpoints: Vec<OversightCheckpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreatyPack {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub local_owner: OwnerRef,
+    pub remote_principal: RemotePrincipalRef,
+    #[serde(default)]
+    pub allowed_capabilities: Vec<String>,
+    #[serde(default)]
+    pub allowed_data_scopes: Vec<String>,
+    #[serde(default)]
+    pub allowed_artifact_classes: Vec<String>,
+    #[serde(default)]
+    pub allowed_auth_forwarding_mode: TreatyAuthForwardingMode,
+    #[serde(default)]
+    pub required_checkpoints: Vec<OversightCheckpoint>,
+    pub max_delegation_depth: u32,
+    pub review_policy: String,
+    #[serde(default)]
+    pub clauses: Vec<TreatyClause>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationDecision {
+    Allowed,
+    Denied,
+    StoreAndForward,
+    HumanHandoff,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationReceipt {
+    pub id: String,
+    pub action_id: String,
+    pub treaty_pack_id: String,
+    pub remote_principal: RemotePrincipalRef,
+    pub capability: String,
+    #[serde(default)]
+    pub requested_scopes: Vec<String>,
+    pub decision: DelegationDecision,
+    pub remote_agent_card_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_task_ref: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1276,6 +1377,7 @@ pub enum InteractionModel {
     SameOwnerSwarm,
     SameDeviceMultiOwner,
     RemoteHarness,
+    RemoteAgent,
     ExternalUnknown,
 }
 
@@ -1388,6 +1490,14 @@ pub struct TraceBundle {
     pub enforcement_records: Vec<EnforcementRecord>,
     #[serde(default)]
     pub policy_incidents: Vec<PolicyIncident>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_principal: Option<RemotePrincipalRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treaty_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_receipt_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_task_ref: Option<String>,
     pub created_at: String,
 }
 
@@ -1554,6 +1664,14 @@ pub struct DatasetCase {
     pub checkpoint_status: Vec<CheckpointStatus>,
     #[serde(default)]
     pub policy_incidents: Vec<PolicyIncident>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_principal: Option<RemotePrincipalRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treaty_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_receipt_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_summary: Option<VerificationSummary>,
     #[serde(default)]

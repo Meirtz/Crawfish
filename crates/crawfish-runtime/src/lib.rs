@@ -21,7 +21,7 @@ use crawfish_core::{
     PolicyValidationResponse, RejectActionRequest, ResolveReviewQueueItemRequest,
     ResolveReviewQueueItemResponse, ReviewQueueResponse, RevokeLeaseRequest,
     StartEvaluationRunRequest, StartEvaluationRunResponse, SubmitActionRequest, SubmittedAction,
-    SupervisorControl, SwarmStatusResponse,
+    SupervisorControl, SwarmStatusResponse, TreatyDetailResponse, TreatyListResponse,
 };
 use crawfish_harness_local::{LocalHarnessAdapter, LocalHarnessError};
 use crawfish_mcp::McpAdapter;
@@ -836,6 +836,13 @@ impl Supervisor {
         incidents: &[PolicyIncident],
     ) -> anyhow::Result<TraceBundle> {
         let events = self.store.list_action_events(&action.id).await?;
+        let delegation_receipt_ref =
+            external_ref_value(&action.external_refs, "a2a.delegation_receipt");
+        let delegation_receipt = if let Some(receipt_ref) = delegation_receipt_ref.as_deref() {
+            self.store.get_delegation_receipt(receipt_ref).await?
+        } else {
+            None
+        };
         let trace = TraceBundle {
             id: format!("trace-{}", action.id),
             action_id: action.id.clone(),
@@ -890,6 +897,12 @@ impl Supervisor {
                 })
                 .collect(),
             policy_incidents: incidents.to_vec(),
+            remote_principal: delegation_receipt
+                .as_ref()
+                .map(|receipt| receipt.remote_principal.clone()),
+            treaty_pack_id: external_ref_value(&action.external_refs, "a2a.treaty_pack"),
+            delegation_receipt_ref,
+            remote_task_ref: external_ref_value(&action.external_refs, "a2a.task_id"),
             created_at: now_timestamp(),
         };
         Ok(trace)
@@ -1408,6 +1421,10 @@ impl Supervisor {
             doctrine_summary: trace.doctrine_summary.clone(),
             checkpoint_status: trace.checkpoint_status.clone(),
             policy_incidents: trace.policy_incidents.clone(),
+            remote_principal: trace.remote_principal.clone(),
+            treaty_pack_id: trace.treaty_pack_id.clone(),
+            delegation_receipt_ref: trace.delegation_receipt_ref.clone(),
+            remote_task_ref: trace.remote_task_ref.clone(),
             verification_summary: trace.verification_summary.clone(),
             evaluation_refs: evaluations
                 .iter()
@@ -4445,6 +4462,10 @@ fn is_remote_harness_executor(executor: &str) -> bool {
     executor.starts_with("openclaw.") || executor.starts_with("local_harness.")
 }
 
+fn is_remote_agent_executor(executor: &str) -> bool {
+    executor.starts_with("a2a.")
+}
+
 fn jurisdiction_class_for_action(
     action: &Action,
     encounter: Option<&EncounterRecord>,
@@ -4479,6 +4500,15 @@ fn interaction_model_for_action(
     action: &Action,
     encounter: Option<&EncounterRecord>,
 ) -> crawfish_types::InteractionModel {
+    if action
+        .selected_executor
+        .as_deref()
+        .map(is_remote_agent_executor)
+        .unwrap_or(false)
+    {
+        return crawfish_types::InteractionModel::RemoteAgent;
+    }
+
     if action
         .selected_executor
         .as_deref()
@@ -4537,6 +4567,13 @@ fn interaction_model_is_frontier(interaction_model: &crawfish_types::Interaction
         interaction_model,
         crawfish_types::InteractionModel::ContextSplit
     )
+}
+
+fn external_ref_value(external_refs: &[ExternalRef], kind: &str) -> Option<String> {
+    external_refs
+        .iter()
+        .find(|reference| reference.kind == kind)
+        .map(|reference| reference.value.clone())
 }
 
 fn default_doctrine_pack(
@@ -5380,6 +5417,22 @@ impl SupervisorControl for Supervisor {
         })
     }
 
+    async fn list_treaties(&self) -> anyhow::Result<TreatyListResponse> {
+        Ok(TreatyListResponse {
+            treaties: self.config.treaties.packs.values().cloned().collect(),
+        })
+    }
+
+    async fn get_treaty(&self, treaty_id: &str) -> anyhow::Result<Option<TreatyDetailResponse>> {
+        Ok(self
+            .config
+            .treaties
+            .packs
+            .get(treaty_id)
+            .cloned()
+            .map(|treaty| TreatyDetailResponse { treaty }))
+    }
+
     async fn acknowledge_alert(
         &self,
         alert_id: &str,
@@ -5529,6 +5582,19 @@ impl SupervisorControl for Supervisor {
             latest_evaluation.as_ref(),
             resolved_profile.is_some(),
         );
+        let delegation_receipt_ref =
+            external_ref_value(&action.external_refs, "a2a.delegation_receipt");
+        let delegation_receipt = if let Some(receipt_ref) = delegation_receipt_ref.as_deref() {
+            self.store.get_delegation_receipt(receipt_ref).await?
+        } else {
+            None
+        };
+        let treaty_summary = external_ref_value(&action.external_refs, "a2a.treaty_pack")
+            .and_then(|treaty_id| self.config.treaties.packs.get(&treaty_id).cloned());
+        let remote_task_ref = external_ref_value(&action.external_refs, "a2a.task_id");
+        let remote_principal = delegation_receipt
+            .as_ref()
+            .map(|receipt| receipt.remote_principal.clone());
         Ok(Some(ActionDetail {
             artifact_refs: action.outputs.artifacts.clone(),
             selected_executor: action.selected_executor.clone(),
@@ -5559,6 +5625,11 @@ impl SupervisorControl for Supervisor {
                 .map(|item| item.id.clone())
                 .collect(),
             alert_refs: alert_events.iter().map(|alert| alert.id.clone()).collect(),
+            remote_principal,
+            treaty_summary,
+            delegation_receipt_ref,
+            remote_task_ref,
+            delegation_receipt,
             action,
             encounter,
             latest_audit_receipt: audit_receipt,
@@ -6201,6 +6272,8 @@ fn api_router(supervisor: Arc<Supervisor>) -> Router {
         )
         .route("/v1/alerts", get(alert_list_handler))
         .route("/v1/alerts/{id}/ack", post(alert_ack_handler))
+        .route("/v1/treaties", get(treaty_list_handler))
+        .route("/v1/treaties/{id}", get(treaty_detail_handler))
         .route(
             "/v1/inbound/openclaw/actions",
             post(openclaw_submit_action_handler),
@@ -6551,6 +6624,29 @@ async fn alert_ack_handler(
             }
         }
     }
+}
+
+async fn treaty_list_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+) -> Result<Json<TreatyListResponse>, RuntimeError> {
+    Ok(Json(
+        supervisor
+            .list_treaties()
+            .await
+            .map_err(RuntimeError::Internal)?,
+    ))
+}
+
+async fn treaty_detail_handler(
+    State(supervisor): State<Arc<Supervisor>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<TreatyDetailResponse>, RuntimeError> {
+    supervisor
+        .get_treaty(&id)
+        .await
+        .map_err(RuntimeError::Internal)?
+        .map(Json)
+        .ok_or_else(|| RuntimeError::NotFound(format!("treaty not found: {id}")))
 }
 
 async fn drain_handler(

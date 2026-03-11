@@ -1,12 +1,12 @@
 use crate::ExecutionContractPatch;
 use crawfish_types::{
     Action, AgentManifest, AlertEvent, ArtifactRef, AuditReceipt, CapabilityLease,
-    CheckpointStatus, ConsentGrant, CounterpartyRef, DatasetCase, DoctrinePack, EncounterRecord,
-    EvaluationDataset, EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode,
+    CheckpointStatus, ConsentGrant, CounterpartyRef, DatasetCase, DelegationReceipt, DoctrinePack,
+    EncounterRecord, EvaluationDataset, EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode,
     ExperimentCaseResult, ExperimentRun, ExternalRef, GoalSpec, InteractionModel,
-    JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PolicyIncident, RequesterRef,
-    ReviewQueueItem, ScheduleSpec, TraceBundle, TrustDomain, VerificationSummary,
-    WorkspaceLockDetail,
+    JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PolicyIncident, RemotePrincipalRef,
+    RequesterRef, ReviewQueueItem, ScheduleSpec, TraceBundle, TreatyPack, TrustDomain,
+    VerificationSummary, WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -93,6 +93,16 @@ pub struct ActionDetail {
     pub review_queue_refs: Vec<String>,
     #[serde(default)]
     pub alert_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_principal: Option<RemotePrincipalRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treaty_summary: Option<TreatyPack>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_receipt_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_task_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_receipt: Option<DelegationReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,6 +198,16 @@ pub struct ExperimentRunDetailResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AlertListResponse {
     pub alerts: Vec<AlertEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreatyListResponse {
+    pub treaties: Vec<TreatyPack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreatyDetailResponse {
+    pub treaty: TreatyPack,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

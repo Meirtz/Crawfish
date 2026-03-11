@@ -87,6 +87,14 @@ pub trait ActionStore: Send + Sync {
         &self,
         alert: &crawfish_types::AlertEvent,
     ) -> anyhow::Result<()>;
+    async fn insert_delegation_receipt(
+        &self,
+        receipt: &crawfish_types::DelegationReceipt,
+    ) -> anyhow::Result<()>;
+    async fn get_delegation_receipt(
+        &self,
+        receipt_id: &str,
+    ) -> anyhow::Result<Option<crawfish_types::DelegationReceipt>>;
 }
 
 #[async_trait]
@@ -178,6 +186,11 @@ pub trait SupervisorControl: Send + Sync {
         alert_id: &str,
         request: crate::AcknowledgeAlertRequest,
     ) -> anyhow::Result<crate::AcknowledgeAlertResponse>;
+    async fn list_treaties(&self) -> anyhow::Result<crate::TreatyListResponse>;
+    async fn get_treaty(
+        &self,
+        treaty_id: &str,
+    ) -> anyhow::Result<Option<crate::TreatyDetailResponse>>;
     async fn inspect_agent(&self, agent_id: &str) -> anyhow::Result<Option<crate::AgentDetail>>;
     async fn inspect_action(&self, action_id: &str) -> anyhow::Result<Option<crate::ActionDetail>>;
     async fn submit_action(
