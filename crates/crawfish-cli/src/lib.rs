@@ -141,6 +141,7 @@ pub enum TreatySubcommands {
 }
 
 #[derive(Debug, Args)]
+#[command(about = "Inspect treaty-governed remote delegation surfaces (experimental alpha)")]
 pub struct TreatyCommand {
     #[command(subcommand)]
     pub command: TreatySubcommands,
@@ -153,6 +154,7 @@ pub enum FederationSubcommands {
 }
 
 #[derive(Debug, Args)]
+#[command(about = "Inspect federation packs for remote-agent governance (experimental alpha)")]
 pub struct FederationCommand {
     #[command(subcommand)]
     pub command: FederationSubcommands,
