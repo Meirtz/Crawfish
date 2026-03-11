@@ -1,0 +1,22 @@
+id = "repo_reviewer"
+role = "repo_reviewer"
+trust_domain = "same_owner_local"
+capabilities = ["repo.review"]
+exposed_capabilities = ["repo.review"]
+dependencies = ["repo_indexer"]
+default_data_boundaries = ["owner_local"]
+
+[owner]
+kind = "human"
+id = "local-dev"
+display_name = "Local Developer"
+
+[contract_defaults.quality]
+evaluation_profile = "repo_review_default"
+
+[[adapters]]
+adapter = "mcp"
+capability = "github.pull_request.review"
+server = "hero_remote"
+tool = "github_pull_request_review"
+default_scope = ["pull_request:read"]

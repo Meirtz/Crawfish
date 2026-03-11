@@ -1,0 +1,4 @@
+2026-03-10T10:15:01Z ERROR api timeout contacting db primary
+2026-03-10T10:15:03Z WARN web received 503 service unavailable from api
+2026-03-10T10:15:06Z ERROR worker retry failed because api remained unavailable
+2026-03-10T10:15:10Z WARN api timeout contacting db primary

@@ -1,0 +1,18 @@
+id = "repo_indexer"
+role = "repo_indexer"
+trust_domain = "same_owner_local"
+capabilities = ["repo.index"]
+exposed_capabilities = ["repo.index"]
+default_data_boundaries = ["owner_local"]
+
+[owner]
+kind = "human"
+id = "local-dev"
+display_name = "Local Developer"
+
+[[adapters]]
+adapter = "mcp"
+capability = "filesystem.read"
+server = "hero_remote"
+tool = "filesystem_read"
+default_scope = ["repo:read"]

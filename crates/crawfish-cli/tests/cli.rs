@@ -27,9 +27,9 @@ fn init_creates_workspace_files() {
         .success();
 
     assert!(dir.path().join("Crawfish.toml").exists());
-    assert!(fs::read_to_string(dir.path().join("Crawfish.toml"))
-        .unwrap()
-        .contains("[openclaw.inbound]"));
+    let config = fs::read_to_string(dir.path().join("Crawfish.toml")).unwrap();
+    assert!(config.contains("[swarm]"));
+    assert!(!config.contains("[openclaw.inbound]"));
     assert!(dir.path().join("agents/repo_reviewer.toml").exists());
     assert!(dir.path().join("agents/task_planner.toml").exists());
     assert!(dir.path().join("agents/workspace_editor.toml").exists());

@@ -1192,11 +1192,6 @@ manifests_dir = "agents"
 [api]
 socket_path = ".crawfish/run/crawfishd.sock"
 
-[openclaw.inbound]
-enabled = false
-caller_owner_mapping = "required"
-default_trust_domain = "same_device_foreign_owner"
-
 [runtime]
 reconcile_interval_ms = 5000
 

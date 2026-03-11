@@ -1,0 +1,21 @@
+id = "incident_enricher"
+role = "incident_enricher"
+trust_domain = "same_owner_local"
+capabilities = ["incident.enrich"]
+exposed_capabilities = ["incident.enrich"]
+default_data_boundaries = ["owner_local"]
+
+[owner]
+kind = "human"
+id = "local-dev"
+display_name = "Local Developer"
+
+[contract_defaults.quality]
+evaluation_profile = "incident_enrich_default"
+
+[[adapters]]
+adapter = "mcp"
+capability = "observability.logs.read"
+server = "hero_remote"
+tool = "observability_logs_read"
+default_scope = ["logs:read"]

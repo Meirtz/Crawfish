@@ -1,0 +1,16 @@
+id = "workspace_editor"
+role = "workspace_editor"
+trust_domain = "same_owner_local"
+capabilities = ["workspace.patch.apply"]
+exposed_capabilities = ["workspace.patch.apply"]
+default_data_boundaries = ["owner_local"]
+
+[owner]
+kind = "human"
+id = "local-dev"
+display_name = "Local Developer"
+
+[workspace_policy]
+isolation = "per_action"
+lock_mode = "file"
+write_mode = "approval_gated"

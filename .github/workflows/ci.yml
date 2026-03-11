@@ -46,8 +46,8 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  hero-smoke:
-    name: hero-smoke
+  mainline-hero-smoke:
+    name: mainline-hero-smoke
     runs-on: ubuntu-latest
     needs: checks
     steps:
@@ -59,8 +59,26 @@ jobs:
       - name: Hero P0 CLI smoke
         run: cargo test -p crawfish-cli --test cli
 
-  openclaw-inbound:
-    name: openclaw-inbound
+  experimental-regression:
+    name: experimental-regression
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Remote and federation regression tests
+        run: |
+          cargo test -p crawfish-runtime task_plan_routes_to_openclaw_and_streams_events -- --exact
+          cargo test -p crawfish-runtime task_plan_routes_to_a2a_and_surfaces_treaty_lineage -- --exact
+          cargo test -p crawfish-runtime task_plan_remote_review_required_creates_remote_evidence_bundle_and_queue_item -- --exact
+          cargo test -p crawfish-runtime dispatching_remote_followup_creates_fresh_attempt_on_same_action -- --exact
+          cargo test -p crawfish-runtime openclaw_inbound_submit_inspect_and_events_work_for_mapped_caller -- --exact
+
+  experimental-openclaw-inbound:
+    name: experimental-openclaw-inbound
     runs-on: ubuntu-latest
     needs: checks
     steps:

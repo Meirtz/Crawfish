@@ -1,0 +1,19 @@
+id = "ci_triage"
+role = "ci_triage"
+trust_domain = "same_owner_local"
+capabilities = ["ci.triage"]
+exposed_capabilities = ["ci.triage"]
+dependencies = ["repo_indexer"]
+default_data_boundaries = ["owner_local"]
+
+[owner]
+kind = "human"
+id = "local-dev"
+display_name = "Local Developer"
+
+[[adapters]]
+adapter = "mcp"
+capability = "ci.runs.inspect"
+server = "hero_remote"
+tool = "ci_runs_inspect"
+default_scope = ["ci:read"]

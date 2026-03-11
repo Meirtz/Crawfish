@@ -10,6 +10,8 @@ This repository keeps product and architecture documentation under `docs/`.
   - Generated exports derived from the Markdown spec set.
 - `docs/archive/`
   - Historical or legacy materials retained for reference.
+- `docs/experimental/`
+  - Notes and entry points for retained experimental alpha surfaces.
 
 ## Source Of Truth
 
@@ -22,6 +24,7 @@ Current spec entry points:
 - [`spec/architecture.md`](spec/architecture.md)
 - [`spec/v0.1-plan.md`](spec/v0.1-plan.md)
 - [`spec/glossary.md`](spec/glossary.md)
+- [`experimental/README.md`](experimental/README.md)
 
 The implementation boundary is **Rust-first, not Rust-only**:
 
@@ -41,6 +44,8 @@ Public maintenance and contribution policy lives in:
 
 ## Runnable Example
 
+The public happy path is the **mainline alpha** example under `examples/hero-swarm/`.
+
 The live alpha example swarm is tracked under:
 
 - [`../examples/hero-swarm/Crawfish.toml`](../examples/hero-swarm/Crawfish.toml)
@@ -49,9 +54,12 @@ The live alpha example swarm is tracked under:
 - [`../examples/hero-swarm/agents/ci_triage.toml`](../examples/hero-swarm/agents/ci_triage.toml)
 - [`../examples/hero-swarm/agents/task_planner.toml`](../examples/hero-swarm/agents/task_planner.toml)
 - [`../examples/hero-swarm/agents/workspace_editor.toml`](../examples/hero-swarm/agents/workspace_editor.toml)
-- [`../integrations/openclaw-inbound/`](../integrations/openclaw-inbound/)
 
-That example is the current implementation reference for Hero P0 plus the first OpenClaw interop slices: deterministic `repo.index`, deterministic-first `repo.review`, `ci_triage` with either direct log input or SSE MCP-backed log fetch, approval-gated local mutation through `workspace_editor`, proposal-oriented `task.plan` with `verify_loop`, and OpenClaw Gateway ingress through the isolated bridge package.
+That example is the current implementation reference for local swarm control, deterministic and local-harness execution, approval-gated local mutation, and inspectable operator state.
+
+Experimental alpha surfaces are documented separately in:
+
+- [`experimental/README.md`](experimental/README.md)
 
 ## Export Policy
 
