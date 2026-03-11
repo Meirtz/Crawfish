@@ -703,12 +703,20 @@ impl Supervisor {
         let resolved_profile = self.resolve_evaluation_profile(action)?;
         let preliminary_checkpoint_status =
             checkpoint_status_for_action(action, &doctrine, true, None, resolved_profile.is_some());
+        let preliminary_incidents = self.policy_incidents_for_action(
+            action,
+            resolved_profile.as_ref(),
+            None,
+            &preliminary_checkpoint_status,
+        );
         let evaluations = self
             .evaluate_action_outputs(
                 action,
                 resolved_profile.as_ref(),
                 &doctrine,
+                &interaction_model,
                 &preliminary_checkpoint_status,
+                &preliminary_incidents,
             )
             .await?;
         for evaluation in &evaluations {
@@ -935,14 +943,23 @@ impl Supervisor {
         action: &Action,
         profile: Option<&ResolvedEvaluationProfile>,
         doctrine: &DoctrinePack,
+        interaction_model: &crawfish_types::InteractionModel,
         checkpoint_status: &[CheckpointStatus],
+        observed_incidents: &[PolicyIncident],
     ) -> anyhow::Result<Vec<EvaluationRecord>> {
         let Some(profile) = profile else {
             return Ok(Vec::new());
         };
 
         let outcome = self
-            .score_action_outputs(action, profile, doctrine, checkpoint_status)
+            .score_action_outputs(
+                action,
+                profile,
+                doctrine,
+                interaction_model,
+                checkpoint_status,
+                observed_incidents,
+            )
             .await?;
         Ok(vec![EvaluationRecord {
             id: Uuid::new_v4().to_string(),
@@ -953,6 +970,9 @@ impl Supervisor {
             summary: outcome.summary,
             findings: outcome.findings,
             criterion_results: outcome.criterion_results,
+            interaction_model: Some(interaction_model.clone()),
+            remote_outcome_disposition: remote_outcome_disposition_for_action(action),
+            treaty_violation_count: treaty_violations_for_action(action).len() as u32,
             feedback_note_id: None,
             created_at: now_timestamp(),
         }])
@@ -963,7 +983,9 @@ impl Supervisor {
         action: &Action,
         profile: &ResolvedEvaluationProfile,
         doctrine: &DoctrinePack,
+        interaction_model: &crawfish_types::InteractionModel,
         checkpoint_status: &[CheckpointStatus],
+        observed_incidents: &[PolicyIncident],
     ) -> anyhow::Result<ScorecardOutcome> {
         let total_weight: u32 = profile
             .scorecard
@@ -980,7 +1002,14 @@ impl Supervisor {
         let mut criterion_results = Vec::new();
         for criterion in &profile.scorecard.criteria {
             let criterion_result = self
-                .scorecard_criterion_result(action, doctrine, checkpoint_status, criterion)
+                .scorecard_criterion_result(
+                    action,
+                    doctrine,
+                    interaction_model,
+                    checkpoint_status,
+                    observed_incidents,
+                    criterion,
+                )
                 .await?;
             if criterion_result.passed {
                 passed_weight = passed_weight.saturating_add(criterion.weight.max(1));
@@ -1410,7 +1439,7 @@ impl Supervisor {
             } else if let Some(hook) = action.contract.quality.evaluation_hook.as_deref() {
                 legacy_evaluation_hook_profile_name(hook).map(ToString::to_string)
             } else {
-                builtin_profile_name_for_capability(&action.capability).map(ToString::to_string)
+                builtin_profile_name_for_action(action).map(ToString::to_string)
             };
 
         let Some(profile_name) = requested_name else {
@@ -1484,7 +1513,9 @@ impl Supervisor {
         &self,
         action: &Action,
         _doctrine: &DoctrinePack,
+        interaction_model: &crawfish_types::InteractionModel,
         checkpoint_status: &[CheckpointStatus],
+        observed_incidents: &[PolicyIncident],
         criterion: &ScorecardCriterion,
     ) -> anyhow::Result<crawfish_types::EvaluationCriterionResult> {
         let passed = match criterion.kind {
@@ -1688,13 +1719,45 @@ impl Supervisor {
                 })
             }
             ScorecardCriterionKind::IncidentAbsent => {
-                let incidents = self.store.list_policy_incidents(&action.id).await?;
                 if let Some(code) = criterion.incident_code.as_deref() {
-                    !incidents
+                    !observed_incidents
                         .iter()
                         .any(|incident| incident.reason_code == code)
                 } else {
-                    incidents.is_empty()
+                    observed_incidents.is_empty()
+                }
+            }
+            ScorecardCriterionKind::ExternalRefPresent => criterion
+                .external_ref_kind
+                .as_deref()
+                .map(|kind| {
+                    action
+                        .external_refs
+                        .iter()
+                        .any(|reference| reference.kind == kind)
+                })
+                .unwrap_or(false),
+            ScorecardCriterionKind::InteractionModelIs => criterion
+                .interaction_model
+                .as_ref()
+                .map(|expected| expected == interaction_model)
+                .unwrap_or(false),
+            ScorecardCriterionKind::RemoteOutcomeDispositionIs => criterion
+                .remote_outcome_disposition
+                .as_ref()
+                .map(|expected| {
+                    remote_outcome_disposition_for_action(action)
+                        .as_ref()
+                        .map(|actual| actual == expected)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            ScorecardCriterionKind::TreatyViolationAbsent => {
+                let violations = treaty_violations_for_action(action);
+                if let Some(code) = criterion.treaty_violation_code.as_deref() {
+                    !violations.iter().any(|violation| violation.code == code)
+                } else {
+                    violations.is_empty()
                 }
             }
         };
@@ -1707,7 +1770,14 @@ impl Supervisor {
             } else {
                 0.0
             },
-            evidence_summary: scorecard_evidence_summary(action, criterion, passed).await?,
+            evidence_summary: scorecard_evidence_summary(
+                action,
+                criterion,
+                interaction_model,
+                observed_incidents,
+                passed,
+            )
+            .await?,
         })
     }
 
@@ -1900,12 +1970,20 @@ impl Supervisor {
                     None,
                     resolved_profile.is_some(),
                 );
+                let preliminary_incidents = self.policy_incidents_for_action(
+                    &action,
+                    resolved_profile.as_ref(),
+                    None,
+                    &checkpoint_status,
+                );
                 let evaluation = self
                     .evaluate_action_outputs(
                         &action,
                         resolved_profile.as_ref(),
                         &doctrine,
+                        &interaction_model,
                         &checkpoint_status,
+                        &preliminary_incidents,
                     )
                     .await?
                     .into_iter()
@@ -1945,6 +2023,9 @@ impl Supervisor {
                     artifact_refs: outputs.artifacts,
                     external_refs,
                     policy_incident_count: incidents.len() as u32,
+                    interaction_model: Some(interaction_model),
+                    remote_outcome_disposition: remote_outcome_disposition_for_action(&action),
+                    treaty_violation_count: treaty_violations_for_action(&action).len() as u32,
                     failure_code: None,
                     created_at: now_timestamp(),
                 })
@@ -1962,24 +2043,102 @@ impl Supervisor {
                 outputs,
                 external_refs,
                 ..
-            } => Ok(ExperimentCaseResult {
-                id: Uuid::new_v4().to_string(),
-                run_id: run.id.clone(),
-                dataset_case_id: case.id.clone(),
-                capability: case.capability.clone(),
-                status: ExperimentCaseStatus::Failed,
-                selected_executor: action.selected_executor.clone(),
-                evaluation_status: None,
-                score: None,
-                summary: reason,
-                findings: Vec::new(),
-                criterion_results: Vec::new(),
-                artifact_refs: outputs.artifacts,
-                external_refs,
-                policy_incident_count: 0,
-                failure_code: Some(failure_code),
-                created_at: now_timestamp(),
-            }),
+            } => {
+                action.phase = if failure_code == "a2a_auth_required" {
+                    ActionPhase::AwaitingApproval
+                } else if failure_code == "a2a_input_required" {
+                    ActionPhase::Blocked
+                } else {
+                    ActionPhase::Failed
+                };
+                action.finished_at = if matches!(
+                    action.phase,
+                    ActionPhase::Blocked | ActionPhase::AwaitingApproval
+                ) {
+                    None
+                } else {
+                    Some(now_timestamp())
+                };
+                action.failure_reason = Some(reason.clone());
+                action.failure_code = Some(failure_code.clone());
+                action.outputs = outputs.clone();
+                action.external_refs = external_refs.clone();
+                action.selected_executor = action
+                    .selected_executor
+                    .clone()
+                    .or_else(|| selected_executor_from_external_refs(&external_refs));
+                let interaction_model = interaction_model_for_action(&action, None);
+                let doctrine = default_doctrine_pack(
+                    &action,
+                    &interaction_model,
+                    jurisdiction_class_for_action(&action, None),
+                );
+                let resolved_profile = self.resolve_evaluation_profile(&action)?;
+                let checkpoint_status = checkpoint_status_for_action(
+                    &action,
+                    &doctrine,
+                    false,
+                    None,
+                    resolved_profile.is_some(),
+                );
+                let preliminary_incidents = self.policy_incidents_for_action(
+                    &action,
+                    resolved_profile.as_ref(),
+                    None,
+                    &checkpoint_status,
+                );
+                let evaluation = self
+                    .evaluate_action_outputs(
+                        &action,
+                        resolved_profile.as_ref(),
+                        &doctrine,
+                        &interaction_model,
+                        &checkpoint_status,
+                        &preliminary_incidents,
+                    )
+                    .await?
+                    .into_iter()
+                    .last();
+                let incidents = self.policy_incidents_for_action(
+                    &action,
+                    resolved_profile.as_ref(),
+                    evaluation.as_ref(),
+                    &checkpoint_status,
+                );
+
+                Ok(ExperimentCaseResult {
+                    id: Uuid::new_v4().to_string(),
+                    run_id: run.id.clone(),
+                    dataset_case_id: case.id.clone(),
+                    capability: case.capability.clone(),
+                    status: ExperimentCaseStatus::Failed,
+                    selected_executor: action.selected_executor.clone(),
+                    evaluation_status: evaluation
+                        .as_ref()
+                        .map(|evaluation| evaluation.status.clone()),
+                    score: evaluation.as_ref().and_then(|evaluation| evaluation.score),
+                    summary: evaluation
+                        .as_ref()
+                        .map(|evaluation| evaluation.summary.clone())
+                        .unwrap_or(reason),
+                    findings: evaluation
+                        .as_ref()
+                        .map(|evaluation| evaluation.findings.clone())
+                        .unwrap_or_default(),
+                    criterion_results: evaluation
+                        .as_ref()
+                        .map(|evaluation| evaluation.criterion_results.clone())
+                        .unwrap_or_default(),
+                    artifact_refs: outputs.artifacts,
+                    external_refs,
+                    policy_incident_count: incidents.len() as u32,
+                    interaction_model: Some(interaction_model),
+                    remote_outcome_disposition: remote_outcome_disposition_for_action(&action),
+                    treaty_violation_count: treaty_violations_for_action(&action).len() as u32,
+                    failure_code: Some(failure_code),
+                    created_at: now_timestamp(),
+                })
+            }
         }
     }
 
@@ -2007,6 +2166,9 @@ impl Supervisor {
             ),
             findings: feedback.into_iter().cloned().collect(),
             criterion_results: Vec::new(),
+            interaction_model: Some(interaction_model_for_action(action, None)),
+            remote_outcome_disposition: remote_outcome_disposition_for_action(action),
+            treaty_violation_count: treaty_violations_for_action(action).len() as u32,
             feedback_note_id: None,
             created_at: now_timestamp(),
         };
@@ -5264,6 +5426,8 @@ async fn scorecard_target_text(
 async fn scorecard_evidence_summary(
     action: &Action,
     criterion: &ScorecardCriterion,
+    interaction_model: &crawfish_types::InteractionModel,
+    observed_incidents: &[PolicyIncident],
     passed: bool,
 ) -> anyhow::Result<String> {
     let target_label = criterion
@@ -5311,7 +5475,32 @@ async fn scorecard_evidence_summary(
             .incident_code
             .as_deref()
             .map(|code| format!("incident `{code}` absent"))
-            .unwrap_or_else(|| "no incidents present".to_string()),
+            .unwrap_or_else(|| format!("{} incidents absent", observed_incidents.len())),
+        ScorecardCriterionKind::ExternalRefPresent => criterion
+            .external_ref_kind
+            .as_deref()
+            .map(|kind| format!("external ref `{kind}` present"))
+            .unwrap_or_else(|| "external ref kind missing".to_string()),
+        ScorecardCriterionKind::InteractionModelIs => criterion
+            .interaction_model
+            .as_ref()
+            .map(|model| format!("interaction model `{}`", runtime_enum_to_snake(model)))
+            .unwrap_or_else(|| "interaction model missing".to_string()),
+        ScorecardCriterionKind::RemoteOutcomeDispositionIs => criterion
+            .remote_outcome_disposition
+            .as_ref()
+            .map(|disposition| {
+                format!(
+                    "remote outcome disposition `{}`",
+                    runtime_enum_to_snake(disposition)
+                )
+            })
+            .unwrap_or_else(|| "remote outcome disposition missing".to_string()),
+        ScorecardCriterionKind::TreatyViolationAbsent => criterion
+            .treaty_violation_code
+            .as_deref()
+            .map(|code| format!("treaty violation `{code}` absent"))
+            .unwrap_or_else(|| "no treaty violations present".to_string()),
         ScorecardCriterionKind::ArtifactPresent => "artifact present".to_string(),
         ScorecardCriterionKind::ArtifactAbsent => "artifact absent".to_string(),
         ScorecardCriterionKind::JsonFieldNonempty => "field nonempty".to_string(),
@@ -5334,6 +5523,78 @@ async fn scorecard_evidence_summary(
         .await?
         .map(|text| format!(" observed {}", compact_json_value(&Value::String(text))))
         .unwrap_or_else(|| " observed <missing>".to_string())
+    } else if matches!(criterion.kind, ScorecardCriterionKind::InteractionModelIs) {
+        format!(" observed {}", runtime_enum_to_snake(interaction_model))
+    } else if matches!(
+        criterion.kind,
+        ScorecardCriterionKind::RemoteOutcomeDispositionIs
+    ) {
+        remote_outcome_disposition_for_action(action)
+            .as_ref()
+            .map(|disposition| format!(" observed {}", runtime_enum_to_snake(disposition)))
+            .unwrap_or_else(|| " observed <missing>".to_string())
+    } else if matches!(criterion.kind, ScorecardCriterionKind::ExternalRefPresent) {
+        criterion
+            .external_ref_kind
+            .as_deref()
+            .map(|kind| {
+                let present = action
+                    .external_refs
+                    .iter()
+                    .any(|reference| reference.kind == kind);
+                format!(" observed present={present}")
+            })
+            .unwrap_or_else(|| " observed <missing-kind>".to_string())
+    } else if matches!(
+        criterion.kind,
+        ScorecardCriterionKind::TreatyViolationAbsent
+    ) {
+        let violations = treaty_violations_for_action(action);
+        if let Some(code) = criterion.treaty_violation_code.as_deref() {
+            let matched = violations
+                .iter()
+                .filter(|violation| violation.code == code)
+                .map(|violation| violation.summary.clone())
+                .collect::<Vec<_>>();
+            if matched.is_empty() {
+                " observed []".to_string()
+            } else {
+                format!(" observed {matched:?}")
+            }
+        } else if violations.is_empty() {
+            " observed []".to_string()
+        } else {
+            format!(
+                " observed {:?}",
+                violations
+                    .iter()
+                    .map(|violation| violation.code.clone())
+                    .collect::<Vec<_>>()
+            )
+        }
+    } else if matches!(criterion.kind, ScorecardCriterionKind::IncidentAbsent) {
+        if let Some(code) = criterion.incident_code.as_deref() {
+            let matched = observed_incidents
+                .iter()
+                .filter(|incident| incident.reason_code == code)
+                .map(|incident| incident.summary.clone())
+                .collect::<Vec<_>>();
+            if matched.is_empty() {
+                " observed []".to_string()
+            } else {
+                format!(" observed {matched:?}")
+            }
+        } else if observed_incidents.is_empty() {
+            " observed []".to_string()
+        } else {
+            format!(
+                " observed {:?}",
+                observed_incidents
+                    .iter()
+                    .map(|incident| incident.reason_code.clone())
+                    .collect::<Vec<_>>()
+            )
+        }
     } else {
         let current = scorecard_target_value(
             action,
@@ -5991,6 +6252,20 @@ fn builtin_evaluation_profiles() -> BTreeMap<String, EvaluationProfile> {
             },
         ),
         (
+            "task_plan_remote_default".to_string(),
+            EvaluationProfile {
+                scorecard: "task_plan_remote_scorecard".to_string(),
+                review_queue: true,
+                alert_rules: vec![
+                    "evaluation_attention_required".to_string(),
+                    "frontier_gap_detected".to_string(),
+                ],
+                dataset_name: Some("task_plan_dataset".to_string()),
+                dataset_capture: true,
+                post_result_required: true,
+            },
+        ),
+        (
             "incident_enrich_default".to_string(),
             EvaluationProfile {
                 scorecard: "incident_enrich_scorecard".to_string(),
@@ -6161,6 +6436,144 @@ fn builtin_scorecards() -> BTreeMap<String, ScorecardSpec> {
                     },
                 ],
                 minimum_score: Some(0.6),
+                needs_review_below: Some(1.0),
+            },
+        ),
+        (
+            "task_plan_remote_scorecard".to_string(),
+            ScorecardSpec {
+                id: "task_plan_remote_scorecard".to_string(),
+                title: "Task plan remote-agent scorecard".to_string(),
+                criteria: vec![
+                    ScorecardCriterion {
+                        id: "interaction_model_remote_agent".to_string(),
+                        title: "interaction model is remote_agent".to_string(),
+                        kind: ScorecardCriterionKind::InteractionModelIs,
+                        interaction_model: Some(crawfish_types::InteractionModel::RemoteAgent),
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "delegation_receipt_present".to_string(),
+                        title: "delegation receipt external ref present".to_string(),
+                        kind: ScorecardCriterionKind::ExternalRefPresent,
+                        external_ref_kind: Some("a2a.delegation_receipt".to_string()),
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "remote_task_ref_present".to_string(),
+                        title: "remote task ref present".to_string(),
+                        kind: ScorecardCriterionKind::ExternalRefPresent,
+                        external_ref_kind: Some("a2a.task_id".to_string()),
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "remote_outcome_accepted".to_string(),
+                        title: "remote outcome accepted".to_string(),
+                        kind: ScorecardCriterionKind::RemoteOutcomeDispositionIs,
+                        remote_outcome_disposition: Some(
+                            crawfish_types::RemoteOutcomeDisposition::Accepted,
+                        ),
+                        weight: 3,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "no_treaty_violations".to_string(),
+                        title: "no treaty violations present".to_string(),
+                        kind: ScorecardCriterionKind::TreatyViolationAbsent,
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "no_treaty_scope_violation".to_string(),
+                        title: "treaty scope violation absent".to_string(),
+                        kind: ScorecardCriterionKind::TreatyViolationAbsent,
+                        treaty_violation_code: Some("treaty_scope_violation".to_string()),
+                        weight: 3,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "no_frontier_gap_violation".to_string(),
+                        title: "frontier enforcement gap absent".to_string(),
+                        kind: ScorecardCriterionKind::TreatyViolationAbsent,
+                        treaty_violation_code: Some("frontier_enforcement_gap".to_string()),
+                        weight: 3,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "artifact_json".to_string(),
+                        title: "task_plan.json present".to_string(),
+                        kind: ScorecardCriterionKind::ArtifactPresent,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        weight: 1,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "artifact_markdown".to_string(),
+                        title: "task_plan.md present".to_string(),
+                        kind: ScorecardCriterionKind::ArtifactPresent,
+                        artifact_name: Some("task_plan.md".to_string()),
+                        weight: 1,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "ordered_steps".to_string(),
+                        title: "ordered_steps has enough entries".to_string(),
+                        kind: ScorecardCriterionKind::ListMinLen,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        field_path: Some("ordered_steps".to_string()),
+                        min_len: Some(2),
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "confidence_summary".to_string(),
+                        title: "confidence summary populated".to_string(),
+                        kind: ScorecardCriterionKind::JsonFieldNonempty,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        field_path: Some("confidence_summary".to_string()),
+                        weight: 1,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "task_plan_schema".to_string(),
+                        title: "task plan JSON matches the expected schema".to_string(),
+                        kind: ScorecardCriterionKind::JsonSchemaValid,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        json_schema: Some(serde_json::json!({
+                            "type": "object",
+                            "required": ["ordered_steps", "risks", "assumptions", "confidence_summary"],
+                            "properties": {
+                                "ordered_steps": {"type": "array"},
+                                "risks": {"type": "array"},
+                                "assumptions": {"type": "array"},
+                                "confidence_summary": {"type": "string"}
+                            }
+                        })),
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "objective_coverage".to_string(),
+                        title: "objective tokens covered".to_string(),
+                        kind: ScorecardCriterionKind::TokenCoverage,
+                        artifact_name: Some("task_plan.json".to_string()),
+                        source_path: Some("inputs.objective".to_string()),
+                        weight: 2,
+                        ..ScorecardCriterion::default()
+                    },
+                    ScorecardCriterion {
+                        id: "pre_dispatch".to_string(),
+                        title: "pre-dispatch checkpoint passed".to_string(),
+                        kind: ScorecardCriterionKind::CheckpointPassed,
+                        checkpoint: Some(OversightCheckpoint::PreDispatch),
+                        weight: 1,
+                        ..ScorecardCriterion::default()
+                    },
+                ],
+                minimum_score: Some(0.75),
                 needs_review_below: Some(1.0),
             },
         ),
@@ -6447,8 +6860,16 @@ fn builtin_pairwise_profiles() -> BTreeMap<String, PairwiseProfile> {
     )])
 }
 
-fn builtin_profile_name_for_capability(capability: &str) -> Option<&'static str> {
-    match capability {
+fn builtin_profile_name_for_action(action: &Action) -> Option<&'static str> {
+    match action.capability.as_str() {
+        "task.plan" | "coding.patch.plan"
+            if matches!(
+                interaction_model_for_action(action, None),
+                crawfish_types::InteractionModel::RemoteAgent
+            ) =>
+        {
+            Some("task_plan_remote_default")
+        }
         "task.plan" | "coding.patch.plan" => Some("task_plan_default"),
         "repo.review" => Some("repo_review_default"),
         "incident.enrich" => Some("incident_enrich_default"),
@@ -6592,7 +7013,19 @@ fn build_pairwise_case_result(
     profile: &PairwiseProfile,
 ) -> PairwiseCaseResult {
     let (outcome, reason_code, summary) =
-        if left.policy_incident_count < right.policy_incident_count {
+        if left.treaty_violation_count < right.treaty_violation_count {
+            (
+                PairwiseOutcome::LeftWins,
+                "fewer_treaty_violations".to_string(),
+                "left executor produced fewer treaty-governance violations".to_string(),
+            )
+        } else if right.treaty_violation_count < left.treaty_violation_count {
+            (
+                PairwiseOutcome::RightWins,
+                "fewer_treaty_violations".to_string(),
+                "right executor produced fewer treaty-governance violations".to_string(),
+            )
+        } else if left.policy_incident_count < right.policy_incident_count {
             (
                 PairwiseOutcome::LeftWins,
                 "fewer_policy_incidents".to_string(),
@@ -10156,6 +10589,188 @@ EOF
             .treaty_violations
             .iter()
             .any(|violation| violation.code == "frontier_enforcement_gap"));
+    }
+
+    #[tokio::test]
+    async fn task_plan_remote_actions_use_remote_evaluation_profile_and_dataset_metadata() {
+        let dir = tempdir().unwrap();
+        let a2a_url = spawn_runtime_a2a_server(RuntimeA2aMode::StreamingCompleted).await;
+        std::env::set_var("A2A_REMOTE_TOKEN", "remote-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
+            .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Plan a remote-agent evaluation path with treaty evidence",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail.evaluation_profile.as_deref(),
+            Some("task_plan_remote_default")
+        );
+        assert_eq!(
+            detail.remote_outcome_disposition,
+            Some(crawfish_types::RemoteOutcomeDisposition::Accepted)
+        );
+
+        let evaluations = supervisor
+            .list_action_evaluations(&submitted.action_id)
+            .await
+            .unwrap();
+        let latest = evaluations
+            .evaluations
+            .iter()
+            .rev()
+            .find(|evaluation| evaluation.evaluator == "task_plan_remote_default")
+            .expect("remote task-plan evaluation");
+        assert_eq!(
+            latest.interaction_model,
+            Some(crawfish_types::InteractionModel::RemoteAgent)
+        );
+        assert_eq!(
+            latest.remote_outcome_disposition,
+            Some(crawfish_types::RemoteOutcomeDisposition::Accepted)
+        );
+        assert_eq!(latest.treaty_violation_count, 0);
+        assert!(latest
+            .criterion_results
+            .iter()
+            .any(
+                |criterion| criterion.criterion_id == "interaction_model_remote_agent"
+                    && criterion.passed
+            ));
+        assert!(latest
+            .criterion_results
+            .iter()
+            .any(
+                |criterion| criterion.criterion_id == "remote_outcome_accepted" && criterion.passed
+            ));
+        assert!(latest
+            .criterion_results
+            .iter()
+            .any(|criterion| criterion.criterion_id == "no_treaty_violations" && criterion.passed));
+
+        let dataset = supervisor
+            .get_evaluation_dataset("task_plan_dataset")
+            .await
+            .unwrap()
+            .expect("task plan dataset");
+        let case = dataset
+            .cases
+            .iter()
+            .find(|case| case.source_action_id == submitted.action_id)
+            .expect("captured dataset case");
+        assert_eq!(
+            case.interaction_model,
+            Some(crawfish_types::InteractionModel::RemoteAgent)
+        );
+        assert_eq!(
+            case.remote_outcome_disposition,
+            Some(crawfish_types::RemoteOutcomeDisposition::Accepted)
+        );
+        assert_eq!(case.treaty_pack_id.as_deref(), Some("remote_task_planning"));
+        assert!(case.treaty_violations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_plan_remote_evidence_gap_fails_remote_scorecard() {
+        let dir = tempdir().unwrap();
+        let a2a_url = spawn_runtime_a2a_server(RuntimeA2aMode::StreamingMissingTaskRef).await;
+        std::env::set_var("A2A_REMOTE_TOKEN", "remote-token");
+        let manifest = local_task_planner_manifest(
+            "__missing_claude__",
+            "__missing_codex__",
+            "ws://127.0.0.1:9/unavailable",
+        )
+        .replace(
+            "preferred_harnesses = [\"claude_code\", \"codex\", \"a2a\", \"openclaw\"]",
+            "preferred_harnesses = [\"a2a\"]",
+        )
+        .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let config = include_str!("../../../examples/hero-swarm/Crawfish.toml")
+            .replace("http://127.0.0.1:7788/agent-card.json", &a2a_url);
+        let supervisor = build_supervisor_with_task_planner_manifest_and_config(
+            dir.path(),
+            manifest,
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let submitted = supervisor
+            .submit_action(task_plan_request(
+                dir.path(),
+                "Plan a remote task that should trigger a frontier evidence gap",
+            ))
+            .await
+            .unwrap();
+        supervisor.process_action_queue_once().await.unwrap();
+
+        let detail = supervisor
+            .inspect_action(&submitted.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail.evaluation_profile.as_deref(),
+            Some("task_plan_remote_default")
+        );
+        assert_eq!(detail.action.phase, ActionPhase::Blocked);
+        assert_eq!(
+            detail.remote_outcome_disposition,
+            Some(crawfish_types::RemoteOutcomeDisposition::ReviewRequired)
+        );
+
+        let evaluations = supervisor
+            .list_action_evaluations(&submitted.action_id)
+            .await
+            .unwrap();
+        let latest = evaluations
+            .evaluations
+            .iter()
+            .rev()
+            .find(|evaluation| evaluation.evaluator == "task_plan_remote_default")
+            .expect("remote task-plan evaluation");
+        assert!(matches!(latest.status, EvaluationStatus::Failed));
+        assert_eq!(latest.treaty_violation_count, 1);
+        assert!(latest
+            .criterion_results
+            .iter()
+            .any(
+                |criterion| criterion.criterion_id == "remote_outcome_accepted"
+                    && !criterion.passed
+            ));
+        assert!(latest
+            .criterion_results
+            .iter()
+            .any(
+                |criterion| criterion.criterion_id == "no_frontier_gap_violation"
+                    && !criterion.passed
+            ));
     }
 
     #[tokio::test]

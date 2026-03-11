@@ -1637,6 +1637,12 @@ pub struct EvaluationRecord {
     #[serde(default)]
     pub criterion_results: Vec<EvaluationCriterionResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_model: Option<InteractionModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
+    #[serde(default)]
+    pub treaty_violation_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback_note_id: Option<String>,
     pub created_at: String,
 }
@@ -1742,6 +1748,10 @@ pub enum ScorecardCriterionKind {
     TokenCoverage,
     CheckpointPassed,
     IncidentAbsent,
+    ExternalRefPresent,
+    InteractionModelIs,
+    RemoteOutcomeDispositionIs,
+    TreatyViolationAbsent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1771,6 +1781,14 @@ pub struct ScorecardCriterion {
     pub numeric_comparison: Option<NumericComparison>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_model: Option<InteractionModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treaty_violation_code: Option<String>,
     #[serde(default = "default_scorecard_weight")]
     pub weight: u32,
 }
@@ -1792,6 +1810,10 @@ impl Default for ScorecardCriterion {
             numeric_threshold: None,
             numeric_comparison: None,
             json_schema: None,
+            external_ref_kind: None,
+            interaction_model: None,
+            remote_outcome_disposition: None,
+            treaty_violation_code: None,
             weight: default_scorecard_weight(),
         }
     }
@@ -1972,6 +1994,12 @@ pub struct ExperimentCaseResult {
     pub external_refs: Vec<ExternalRef>,
     #[serde(default)]
     pub policy_incident_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_model: Option<InteractionModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
+    #[serde(default)]
+    pub treaty_violation_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_code: Option<String>,
     pub created_at: String,
