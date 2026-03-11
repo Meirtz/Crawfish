@@ -69,7 +69,7 @@ Crawfish should talk about interoperability in three planes:
 - **Harness plane:** OpenClaw Gateway and ACP-compatible harnesses for specialized execution surfaces, including planning, research, operations, investigation, and coding agents.
 - **Agent plane:** A2A for remote agent delegation across system boundaries.
 
-This framing is more accurate than treating all integrations as generic subprocesses. It also matches the actual product problem: tools, harnesses, and remote agents have different semantics, risk envelopes, and scheduling implications.
+This framing is more accurate than treating all integrations as generic subprocesses. It also matches the actual product problem: tools, harnesses, and remote agents have different semantics, risk envelopes, and scheduling implications. The [A2A project](https://github.com/a2aproject/A2A) and Google's ["A2A: A New Era of Agent Interoperability"](https://developers.googleblog.com/a2a-a-new-era-of-agent-interoperability/) are the key reference anchors for the remote-agent plane.
 
 ## Why Governance Becomes Core When Agents Roam
 
@@ -90,6 +90,7 @@ The distinction matters:
 
 - old multi-agent often meant context-managed sub-agents under one application authority
 - Crawfish targets true swarm governance across owners, trust domains, and harness surfaces
+- remote delegation is governed separately from harness selection, because a remote agent is another authority boundary rather than just another execution wrapper
 
 ## Sovereignty Before Coordination
 

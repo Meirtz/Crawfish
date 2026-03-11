@@ -38,6 +38,8 @@ Harnesses are important, but they are not the strategic center of the system.
 
 OpenClaw, Codex, Claude Code, Gemini CLI, ACP-compatible adapters, and future agentic surfaces will come and go, improve, fragment, or be superseded. The enduring system problem is not how to build one more harness. It is how to govern many harnesses as one swarm.
 
+That also means distinguishing harnesses from remote agent planes. A2A's [Agent Card](https://github.com/a2aproject/A2A) model and Google's ["A2A: A New Era of Agent Interoperability"](https://developers.googleblog.com/a2a-a-new-era-of-agent-interoperability/) launch framing matter here: remote delegation is not just another wrapper. It is a separate authority boundary that requires treaty scope and inspectable delegation evidence.
+
 This is why Crawfish treats harnesses as execution surfaces:
 
 - selectable
@@ -162,6 +164,8 @@ That means:
 - inspection and audit are product behavior, not incident response afterthoughts
 
 If the local model is coherent, it can extend outward. If it is not coherent locally, no federation story will save it later.
+
+The next frontier after same-device governance is treaty-governed remote delegation. The [A2A project](https://github.com/a2aproject/A2A) is useful because it provides a task-oriented remote-agent plane, but the runtime still has to decide when delegation is lawful, which treaty pack applies, and which evidence proves the delegation stayed inside scope.
 
 ## Design Consequences
 

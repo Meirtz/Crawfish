@@ -359,8 +359,12 @@ type AcpHarnessBinding = {
 type A2ARemoteAgentBinding = {
   adapter: "a2a";
   capability: string;
-  endpoint: string;
-  trust_domain: TrustDomain;
+  agent_card_url: string;
+  auth_ref?: string;
+  treaty_pack: string;
+  required_scopes: string[];
+  streaming_mode: "prefer_streaming" | "poll_only";
+  allow_in_task_auth: boolean;
 };
 
 type WorkspacePolicy = {
@@ -826,13 +830,49 @@ Outbound rules:
 
 ### Shared Governance Kernel
 
-OpenClaw inbound and outbound paths must reuse the same governance model as future A2A and other remote-agent systems:
+OpenClaw inbound and outbound paths must reuse the same governance model as A2A and other remote-agent systems:
 
 - classify owner and trust domain
 - resolve encounter policy
 - obtain consent if required
 - issue short-lived lease
 - emit auditable receipt
+
+## A2A Remote-Agent Delegation
+
+A2A is the first implemented remote-agent plane, using the [A2A project](https://github.com/a2aproject/A2A) and Google's ["A2A: A New Era of Agent Interoperability"](https://developers.googleblog.com/a2a-a-new-era-of-agent-interoperability/) as the reference shape.
+
+The distinction from the harness plane is intentional:
+
+- harness crossing changes execution surface semantics
+- remote-agent delegation crosses an authority boundary
+- remote delegation therefore requires treaty scope, delegation receipts, and frontier checkpoint evidence
+
+Current `P1i` rules:
+
+- outbound only
+- `task.plan` only
+- one-hop delegation only
+- treaty required before dispatch
+- no in-task auth forwarding
+- no mutation over A2A
+- prefer streaming when available, otherwise submit plus poll
+
+Remote state mapping is normalized into the normal Crawfish action model:
+
+- `submitted` or `working` -> `running`
+- `input-required` -> `blocked`
+- `auth-required` -> `awaiting_approval`
+- `completed` -> `completed`
+- `failed`, `rejected`, or `canceled` -> `failed`
+
+Remote lineage remains inspectable through:
+
+- remote principal
+- remote task id
+- treaty pack
+- delegation receipt
+- doctrine checkpoint status
 
 ## Execution Strategies
 
@@ -1121,7 +1161,7 @@ This is how Crawfish turns trace history into institutional memory rather than a
 | team and production state | Postgres control state |
 | durable bus upgrade path | external durable bus, introduced after P0 |
 | required protocol | MCP |
-| protocol status | MCP in P0, OpenClaw inbound and outbound in P1, ACP-compatible harness adapters and A2A deferred |
+| protocol status | MCP in P0, OpenClaw inbound/outbound and A2A outbound in P1, ACP-compatible harness adapters phased after |
 | external adapter boundary | JSON-RPC 2.0 over stdio |
 | telemetry | structured logs plus OpenTelemetry-compatible traces and metrics |
 

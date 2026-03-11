@@ -87,9 +87,22 @@ Harnesses are execution surfaces. Crawfish governs them.
 - OpenClaw is an interactive gateway-native harness surface.
 - Codex, Claude Code, Gemini CLI, and future ACP-compatible adapters are specialized general-purpose harnesses.
 - MCP tools are tool-plane integrations.
-- A2A will be remote-agent interoperability.
+- A2A is the first real remote-agent plane in the current design, using [Agent Cards and task-based delegation](https://github.com/a2aproject/A2A) in the shape introduced by Google's ["A2A: A New Era of Agent Interoperability"](https://developers.googleblog.com/a2a-a-new-era-of-agent-interoperability/).
 
 Crawfish does not compete by being one more reasoning loop. It competes by making many volatile reasoning loops behave like **one inspectable system**.
+
+## Why Remote Agents Are Not Just Another Harness
+
+Remote agents are not only remote processes. They are separate authorities.
+
+A harness crossing changes the execution surface. A remote-agent crossing changes the governance problem. A2A's [Agent Card](https://github.com/a2aproject/A2A) model and task lifecycle make that explicit: the runtime is delegating work to another agent system, not just spawning another wrapper on the same machine.
+
+That is why Crawfish treats remote delegation differently:
+
+- harnesses are selected execution surfaces
+- remote agents are treaty-governed delegation targets
+- doctrine still applies, but treaties decide whether cross-system delegation is allowed at all
+- remote task lineage, remote principal identity, and delegation receipts must remain inspectable
 
 That is why the project is **Rust-first, not Rust-only**:
 
@@ -127,7 +140,8 @@ The current alpha is not a mock architecture. It runs.
 
 ### Harness Paths
 
-- **Local-first harness routing**: `task.plan` now prefers local Claude Code and Codex wrappers before any remote harness route
+- **Local-first harness routing**: `task.plan` now prefers local Claude Code and Codex wrappers before any remote route
+- **A2A outbound remote delegation**: `task.plan` can delegate to a remote agent over [A2A](https://github.com/a2aproject/A2A) when a treaty pack allows it
 - **OpenClaw inbound**: a thin Gateway RPC bridge can submit and inspect Crawfish work without becoming a second policy engine
 - **OpenClaw outbound**: `task.plan` can still route out through OpenClaw as a proposal-only execution surface when local harnesses are absent or unsuitable
 - **Deterministic fallback**: if no approved harness route is available, `task.plan` can degrade into local planning when the compiled contract allows it
@@ -246,7 +260,7 @@ cargo run -p crawfish-cli --bin crawfish -- alert list --json
 
 For the full reference walkthrough, run [`examples/hero-swarm/demo.sh`](examples/hero-swarm/demo.sh).
 
-If `claude` or `codex` is installed locally, `task_planner` will prefer those harnesses first. If neither local wrapper is available, Crawfish falls back to OpenClaw when configured, then to deterministic planning when the contract allows it.
+If `claude` or `codex` is installed locally, `task_planner` will prefer those harnesses first. If neither local wrapper is available, Crawfish now tries treaty-governed A2A remote delegation before OpenClaw, then falls back to deterministic planning when the contract allows it.
 
 ## Public Status
 

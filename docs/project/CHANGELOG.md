@@ -37,6 +37,9 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - operator commands and UDS endpoints for `eval dataset list`, `eval dataset show`, `eval run`, `eval run-status`, `alert list`, and `alert ack`
 - automatic dataset capture and isolated replay runs for `task.plan`, `repo.review`, and `incident.enrich`
 - derived `interaction_model` metadata across action inspection, trace bundles, and dataset cases
+- native Rust `crawfish-a2a` outbound adapter with treaty-governed remote delegation for `task.plan`
+- read-only treaty operator surfaces via `crawfish treaty list`, `crawfish treaty show`, and `/v1/treaties`
+- delegation receipts, remote principal lineage, and remote task refs in action inspection and trace metadata
 
 ### Changed
 
@@ -57,6 +60,8 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - `quality.evaluation_profile` is now the primary evaluation config surface; `evaluation_hook` remains alpha-compatible but deprecated
 - the public README and spec now explicitly distinguish context-split multi-agent coordination from real swarm encounters across owners, harnesses, and trust domains, with inline source citations on first mention
 - `PolicyIncident.reason_code` is now the primary runtime field, with legacy `code` preserved as an alpha-compatibility alias
+- `task.plan` routing now treats A2A as the first real remote-agent plane, distinct from both harness crossings and local context-split coordination
+- the public README and spec now explicitly describe A2A as treaty-governed remote delegation rather than a deferred protocol placeholder
 
 ### Migration Notes
 
