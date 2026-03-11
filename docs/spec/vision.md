@@ -92,6 +92,8 @@ The distinction matters:
 - Crawfish targets true swarm governance across owners, trust domains, and harness surfaces
 - remote delegation is governed separately from harness selection, because a remote agent is another authority boundary rather than just another execution wrapper
 
+That distinction becomes sharper once the result comes back. Remote-agent governance is not finished when the task is dispatched. The runtime also has to decide whether the returned result is lawful to accept, whether the evidence chain is complete, and whether the outcome should be accepted, escalated, or rejected. That is why treaty semantics in Crawfish now cover both delegation admission and post-result governance.
+
 ## Sovereignty Before Coordination
 
 Crawfish should start from a sovereignty-first worldview.
@@ -118,6 +120,8 @@ A local coding agent, a personal research agent, an enterprise support agent, an
 - mutating tool authority
 
 This is why same-device governance should be treated as the first concrete enforcement target. If the model is coherent locally, it can later generalize to internet-scale federation.
+
+The next step after same-device governance is treaty-governed remote delegation, not open-ended federation economics. Markets, reputation, and broader federation packs are downstream. Treaties come first because a swarm needs a lawful basis for delegation before it needs a marketplace for delegation.
 
 ## Why Crawfish Matters In A Harness-Rich World
 
@@ -159,6 +163,22 @@ The right relationship is bidirectional interoperability, not category confusion
 
 - OpenClaw can call Crawfish when a session needs durable, policy-bound swarm work.
 - Crawfish can call OpenClaw when an action needs a specialized interactive or gateway-native agent surface.
+
+## Why Treaties Matter Before Federation Markets
+
+Remote agents are the first place where the control plane has to act like a federation runtime rather than a local scheduler.
+
+That does not mean Crawfish should start with marketplaces or reputation systems. It means it should start with the narrower legal primitive that actually constrains delegation:
+
+- recognized remote principal
+- allowed capability
+- allowed data scope
+- allowed artifact class
+- required checkpoints
+- required result evidence
+- escalation behavior when evidence is missing or scope is violated
+
+This is the same design lesson behind the distinction between Anthropic's [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) and runtime governance: principles can guide behavior, but they do not decide whether a concrete boundary crossing was lawful, inspectable, and adequately evidenced. Crawfish therefore treats treaties as the first control-plane primitive for remote-agent federation, not as optional metadata around A2A.
 
 ## Why OpenClaw Looks Like The Wild West, And Why Crawfish Should Be The Law Layer
 

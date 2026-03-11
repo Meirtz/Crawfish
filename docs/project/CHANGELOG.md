@@ -45,6 +45,10 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - operator commands and UDS endpoints for `eval compare`, `eval compare-status`, and pairwise review filtering
 - criterion-level evidence persisted inside `EvaluationRecord`
 - pairwise-aware review queue items, feedback-note lineage, and comparison-oriented alert rules
+- decision-complete treaty packs with result-evidence and escalation semantics for A2A outbound delegation
+- remote outcome dispositions for treaty-governed delegation: `accepted`, `review_required`, and `rejected`
+- treaty-aware review queue and alert integration for remote-agent results
+- treaty violation reporting and post-result frontier-gap visibility in action inspection and trace metadata
 
 ### Changed
 
@@ -68,11 +72,14 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - `task.plan` routing now treats A2A as the first real remote-agent plane, distinct from both harness crossings and local context-split coordination
 - the public README and spec now explicitly describe A2A as treaty-governed remote delegation rather than a deferred protocol placeholder
 - the evaluation spine now includes pairwise comparison and human side-by-side review so routing choices can improve without adding an opaque LLM judge
+- treaty-governed remote delegation now checks remote results after dispatch, not only whether delegation was allowed before dispatch
+- treaty configuration now treats result evidence, artifact class scope, data scope, and escalation behavior as first-class runtime inputs
 
 ### Migration Notes
 
 - prefer `quality.evaluation_profile` for new configs and manifests
 - prefer `[evaluation.pairwise_profiles.<name>]` when customizing comparison behavior beyond the built-in `task_plan_pairwise_default`
+- prefer the expanded `[treaties.packs.<name>]` fields for new remote-agent integrations, especially `required_result_evidence`, `on_scope_violation`, `on_evidence_gap`, and `alert_rules`
 - `quality.evaluation_hook` still parses during `0.1.x alpha`, but only legacy built-ins are normalized automatically
 - prefer `PolicyIncident.reason_code` in new integrations and tooling; the older `code` name remains accepted as a compatibility alias during alpha
 

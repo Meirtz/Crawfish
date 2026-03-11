@@ -104,6 +104,25 @@ That is why Crawfish treats remote delegation differently:
 - doctrine still applies, but treaties decide whether cross-system delegation is allowed at all
 - remote task lineage, remote principal identity, and delegation receipts must remain inspectable
 
+## Why Treaties Precede Marketplaces
+
+Before reputation systems, marketplaces, or federation policy packs, a swarm needs a lawful basis for remote delegation.
+
+In Crawfish, that basis is the treaty.
+
+A treaty decides:
+
+- which remote principal is recognized
+- which capabilities may be delegated
+- which data scopes may cross the boundary
+- which artifact classes may come back
+- which checkpoints and result evidence are mandatory
+- whether missing evidence should be escalated or denied
+
+That is why the current [A2A](https://github.com/a2aproject/A2A) line is treaty-governed rather than marketplace-driven. Google's ["A2A: A New Era of Agent Interoperability"](https://developers.googleblog.com/a2a-a-new-era-of-agent-interoperability/) gives the task-plane shape. Crawfish adds the control-plane question: not just **can** the swarm delegate, but **under what treaty**, **with what evidence**, and **how does the runtime respond when the evidence comes back incomplete**.
+
+Markets can come later. The treaty has to come first.
+
 That is why the project is **Rust-first, not Rust-only**:
 
 - `crates/` is the implementation spine for the runtime, control plane, storage, and native outbound adapters.
@@ -146,6 +165,25 @@ The current alpha is not a mock architecture. It runs.
 - **OpenClaw outbound**: `task.plan` can still route out through OpenClaw as a proposal-only execution surface when local harnesses are absent or unsuitable
 - **Deterministic fallback**: if no approved harness route is available, `task.plan` can degrade into local planning when the compiled contract allows it
 - **Verified execution strategy**: local wrappers, OpenClaw, and deterministic fallback are all forced through the same deterministic verifier
+
+### Treaty-Governed Remote Results
+
+Remote delegation is now governed at both ends.
+
+- **before dispatch**: Crawfish compiles a treaty decision and rejects remote work if the principal, capability, data scope, or delegation depth falls outside treaty bounds
+- **after result**: Crawfish checks whether the returned artifact classes, data scopes, and result evidence satisfy the treaty before it accepts the remote outcome
+
+Remote outcomes therefore do not collapse into one naive success state. They now resolve as:
+
+- `accepted`
+- `review_required`
+- `rejected`
+
+And when the frontier evidence chain is incomplete, the runtime records that explicitly instead of hiding it:
+
+- `treaty_denied`
+- `treaty_scope_violation`
+- `frontier_enforcement_gap`
 
 ## Verified Execution Strategies
 
@@ -233,6 +271,7 @@ The short version:
 - constitutions guide models; institutions govern swarms
 - frontier enforcement gaps are runtime failures, not merely policy failures
 - evaluation is how a swarm learns without becoming opaque
+- treaties precede marketplaces, reputation, and federation packs
 - design for future multi-owner encounters, not yesterday's app sandbox
 
 The supporting spec set lives in:

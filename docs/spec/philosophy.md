@@ -168,6 +168,49 @@ If the local model is coherent, it can extend outward. If it is not coherent loc
 
 The next frontier after same-device governance is treaty-governed remote delegation. The [A2A project](https://github.com/a2aproject/A2A) is useful because it provides a task-oriented remote-agent plane, but the runtime still has to decide when delegation is lawful, which treaty pack applies, and which evidence proves the delegation stayed inside scope.
 
+## Principle 10: Treaties Precede Marketplaces
+
+Remote-agent delegation should not begin with a marketplace mindset. It should begin with treaty semantics.
+
+Before swarms can safely rely on reputation systems, federation packs, or delegated service catalogs, they need a narrower legal core:
+
+- which remote principal is recognized
+- which capabilities are allowed to cross the boundary
+- which data scopes may leave the local control plane
+- which artifact classes may come back
+- which checkpoints must run before the result is trusted
+- what happens when evidence is missing
+
+This is why Crawfish treats remote delegation as treaty-governed rather than merely discoverable. The [A2A project](https://github.com/a2aproject/A2A) provides the remote task shape; Crawfish adds the requirement that delegation must be justified before dispatch and governable after result.
+
+The correct order is:
+
+1. treaty
+2. evidence
+3. escalation
+4. only later, broader federation economics
+
+If that order is reversed, the swarm scales contact before it scales law.
+
+## Principle 11: Remote Results Must Be Governed, Not Just Remote Calls
+
+Delegation risk does not end when the remote task starts. It becomes more subtle when the result comes back.
+
+A remote result may still be unacceptable if:
+
+- the runtime cannot prove the remote terminal state
+- the returned artifact class was outside treaty scope
+- the returned data scope exceeded what the treaty allowed
+- the treaty required evidence that never arrived
+
+That is why post-result governance is part of the control plane rather than an afterthought in application code. Remote outcomes need a disposition:
+
+- accepted
+- review required
+- rejected
+
+Without that distinction, remote delegation turns every successful HTTP response into an ambient trust event.
+
 ## Design Consequences
 
 These principles imply concrete architectural choices:
@@ -184,6 +227,9 @@ These principles imply concrete architectural choices:
 - doctrine and evaluation are runtime layers
   - not just documentation language
   - not only future UI ideas
+- treaties are runtime law, not partner metadata
+  - remote delegation requires scope, evidence, and escalation
+  - post-result governance is as important as dispatch-time governance
 - public terminology should stay future-correct
   - `swarm`, not `fleet`
   - `general-purpose harness`, not `coding-only harness`

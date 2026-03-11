@@ -184,6 +184,40 @@ pub struct AuditReceipt {
   pub approver_ref: Option<String>,
   pub emitted_at: String,
 }
+
+pub struct TreatyDecision {
+  pub treaty_pack_id: String,
+  pub remote_principal: RemotePrincipalRef,
+  pub allowed_capabilities: Vec<String>,
+  pub allowed_data_scopes: Vec<String>,
+  pub allowed_artifact_classes: Vec<String>,
+  pub required_checkpoints: Vec<OversightCheckpoint>,
+  pub required_result_evidence: Vec<TreatyEvidenceRequirement>,
+  pub on_scope_violation: TreatyEscalationMode,
+  pub on_evidence_gap: TreatyEscalationMode,
+  pub review_queue: bool,
+  pub alert_rules: Vec<String>,
+  pub delegation_depth: u32,
+}
+
+pub enum TreatyEvidenceRequirement {
+  DelegationReceipt,
+  RemoteTaskRef,
+  TerminalStateVerified,
+  AllowedArtifactClasses,
+  AllowedDataScopes,
+}
+
+pub struct TreatyViolation {
+  pub reason_code: String,
+  pub summary: String,
+}
+
+pub enum RemoteOutcomeDisposition {
+  Accepted,
+  ReviewRequired,
+  Rejected,
+}
 ```
 
 ### Governance Doctrine And Evaluation Primitives
@@ -365,6 +399,31 @@ type A2ARemoteAgentBinding = {
   required_scopes: string[];
   streaming_mode: "prefer_streaming" | "poll_only";
   allow_in_task_auth: boolean;
+};
+
+type TreatyPack = {
+  id: string;
+  local_owner_kind: "human" | "team" | "org" | "service_account";
+  local_owner_id: string;
+  remote_principal_kind: "agent" | "service" | "org";
+  remote_principal_id: string;
+  allowed_capabilities: string[];
+  allowed_data_scopes: string[];
+  allowed_artifact_classes: string[];
+  auth_forwarding: "none";
+  required_checkpoints: ("admission" | "pre_dispatch" | "post_result")[];
+  required_result_evidence: (
+    | "delegation_receipt"
+    | "remote_task_ref"
+    | "terminal_state_verified"
+    | "allowed_artifact_classes"
+    | "allowed_data_scopes"
+  )[];
+  max_delegation_depth: number;
+  on_scope_violation: "deny" | "review_required";
+  on_evidence_gap: "review_required" | "deny";
+  review_queue: boolean;
+  alert_rules: string[];
 };
 
 type WorkspacePolicy = {
@@ -858,6 +917,24 @@ Current `P1i` rules:
 - no mutation over A2A
 - prefer streaming when available, otherwise submit plus poll
 
+Current `P1k` treaty-escalation rules:
+
+- remote delegation is not lawful until a `TreatyDecision` is compiled
+- treaty admission validates local owner, remote principal, capability, allowed data scopes, and delegation depth before dispatch
+- no remote task may be created if treaty admission fails
+- post-result governance is mandatory, not optional
+- remote outcomes are classified as `accepted`, `review_required`, or `rejected`
+- returned artifact classes and data scopes are checked against the treaty before the result is accepted
+- missing required result evidence creates an explicit frontier incident instead of silently trusting the result
+
+Treaty escalation semantics are intentionally narrow in alpha:
+
+- `on_scope_violation = deny | review_required`
+- `on_evidence_gap = review_required | deny`
+- `max_delegation_depth = 1`
+- no secret forwarding
+- no treaty negotiation protocol
+
 Remote state mapping is normalized into the normal Crawfish action model:
 
 - `submitted` or `working` -> `running`
@@ -873,6 +950,28 @@ Remote lineage remains inspectable through:
 - treaty pack
 - delegation receipt
 - doctrine checkpoint status
+- remote outcome disposition
+- treaty violations
+- delegation depth
+
+### Remote Result Governance
+
+Remote result governance is the point where doctrine and treaty meet.
+
+At `post_result`, the runtime must check:
+
+- whether the remote terminal state is provable
+- whether the returned artifact classes are allowed by the treaty
+- whether the returned data scope stayed inside treaty limits
+- whether all treaty-required result evidence is present
+
+Result handling rules:
+
+- if evidence is complete and scope is valid, the remote outcome is `accepted`
+- if evidence is incomplete and the treaty escalation mode allows review, the remote outcome becomes `review_required` and the action is blocked for operator attention
+- if the result violates treaty scope, or the treaty escalation mode requires denial, the remote outcome is `rejected` and the action fails
+
+This is where the architecture treats remote agents as different from harnesses. A harness can be an execution surface. A remote agent is another authority boundary, which means the result itself must remain governable after the call returns.
 
 ## Execution Strategies
 
