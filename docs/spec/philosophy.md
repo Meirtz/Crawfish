@@ -120,12 +120,13 @@ The swarm will not become reliable by accumulating more raw traces alone.
 
 Observability is the rear-view mirror. Evaluation is the learning loop.
 
-LangSmith provides a useful reference shape for this through its [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), and [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules): traces, evaluation, review, and operator automation belong to one system. Crawfish should absorb that lesson at the runtime layer.
+LangSmith provides a useful reference shape for this through its [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [pairwise evaluation](https://docs.langchain.com/langsmith/evaluate-pairwise), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules), and [experiment comparison](https://docs.langchain.com/langsmith/compare-experiment-results): traces, evaluation, comparison, review, and operator automation belong to one system. Crawfish should absorb that lesson at the runtime layer.
 
 This means:
 
 - every significant action should become a trace bundle
 - deterministic scorecards should produce durable evaluation records
+- pairwise comparison should teach routing choices without hiding disagreement behind one aggregate score
 - review queues should capture “needs human eyes” cases without erasing history
 - feedback should be structured and reusable, not trapped in ad-hoc operator memory
 - dataset cases should turn production traces into replayable institutional memory

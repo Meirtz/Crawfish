@@ -173,11 +173,11 @@ Reasoning quality will keep changing. Verification and control have to outlive t
 
 Tracing alone is not enough. Evaluation alone is not enough. A control plane needs both.
 
-LangSmith provides a useful reference shape here through its [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), and [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules): traces, datasets, evaluators, review, and alerts belong to one operational loop. Crawfish does not copy LangSmith's product. It lifts that shape into swarm runtime infrastructure.
+LangSmith provides a useful reference shape here through its [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [pairwise evaluation](https://docs.langchain.com/langsmith/evaluate-pairwise), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules), and [experiment comparison](https://docs.langchain.com/langsmith/compare-experiment-results): traces, datasets, evaluators, review, alerts, and comparison loops belong to one operational system. Crawfish does not copy LangSmith's product. It lifts that shape into swarm runtime infrastructure.
 
 The runtime now builds an **evaluation spine**:
 
-- `trace -> scorecard -> review queue -> alert -> dataset -> replay`
+- `trace -> scorecard -> review queue -> alert -> dataset -> replay -> compare`
 
 That spine is attached to real action execution:
 
@@ -198,6 +198,26 @@ In Crawfish:
 - `AlertRule` turns governance or evaluation failures into visible operator signals
 - `DatasetCase` freezes completed actions into replayable evaluation datasets with doctrine and jurisdiction metadata
 - `ExperimentRun` replays those cases against one executor surface so the swarm can learn without polluting production review queues
+
+## Pairwise Review
+
+Single-run evaluation tells you whether one executor met the bar. Pairwise review tells you whether one route is actually better than another.
+
+Crawfish now treats executor-first comparison as a control-plane primitive:
+
+- launch two isolated experiment runs against one dataset
+- compare them deterministically before any human judgment
+- open a human review item only when the signals are too close or too conflicted to trust automation
+
+That shape is borrowed deliberately from LangSmith's [pairwise evaluation](https://docs.langchain.com/langsmith/evaluate-pairwise), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), and [experiment comparison](https://docs.langchain.com/langsmith/compare-experiment-results), but reinterpreted as runtime substrate rather than a hosted UI.
+
+The important product choice is what Crawfish does **not** do here:
+
+- no LLM-as-judge
+- no opaque winner selection
+- no prompt arena disconnected from runtime doctrine
+
+Instead, pairwise outcomes are driven by doctrine incidents, terminal status, normalized evaluation score, and explicit review resolution when automation should stop pretending certainty.
 
 ## Philosophy
 
@@ -255,6 +275,8 @@ cargo run -p crawfish-cli --bin crawfish -- action evals <action-id> --json
 cargo run -p crawfish-cli --bin crawfish -- review list --json
 cargo run -p crawfish-cli --bin crawfish -- eval dataset list --json
 cargo run -p crawfish-cli --bin crawfish -- eval run task_plan_dataset --executor deterministic --json
+cargo run -p crawfish-cli --bin crawfish -- eval compare task_plan_dataset --left deterministic --right deterministic --json
+cargo run -p crawfish-cli --bin crawfish -- review list --kind pairwise --json
 cargo run -p crawfish-cli --bin crawfish -- alert list --json
 ```
 

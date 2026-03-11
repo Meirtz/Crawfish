@@ -40,6 +40,11 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - native Rust `crawfish-a2a` outbound adapter with treaty-governed remote delegation for `task.plan`
 - read-only treaty operator surfaces via `crawfish treaty list`, `crawfish treaty show`, and `/v1/treaties`
 - delegation receipts, remote principal lineage, and remote task refs in action inspection and trace metadata
+- richer deterministic evaluation criteria, including JSON schema, regex, numeric-threshold, equality, and artifact-absence checks
+- executor-first pairwise comparison runs, pairwise case results, and built-in `task_plan_pairwise_default`
+- operator commands and UDS endpoints for `eval compare`, `eval compare-status`, and pairwise review filtering
+- criterion-level evidence persisted inside `EvaluationRecord`
+- pairwise-aware review queue items, feedback-note lineage, and comparison-oriented alert rules
 
 ### Changed
 
@@ -62,10 +67,12 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - `PolicyIncident.reason_code` is now the primary runtime field, with legacy `code` preserved as an alpha-compatibility alias
 - `task.plan` routing now treats A2A as the first real remote-agent plane, distinct from both harness crossings and local context-split coordination
 - the public README and spec now explicitly describe A2A as treaty-governed remote delegation rather than a deferred protocol placeholder
+- the evaluation spine now includes pairwise comparison and human side-by-side review so routing choices can improve without adding an opaque LLM judge
 
 ### Migration Notes
 
 - prefer `quality.evaluation_profile` for new configs and manifests
+- prefer `[evaluation.pairwise_profiles.<name>]` when customizing comparison behavior beyond the built-in `task_plan_pairwise_default`
 - `quality.evaluation_hook` still parses during `0.1.x alpha`, but only legacy built-ins are normalized automatically
 - prefer `PolicyIncident.reason_code` in new integrations and tooling; the older `code` name remains accepted as a compatibility alias during alpha
 

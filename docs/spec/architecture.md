@@ -1122,8 +1122,13 @@ The config surface for this layer is:
 The first deterministic criterion kinds are:
 
 - `artifact_present`
+- `artifact_absent`
 - `json_field_nonempty`
+- `json_schema_valid`
 - `list_min_len`
+- `regex_match`
+- `numeric_threshold`
+- `field_equals`
 - `token_coverage`
 - `checkpoint_passed`
 - `incident_absent`
@@ -1136,7 +1141,7 @@ The initial capability set remains:
 
 `verify_loop` is part of the same spine. Verification failures are recorded as evaluations, not only as action events.
 
-LangSmith's [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), and [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules) are useful reference shapes here. Anthropic's [Claude's Constitution](https://www.anthropic.com/constitution) and [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) are useful reference shapes for rule-guided behavior. Crawfish lifts both ideas into runtime governance: checkpoints, evidence, incidents, review, escalation, datasets, and replay experiments.
+LangSmith's [observability concepts](https://docs.langchain.com/langsmith/observability-concepts), [pairwise evaluation](https://docs.langchain.com/langsmith/evaluate-pairwise), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules), and [experiment comparison](https://docs.langchain.com/langsmith/compare-experiment-results) are useful reference shapes here. Anthropic's [Claude's Constitution](https://www.anthropic.com/constitution) and [Constitutional AI](https://www.anthropic.com/research/constitutional-ai-harmlessness-from-ai-feedback/) are useful reference shapes for rule-guided behavior. Crawfish lifts both ideas into runtime governance: checkpoints, evidence, incidents, review, escalation, datasets, replay experiments, and side-by-side executor comparison.
 
 ### Dataset Capture And Replay
 
@@ -1149,6 +1154,69 @@ The evaluation spine now extends beyond post-result scoring into reusable qualit
 - replay does not create normal production review queue noise or alert spam by default
 
 This is how Crawfish turns trace history into institutional memory rather than an archive of unread logs.
+
+### Pairwise Profiles And Comparative Review
+
+Comparative evaluation is now a first-class runtime substrate, not an ad hoc external script.
+
+The pairwise types are:
+
+- `PairwiseProfile`
+- `PairwiseExperimentRun`
+- `PairwiseCaseResult`
+- `PairwiseOutcome`
+
+The config surface for this layer is:
+
+- `[evaluation.pairwise_profiles.<name>]`
+
+The built-in default is:
+
+| Capability | Pairwise profile |
+| --- | --- |
+| `task.plan` | `task_plan_pairwise_default` |
+
+Current pairwise comparison is executor-first, not prompt-first and not strategy-first:
+
+- one dataset
+- one left executor surface
+- one right executor surface
+- two isolated replay runs
+- one deterministic winner decision plus optional human review
+
+The winner selection order is fixed:
+
+1. fewer doctrine or policy incidents wins
+2. successful terminal status beats failed status
+3. higher normalized evaluation score wins when the delta exceeds the configured margin
+4. otherwise the result is `needs_review`
+
+Review queue items can now be opened in two kinds:
+
+- `action_eval`
+- `pairwise_eval`
+
+Pairwise review items carry:
+
+- `pairwise_run_ref`
+- `pairwise_case_ref`
+- `left_case_result_ref`
+- `right_case_result_ref`
+- `priority`
+- `reason_code`
+
+Resolving a pairwise review creates a `FeedbackNote` tied to the pairwise lineage. It does not rewrite the source actions or experiment history.
+
+Alert policy is also pairwise-aware:
+
+- `comparison_regression`
+- `comparison_attention_required`
+
+Pairwise runs remain isolated from production operator noise:
+
+- no production review queue items
+- no production alerts
+- no production action mutation
 
 ## Reference Stack For v0.1
 
@@ -1198,7 +1266,10 @@ The P0 CLI surface is:
 - `review resolve` records operator resolution and feedback without rewriting the action history
 - `eval dataset list` and `eval dataset show` expose captured evaluation datasets and frozen cases
 - `eval run` and `eval run-status` expose isolated replay experiments per executor surface
+- `eval compare` and `eval compare-status` expose executor-first pairwise comparison runs
 - `alert list` and `alert ack` expose doctrine and evaluation escalation signals
+- `review list --kind pairwise` filters operator review items down to side-by-side comparisons
+- `review resolve` supports pairwise outcomes such as `prefer_left`, `prefer_right`, `tie`, and `needs_followup`
 - `drain` prevents new work assignment and reports progress until agents are inactive or finalized
 - `resume` re-enables drained agents or reschedules resumable actions
 - `policy validate` reports whether a manifest, encounter policy, or action override violates hard policy before runtime execution

@@ -206,12 +206,13 @@ This is the product reason for a doctrine layer. Without it, systems can carry g
 
 The swarm also needs a quality memory, not just an event log.
 
-[LangSmith](https://docs.langchain.com/langsmith/observability-concepts) is a useful reference because it shows the right operational shape: observability, evaluation, review, and automation should be connected. Its [annotation queues](https://docs.langchain.com/langsmith/annotation-queues) and [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules) are especially useful reference points. Crawfish should absorb that lesson at the control-plane layer rather than copying a hosted UI directly.
+[LangSmith](https://docs.langchain.com/langsmith/observability-concepts) is a useful reference because it shows the right operational shape: observability, evaluation, review, and automation should be connected. Its [pairwise evaluation](https://docs.langchain.com/langsmith/evaluate-pairwise), [annotation queues](https://docs.langchain.com/langsmith/annotation-queues), [automation rules](https://docs.langchain.com/langsmith/set-up-automation-rules), and [experiment comparison](https://docs.langchain.com/langsmith/compare-experiment-results) are especially useful reference points. Crawfish should absorb that lesson at the control-plane layer rather than copying a hosted UI directly.
 
 That means:
 
 - every significant action should yield a trace bundle
 - deterministic scorecards should produce durable evaluation records
+- pairwise comparison should teach the swarm which executor route deserves preference, and when humans still need to arbitrate
 - review queues should capture work that deserves operator attention
 - feedback should flow into future iterations without erasing the historical record
 - dataset capture should turn completed actions into replayable quality cases
