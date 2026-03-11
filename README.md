@@ -144,6 +144,26 @@ So Crawfish now separates the two responsibilities:
 
 That is how a control plane turns remote delegation from “we made an HTTP call” into governable swarm behavior.
 
+## Why Evidence Bundles Decide Admissibility
+
+Treaties decide whether remote delegation is lawful. Federation packs decide how remote state and remote results should be interpreted. But neither is enough unless the runtime can produce an admissible evidence bundle when the remote side replies.
+
+That is why Crawfish now treats remote evidence as a first-class control-plane object:
+
+- remote terminal state evidence
+- remote artifact manifest
+- remote scope and data evidence
+- checkpoint evidence for `admission`, `pre_dispatch`, and `post_result`
+- treaty violations, policy incidents, and review disposition
+
+This follows the same broad lesson behind LangSmith's [observability concepts](https://docs.langchain.com/langsmith/observability-concepts): traces matter because they preserve evidence, not because they make the UI look richer. In Crawfish, evidence bundles are what decide whether a remote result is admissible, blocked for review, or rejected.
+
+Remote review is therefore not a UI-only feature. It is the operator workflow that turns a treaty-governed but ambiguous remote outcome into an explicit control-plane result:
+
+- `accept_result`
+- `reject_result`
+- `needs_followup`
+
 That is why the project is **Rust-first, not Rust-only**:
 
 - `crates/` is the implementation spine for the runtime, control plane, storage, and native outbound adapters.
@@ -317,6 +337,7 @@ The short version:
 - evaluation is how a swarm learns without becoming opaque
 - treaties precede marketplaces, reputation, and federation packs
 - treaties decide whether delegation is lawful; federation packs decide how remote states and results are interpreted
+- evidence bundles and remote review workflow decide whether frontier results are admissible
 - design for future multi-owner encounters, not yesterday's app sandbox
 
 The supporting spec set lives in:

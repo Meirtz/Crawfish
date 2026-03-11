@@ -54,6 +54,9 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - remote-outcome metadata on evaluation records and experiment case results, including remote disposition and treaty-violation counts
 - federation packs, federation decisions, and remote escalation metadata for A2A outbound delegation
 - read-only operator surfaces for `federation list`, `federation show`, and `/v1/federation/packs`
+- `RemoteEvidenceBundle`, `RemoteEvidenceItem`, and remote review dispositions for every `remote_agent` action attempt
+- `remote_result_review` queue items plus operator read surface for `action remote-evidence` and `/v1/actions/{id}/remote-evidence`
+- explicit remote review resolutions: `accept_result`, `reject_result`, and `needs_followup`
 
 ### Changed
 
@@ -83,6 +86,7 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - remote-agent `task.plan` outcomes are now evaluated as frontier-evidence events, not only as returned artifact quality
 - treaty-governed remote delegation now compiles a federation pack so remote state and result escalation are interpreted by a reusable control-plane policy rather than adapter-local rules
 - inspect and trace now surface federation pack id, federation decision, remote evidence status, and remote state disposition for remote-agent actions
+- remote-agent inspect, trace, dataset capture, alerting, and experiment results now inherit remote evidence refs and remote review disposition metadata
 
 ### Migration Notes
 

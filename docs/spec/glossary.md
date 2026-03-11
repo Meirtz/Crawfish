@@ -44,7 +44,9 @@ This glossary is shared across the repository. Other documents should reuse thes
 | **tool plane** | The interoperability plane for tools. In Crawfish this is primarily MCP. |
 | **harness plane** | The interoperability plane for specialized agent harnesses. In Crawfish this includes OpenClaw Gateway and ACP-compatible harness integration. |
 | **agent plane** | The interoperability plane for remote or external agents. In Crawfish this is primarily A2A. |
+| **remote evidence bundle** | The control-plane evidence package attached to a `remote_agent` action attempt. It captures treaty and federation lineage, remote task refs, checkpoint evidence, artifact and scope evidence, and any incidents or violations tied to the attempt. |
 | **remote evidence status** | The runtime classification of whether required remote result evidence is complete, missing, invalid, or outside allowed scope. |
+| **remote review disposition** | The operator-facing state that explains whether a remote result is pending review, accepted, rejected, or requires follow-up before the action can move forward. |
 | **remote outcome disposition** | The control-plane judgment applied to a remote result after treaty and federation checks, currently `accepted`, `review_required`, or `rejected`. |
 | **OpenClaw binding** | A first-class harness binding that lets Crawfish call OpenClaw through its Gateway protocol or be called by OpenClaw through plugins and RPC. |
 | **manifest** | The declarative specification of an agent, including capabilities, dependencies, runtime profile, lifecycle policy, and contract defaults. |

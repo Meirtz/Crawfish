@@ -189,6 +189,13 @@ That is why Crawfish now separates two remote-governance layers:
 
 Without that second layer, remote governance still depends on adapter-local heuristics instead of one reusable control-plane policy.
 
+The next step is admissibility. Remote outcomes also need first-class evidence bundles and review workflow:
+
+- evidence bundles preserve the treaty, federation, checkpoint, artifact, scope, and incident evidence that came back from the frontier
+- remote review workflow decides whether a `review_required` outcome is accepted, rejected, or kept blocked for follow-up
+
+That is the difference between “we captured a remote trace” and “the control plane can defend why this remote result was or was not admitted.”
+
 ## Why OpenClaw Looks Like The Wild West, And Why Crawfish Should Be The Law Layer
 
 OpenClaw makes the modern agent environment easier to see clearly: powerful agents can move across local environments and network surfaces with real capability, but with relatively little built-in law.

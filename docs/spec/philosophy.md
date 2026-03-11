@@ -226,6 +226,22 @@ Without that distinction, remote delegation turns every successful HTTP response
 
 The same lesson applies to evaluation. A remote result should not be judged only by whether it produced plausible content. It also needs to be judged by whether the frontier evidence chain held together. In practical terms, that means remote outcomes need scorecards that can inspect treaty violations, federation decisions, remote outcome disposition, delegation receipts, and checkpoint evidence rather than only the returned artifact text.
 
+## Principle 11.5: Remote Outcomes Must Be Admissible, Not Merely Available
+
+A remote result is not automatically admissible just because a remote task completed.
+
+For a frontier control plane, admissibility depends on whether the runtime can preserve enough evidence to support acceptance:
+
+- what treaty pack allowed the delegation
+- what federation pack interpreted the result
+- what remote state and terminal evidence actually came back
+- what artifact and data-scope evidence was observed
+- what policy incidents and treaty violations were recorded on the attempt
+
+This is why Crawfish now uses remote evidence bundles plus a remote review workflow. A treaty says the swarm may cross the boundary. A federation pack says how to interpret what comes back. The evidence bundle is what makes the result reviewable. The review workflow is what makes the final disposition actionable.
+
+Without those two layers, remote governance still collapses into “transport succeeded” instead of “result was admissible under swarm law.”
+
 ## Design Consequences
 
 These principles imply concrete architectural choices:

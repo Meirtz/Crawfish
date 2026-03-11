@@ -1018,6 +1018,17 @@ Current `P1m` federation-pack rules:
 - remote result acceptance is now driven by `RemoteResultAcceptance` plus `RemoteEvidenceStatus`, not by a single implicit success branch
 - remote state handling is now driven by `RemoteStateDisposition`, so operators can see why the control plane blocked, awaited approval, or failed the action
 
+Current `P1n` remote-evidence rules:
+
+- every `remote_agent` action attempt records a `RemoteEvidenceBundle`
+- evidence bundles carry treaty pack id, federation pack id, remote principal, remote task ref, checkpoint evidence, artifact manifest, scope/data evidence, policy incidents, and treaty violations
+- `review_required` remote outcomes now create `remote_result_review` items rather than blending into generic action review
+- remote review resolution is explicit:
+  - `accept_result` -> action may complete
+  - `reject_result` -> action fails
+  - `needs_followup` -> action remains blocked and a follow-up review item is opened
+- inspect, trace, dataset capture, evaluation records, alerts, and pairwise comparisons now inherit remote evidence metadata
+
 Treaty escalation semantics are intentionally narrow in alpha:
 
 - `on_scope_violation = deny | review_required`
