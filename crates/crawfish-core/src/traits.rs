@@ -135,6 +135,10 @@ pub trait ActionStore: Send + Sync {
         &self,
         receipt_id: &str,
     ) -> anyhow::Result<Option<crawfish_types::DelegationReceipt>>;
+    /// Count actions currently in the running phase for a given agent.
+    /// Used to enforce per-agent concurrency limits
+    /// (RuntimeProfile.max_parallel_actions).
+    async fn count_running_actions_for_agent(&self, agent_id: &str) -> anyhow::Result<u64>;
 }
 
 #[async_trait]

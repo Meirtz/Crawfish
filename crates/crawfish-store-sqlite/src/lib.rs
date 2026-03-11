@@ -1343,6 +1343,17 @@ impl ActionStore for SqliteStore {
     ) -> anyhow::Result<Option<DelegationReceipt>> {
         SqliteStore::get_delegation_receipt(self, receipt_id).await
     }
+
+    async fn count_running_actions_for_agent(&self, agent_id: &str) -> anyhow::Result<u64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS cnt FROM actions WHERE target_agent_id = ?1 AND phase = 'running'",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let count: i64 = row.try_get("cnt")?;
+        Ok(count as u64)
+    }
 }
 
 #[async_trait]
