@@ -271,6 +271,41 @@ pub enum RemoteOutcomeDisposition {
   ReviewRequired,
   Rejected,
 }
+
+pub struct RemoteFollowupRequest {
+  pub id: String,
+  pub action_id: String,
+  pub remote_evidence_ref: String,
+  pub remote_attempt_ref: String,
+  pub treaty_pack_id: String,
+  pub federation_pack_id: String,
+  pub remote_principal: RemotePrincipalRef,
+  pub remote_task_ref: String,
+  pub reason_code: String,
+  pub requested_evidence: Vec<String>,
+  pub operator_note: Option<String>,
+  pub status: RemoteFollowupStatus,
+}
+
+pub enum RemoteFollowupStatus {
+  Open,
+  Dispatched,
+  Superseded,
+  Closed,
+}
+
+pub struct RemoteAttemptRecord {
+  pub id: String,
+  pub action_id: String,
+  pub attempt_index: u32,
+  pub interaction_model: InteractionModel,
+  pub treaty_pack_id: Option<String>,
+  pub federation_pack_id: Option<String>,
+  pub remote_principal: Option<RemotePrincipalRef>,
+  pub remote_task_ref: Option<String>,
+  pub remote_evidence_ref: Option<String>,
+  pub followup_request_ref: Option<String>,
+}
 ```
 
 ### Governance Doctrine And Evaluation Primitives
@@ -297,6 +332,7 @@ pub enum InteractionModel {
   SameOwnerSwarm,
   SameDeviceMultiOwner,
   RemoteHarness,
+  RemoteAgent,
   ExternalUnknown,
 }
 
@@ -1026,8 +1062,17 @@ Current `P1n` remote-evidence rules:
 - remote review resolution is explicit:
   - `accept_result` -> action may complete
   - `reject_result` -> action fails
-  - `needs_followup` -> action remains blocked and a follow-up review item is opened
+  - `needs_followup` -> action remains blocked and a structured remote follow-up request is created
 - inspect, trace, dataset capture, evaluation records, alerts, and pairwise comparisons now inherit remote evidence metadata
+
+Current `P1o` remote-followup rules:
+
+- `needs_followup` now produces a first-class `RemoteFollowupRequest` rather than a loose note or hidden retry hint
+- follow-up requests pin the original action, remote evidence bundle, treaty pack, federation pack, remote principal, remote task ref, and requested evidence gaps
+- follow-up dispatch is explicit operator control, not automatic requeue
+- follow-up re-dispatch keeps the same `action_id` and creates a fresh `RemoteAttemptRecord`
+- the remote principal, treaty pack, federation pack, and delegated capability remain pinned across follow-up attempts
+- prior remote evidence bundles, review history, and policy incidents remain attached to the same local action so admissibility stays inspectable across attempts
 
 Treaty escalation semantics are intentionally narrow in alpha:
 
@@ -1468,6 +1513,9 @@ The P0 CLI surface is:
 - `crawfish action events`
 - `crawfish action trace`
 - `crawfish action evals`
+- `crawfish action remote-evidence`
+- `crawfish action remote-followups`
+- `crawfish action remote-followup-dispatch`
 - `crawfish treaty list`
 - `crawfish treaty show`
 - `crawfish federation list`
@@ -1478,6 +1526,8 @@ The P0 CLI surface is:
 - `crawfish eval dataset show`
 - `crawfish eval run`
 - `crawfish eval run-status`
+- `crawfish eval compare`
+- `crawfish eval compare-status`
 - `crawfish alert list`
 - `crawfish alert ack`
 - `crawfish drain`
@@ -1490,6 +1540,9 @@ The P0 CLI surface is:
 - `inspect` accepts agent id or action id and surfaces compiled contract, execution strategy, selected adapter or harness, external run ids such as OpenClaw `runId`, encounter state, grant refs, lease refs, treaty and federation summaries for remote-agent work, dependency health, recent transitions, degradation profile, continuity mode, remote evidence status, and failure reasons
 - `action trace` returns the trace bundle for one action, including event lineage, artifact refs, external refs, enforcement records, treaty and federation metadata, and policy incidents
 - `action evals` returns deterministic evaluations and verification-linked scorecards for one action
+- `action remote-evidence` returns remote evidence bundles plus treaty, federation, and attempt lineage for one action
+- `action remote-followups` returns follow-up requests and remote-attempt lineage for one action
+- `action remote-followup-dispatch` performs explicit same-action re-delegation under the pinned treaty, federation, principal, and capability context
 - `treaty list` and `treaty show` expose recognized remote principals, allowed capabilities, scopes, artifact classes, and checkpoint requirements
 - `federation list` and `federation show` expose the remote escalation contract: treaty binding, required evidence, result acceptance rules, scope-violation policy, and blocked/auth-required behavior
 - `review list` returns operator review queue items opened by doctrine or evaluation

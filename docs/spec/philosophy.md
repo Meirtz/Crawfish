@@ -242,6 +242,19 @@ This is why Crawfish now uses remote evidence bundles plus a remote review workf
 
 Without those two layers, remote governance still collapses into “transport succeeded” instead of “result was admissible under swarm law.”
 
+## Principle 11.6: Admissibility Must Survive Another Attempt
+
+Some remote outcomes should not be auto-accepted or auto-rejected. They should remain admissible only after additional evidence is requested, reviewed, and deliberately re-collected.
+
+That is why Crawfish now treats follow-up as a control-plane object rather than a loose operator note:
+
+- a `review_required` remote outcome may produce a structured remote follow-up request
+- the missing evidence must be named by the runtime, not improvised after the fact
+- the action stays blocked until an operator explicitly chooses to dispatch another remote attempt
+- the next remote attempt belongs to the same local action, so admissibility remains one continuous legal and evidentiary story
+
+This matters because frontier governance does not improve if every ambiguous remote result is either silently retried or manually papered over. A control plane has to preserve the old evidence, preserve the old review history, and still let the swarm ask for more proof.
+
 ## Design Consequences
 
 These principles imply concrete architectural choices:

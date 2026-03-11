@@ -164,6 +164,8 @@ Remote review is therefore not a UI-only feature. It is the operator workflow th
 - `reject_result`
 - `needs_followup`
 
+`needs_followup` is now a real control-plane continuation. Crawfish creates a structured `RemoteFollowupRequest`, keeps the action blocked, preserves the prior remote evidence bundle, and requires an explicit operator-triggered re-dispatch before the same action may create a fresh remote attempt.
+
 That is why the project is **Rust-first, not Rust-only**:
 
 - `crates/` is the implementation spine for the runtime, control plane, storage, and native outbound adapters.
@@ -220,6 +222,12 @@ Remote outcomes therefore do not collapse into one naive success state. They now
 - `review_required`
 - `rejected`
 
+When an outcome is `review_required`, the control plane can now preserve and continue the admissibility story instead of forcing a premature terminal choice:
+
+- preserve the exact remote evidence bundle that triggered review
+- create a structured follow-up request that names the missing treaty or federation evidence
+- require an explicit same-action re-delegation so the next remote attempt remains attributable to the same local action
+
 And the runtime now keeps the decision legible:
 
 - which treaty pack allowed delegation
@@ -227,6 +235,8 @@ And the runtime now keeps the decision legible:
 - which checkpoints were required
 - which evidence was present or missing
 - why the action was blocked, accepted, or failed
+- which remote attempt produced the current evidence bundle
+- whether the action is blocked on an open remote follow-up request
 
 And when the frontier evidence chain is incomplete, the runtime records that explicitly instead of hiding it:
 
@@ -239,6 +249,7 @@ Those remote outcomes are now evaluated as part of the same learning loop, not l
 - `task.plan` automatically switches to a remote-aware evaluation profile when it crosses into the A2A agent plane
 - treaty evidence, remote task lineage, outcome disposition, and frontier gaps are scored as part of the result
 - remote results can therefore fail quality review even when the remote call itself technically returned
+- unresolved remote follow-up requests now remain visible in trace, dataset, and evaluation lineage so admissibility history is not erased by later attempts
 
 ## Verified Execution Strategies
 

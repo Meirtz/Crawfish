@@ -57,6 +57,8 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - `RemoteEvidenceBundle`, `RemoteEvidenceItem`, and remote review dispositions for every `remote_agent` action attempt
 - `remote_result_review` queue items plus operator read surface for `action remote-evidence` and `/v1/actions/{id}/remote-evidence`
 - explicit remote review resolutions: `accept_result`, `reject_result`, and `needs_followup`
+- `RemoteFollowupRequest` and `RemoteAttemptRecord` for same-action remote admissibility continuation
+- operator surfaces for `action remote-followups`, `action remote-followup-dispatch`, and `/v1/actions/{id}/remote-followups`
 
 ### Changed
 
@@ -87,6 +89,9 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - treaty-governed remote delegation now compiles a federation pack so remote state and result escalation are interpreted by a reusable control-plane policy rather than adapter-local rules
 - inspect and trace now surface federation pack id, federation decision, remote evidence status, and remote state disposition for remote-agent actions
 - remote-agent inspect, trace, dataset capture, alerting, and experiment results now inherit remote evidence refs and remote review disposition metadata
+- `needs_followup` now creates a structured remote follow-up request rather than a generic lingering review state
+- same-action remote re-delegation now preserves treaty, federation, principal, evidence-bundle, and attempt lineage instead of spawning a disconnected second action
+- federation packs now control remote follow-up allowance and attempt limits through `followup_allowed`, `max_followup_attempts`, and `followup_review_priority`
 
 ### Migration Notes
 
@@ -94,6 +99,7 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - prefer `[evaluation.pairwise_profiles.<name>]` when customizing comparison behavior beyond the built-in `task_plan_pairwise_default`
 - prefer the expanded `[treaties.packs.<name>]` fields for new remote-agent integrations, especially `required_result_evidence`, `on_scope_violation`, `on_evidence_gap`, and `alert_rules`
 - prefer `[federation.packs.<name>]` for remote-agent escalation defaults such as `result_acceptance_policy`, `scope_violation_policy`, `evidence_gap_policy`, and blocked/auth-required handling
+- prefer `[federation.packs.<name>]` follow-up controls when remote `review_required` outcomes need admissibility continuation under the same action
 - expect `task.plan` to resolve to `task_plan_remote_default` automatically when the selected executor crosses into the `remote_agent` plane
 - `quality.evaluation_hook` still parses during `0.1.x alpha`, but only legacy built-ins are normalized automatically
 - prefer `PolicyIncident.reason_code` in new integrations and tooling; the older `code` name remains accepted as a compatibility alias during alpha

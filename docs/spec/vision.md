@@ -196,6 +196,8 @@ The next step is admissibility. Remote outcomes also need first-class evidence b
 
 That is the difference between “we captured a remote trace” and “the control plane can defend why this remote result was or was not admitted.”
 
+The next refinement after admissibility is continuity of proof. A `needs_followup` outcome should not fork into an unrelated second action. It should continue under the same local action, with a new remote attempt, the same treaty and federation context, and a preserved evidence trail. That is why Crawfish now models same-action re-delegation as an explicit operator step rather than an automatic retry.
+
 ## Why OpenClaw Looks Like The Wild West, And Why Crawfish Should Be The Law Layer
 
 OpenClaw makes the modern agent environment easier to see clearly: powerful agents can move across local environments and network surfaces with real capability, but with relatively little built-in law.
