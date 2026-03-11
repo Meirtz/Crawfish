@@ -1045,8 +1045,7 @@ impl Supervisor {
                     .clone()
                     .unwrap_or_else(|| "checkpoint evaluated".to_string()),
                 checkpoint: Some(status.checkpoint.clone()),
-                satisfied: !status.required
-                    || matches!(status.outcome, CheckpointOutcome::Passed),
+                satisfied: !status.required || matches!(status.outcome, CheckpointOutcome::Passed),
                 source_ref: None,
                 detail: Some(runtime_enum_to_snake(&status.outcome)),
             })
