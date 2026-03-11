@@ -4,7 +4,7 @@ use crawfish_types::{
     Action, AgentManifest, AlertEvent, AuditReceipt, CapabilityLease, ConsentGrant, DatasetCase,
     DelegationReceipt, EncounterRecord, EvaluationRecord, ExperimentCaseResult, ExperimentRun,
     FeedbackNote, LifecycleRecord, PairwiseCaseResult, PairwiseExperimentRun, PolicyIncident,
-    ReviewQueueItem, TraceBundle,
+    RemoteEvidenceBundle, ReviewQueueItem, TraceBundle,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, Pool, Row, Sqlite, SqlitePool};
@@ -377,6 +377,65 @@ impl SqliteStore {
             Ok(serde_json::from_str(&payload)?)
         })
         .transpose()
+    }
+
+    pub async fn upsert_remote_evidence_bundle(
+        &self,
+        bundle: &RemoteEvidenceBundle,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(bundle)?;
+        sqlx::query(
+            r#"
+            INSERT INTO remote_evidence_bundles (id, action_id, attempt, created_at, bundle_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+              action_id = excluded.action_id,
+              attempt = excluded.attempt,
+              created_at = excluded.created_at,
+              bundle_json = excluded.bundle_json
+            "#,
+        )
+        .bind(&bundle.id)
+        .bind(&bundle.action_id)
+        .bind(i64::from(bundle.attempt))
+        .bind(&bundle.created_at)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_remote_evidence_bundle(
+        &self,
+        bundle_id: &str,
+    ) -> anyhow::Result<Option<RemoteEvidenceBundle>> {
+        let row = sqlx::query("SELECT bundle_json FROM remote_evidence_bundles WHERE id = ?1")
+            .bind(bundle_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let payload: String = row.try_get("bundle_json")?;
+            Ok(serde_json::from_str(&payload)?)
+        })
+        .transpose()
+    }
+
+    pub async fn list_remote_evidence_bundles(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<RemoteEvidenceBundle>> {
+        let rows = sqlx::query(
+            "SELECT bundle_json FROM remote_evidence_bundles WHERE action_id = ?1 ORDER BY attempt ASC, created_at ASC, id ASC",
+        )
+        .bind(action_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("bundle_json")?;
+                Ok(serde_json::from_str(&payload)?)
+            })
+            .collect()
     }
 
     pub async fn insert_evaluation_record(
@@ -1126,6 +1185,27 @@ impl ActionStore for SqliteStore {
 
     async fn get_trace_bundle(&self, action_id: &str) -> anyhow::Result<Option<TraceBundle>> {
         SqliteStore::get_trace_bundle(self, action_id).await
+    }
+
+    async fn insert_remote_evidence_bundle(
+        &self,
+        bundle: &RemoteEvidenceBundle,
+    ) -> anyhow::Result<()> {
+        SqliteStore::upsert_remote_evidence_bundle(self, bundle).await
+    }
+
+    async fn get_remote_evidence_bundle(
+        &self,
+        bundle_id: &str,
+    ) -> anyhow::Result<Option<RemoteEvidenceBundle>> {
+        SqliteStore::get_remote_evidence_bundle(self, bundle_id).await
+    }
+
+    async fn list_remote_evidence_bundles(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<RemoteEvidenceBundle>> {
+        SqliteStore::list_remote_evidence_bundles(self, action_id).await
     }
 
     async fn insert_evaluation(&self, evaluation: &EvaluationRecord) -> anyhow::Result<()> {

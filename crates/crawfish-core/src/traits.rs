@@ -24,6 +24,18 @@ pub trait ActionStore: Send + Sync {
         &self,
         action_id: &str,
     ) -> anyhow::Result<Option<crawfish_types::TraceBundle>>;
+    async fn insert_remote_evidence_bundle(
+        &self,
+        bundle: &crawfish_types::RemoteEvidenceBundle,
+    ) -> anyhow::Result<()>;
+    async fn get_remote_evidence_bundle(
+        &self,
+        bundle_id: &str,
+    ) -> anyhow::Result<Option<crawfish_types::RemoteEvidenceBundle>>;
+    async fn list_remote_evidence_bundles(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Vec<crawfish_types::RemoteEvidenceBundle>>;
     async fn insert_evaluation(
         &self,
         evaluation: &crawfish_types::EvaluationRecord,
@@ -185,6 +197,10 @@ pub trait SupervisorControl: Send + Sync {
         &self,
         action_id: &str,
     ) -> anyhow::Result<Option<crate::ActionTraceResponse>>;
+    async fn get_action_remote_evidence(
+        &self,
+        action_id: &str,
+    ) -> anyhow::Result<Option<crate::ActionRemoteEvidenceResponse>>;
     async fn list_action_evaluations(
         &self,
         action_id: &str,

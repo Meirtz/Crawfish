@@ -2,8 +2,8 @@ use bytes::Bytes;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crawfish_core::{
     AcknowledgeAlertRequest, AcknowledgeAlertResponse, ActionDetail, ActionEvaluationsResponse,
-    ActionEventsResponse, ActionListResponse, ActionTraceResponse, AdminActionResponse,
-    AgentDetail, AlertListResponse, ApproveActionRequest, CrawfishConfig,
+    ActionEventsResponse, ActionListResponse, ActionRemoteEvidenceResponse, ActionTraceResponse,
+    AdminActionResponse, AgentDetail, AlertListResponse, ApproveActionRequest, CrawfishConfig,
     EvaluationDatasetDetailResponse, EvaluationDatasetsResponse, ExecutionContractPatch,
     ExperimentRunDetailResponse, FederationPackDetailResponse, FederationPackListResponse,
     PairwiseExperimentRunDetailResponse, PolicyValidationRequest, PolicyValidationResponse,
@@ -54,6 +54,7 @@ pub enum Commands {
 pub enum ActionSubcommands {
     List(ListActionsCommand),
     Events(ActionEventsCommand),
+    RemoteEvidence(ActionRemoteEvidenceCommand),
     Trace(ActionTraceCommand),
     Evals(ActionEvaluationsCommand),
     Submit(SubmitActionCommand),
@@ -305,6 +306,15 @@ pub struct ActionTraceCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct ActionRemoteEvidenceCommand {
+    pub action_id: String,
+    #[arg(long, default_value = "Crawfish.toml")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct ActionEvaluationsCommand {
     pub action_id: String,
     #[arg(long, default_value = "Crawfish.toml")]
@@ -531,6 +541,9 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Commands::Action(action) => match action.command {
             ActionSubcommands::List(command) => list_actions_command(command).await,
             ActionSubcommands::Events(command) => action_events_command(command).await,
+            ActionSubcommands::RemoteEvidence(command) => {
+                action_remote_evidence_command(command).await
+            }
             ActionSubcommands::Trace(command) => action_trace_command(command).await,
             ActionSubcommands::Evals(command) => action_evaluations_command(command).await,
             ActionSubcommands::Submit(command) => submit_action_command(command).await,
@@ -769,6 +782,20 @@ async fn action_trace_command(command: ActionTraceCommand) -> anyhow::Result<()>
     let client = DaemonClient::from_config(&command.config)?;
     let response: ActionTraceResponse = client
         .get_json(&format!("/v1/actions/{}/trace", command.action_id))
+        .await?;
+    print_output(serde_json::to_value(response)?, command.json)?;
+    Ok(())
+}
+
+async fn action_remote_evidence_command(
+    command: ActionRemoteEvidenceCommand,
+) -> anyhow::Result<()> {
+    let client = DaemonClient::from_config(&command.config)?;
+    let response: ActionRemoteEvidenceResponse = client
+        .get_json(&format!(
+            "/v1/actions/{}/remote-evidence",
+            command.action_id
+        ))
         .await?;
     print_output(serde_json::to_value(response)?, command.json)?;
     Ok(())

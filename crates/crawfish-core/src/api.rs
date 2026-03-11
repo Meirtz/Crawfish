@@ -5,10 +5,10 @@ use crawfish_types::{
     EncounterRecord, EvaluationDataset, EvaluationRecord, ExecutionStrategy, ExecutionStrategyMode,
     ExperimentCaseResult, ExperimentRun, ExternalRef, FederationDecision, FederationPack, GoalSpec,
     InteractionModel, JurisdictionClass, LifecycleRecord, Metadata, OwnerRef, PairwiseCaseResult,
-    PairwiseExperimentRun, PolicyIncident, RemoteEvidenceStatus, RemoteOutcomeDisposition,
-    RemotePrincipalRef, RemoteStateDisposition, RequesterRef, ReviewQueueItem, ScheduleSpec,
-    TraceBundle, TreatyPack, TreatyViolation, TrustDomain, VerificationSummary,
-    WorkspaceLockDetail,
+    PairwiseExperimentRun, PolicyIncident, RemoteEvidenceBundle, RemoteEvidenceStatus,
+    RemoteOutcomeDisposition, RemotePrincipalRef, RemoteReviewDisposition, RemoteStateDisposition,
+    RequesterRef, ReviewQueueItem, ScheduleSpec, TraceBundle, TreatyPack, TreatyViolation,
+    TrustDomain, VerificationSummary, WorkspaceLockDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -110,11 +110,17 @@ pub struct ActionDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_outcome_disposition: Option<RemoteOutcomeDisposition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_evidence_status: Option<RemoteEvidenceStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_review_disposition: Option<RemoteReviewDisposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_remote_review_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_state_disposition: Option<RemoteStateDisposition>,
     #[serde(default)]
@@ -167,6 +173,12 @@ pub struct ActionEvaluationsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionTraceResponse {
     pub trace: TraceBundle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActionRemoteEvidenceResponse {
+    #[serde(default)]
+    pub bundles: Vec<RemoteEvidenceBundle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
