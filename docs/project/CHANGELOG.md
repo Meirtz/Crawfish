@@ -52,6 +52,8 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - remote-aware evaluation criteria for treaty-governed `task.plan`, including external-ref presence, interaction-model matching, remote outcome disposition, and treaty-violation absence
 - automatic `task_plan_remote_default` profile selection for `task.plan` when execution crosses into the `remote_agent` interaction model
 - remote-outcome metadata on evaluation records and experiment case results, including remote disposition and treaty-violation counts
+- federation packs, federation decisions, and remote escalation metadata for A2A outbound delegation
+- read-only operator surfaces for `federation list`, `federation show`, and `/v1/federation/packs`
 
 ### Changed
 
@@ -79,12 +81,15 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 - treaty configuration now treats result evidence, artifact class scope, data scope, and escalation behavior as first-class runtime inputs
 - executor-first pairwise comparison now prefers fewer treaty-governance violations before broader doctrine and policy incident counts
 - remote-agent `task.plan` outcomes are now evaluated as frontier-evidence events, not only as returned artifact quality
+- treaty-governed remote delegation now compiles a federation pack so remote state and result escalation are interpreted by a reusable control-plane policy rather than adapter-local rules
+- inspect and trace now surface federation pack id, federation decision, remote evidence status, and remote state disposition for remote-agent actions
 
 ### Migration Notes
 
 - prefer `quality.evaluation_profile` for new configs and manifests
 - prefer `[evaluation.pairwise_profiles.<name>]` when customizing comparison behavior beyond the built-in `task_plan_pairwise_default`
 - prefer the expanded `[treaties.packs.<name>]` fields for new remote-agent integrations, especially `required_result_evidence`, `on_scope_violation`, `on_evidence_gap`, and `alert_rules`
+- prefer `[federation.packs.<name>]` for remote-agent escalation defaults such as `result_acceptance_policy`, `scope_violation_policy`, `evidence_gap_policy`, and blocked/auth-required handling
 - expect `task.plan` to resolve to `task_plan_remote_default` automatically when the selected executor crosses into the `remote_agent` plane
 - `quality.evaluation_hook` still parses during `0.1.x alpha`, but only legacy built-ins are normalized automatically
 - prefer `PolicyIncident.reason_code` in new integrations and tooling; the older `code` name remains accepted as a compatibility alias during alpha

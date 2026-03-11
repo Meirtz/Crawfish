@@ -19,6 +19,8 @@ This glossary is shared across the repository. Other documents should reuse thes
 | **contract** | The runtime-enforced set of delivery, execution, safety, quality, and recovery constraints applied to an action. |
 | **execution strategy** | The per-action execution pattern used by Crawfish, such as `single_pass` or `verify_loop`, independent of which adapter or harness is selected. |
 | **interaction model** | A derived runtime classification describing what kind of boundary the action is actually crossing, such as `context_split`, `same_owner_swarm`, `same_device_multi_owner`, or `remote_harness`. It is not user-supplied configuration. |
+| **treaty** | The runtime law that decides whether remote delegation across a principal boundary is allowed at all, including which capabilities, scopes, artifact classes, and checkpoints are authorized. |
+| **federation pack** | A static remote-governance bundle that interprets remote-agent states, evidence gaps, scope violations, and remote results after delegation has been allowed by a treaty. |
 | **verification spec** | The deterministic check set attached to a `verify_loop`, such as tests, lint, schema validation, file checks, or approval gates. |
 | **policy** | A rule set that influences or constrains execution. Policies may be hard or soft and may come from organization defaults, agent defaults, or action overrides. |
 | **trust domain** | The relationship class between the caller and the target runtime surface, such as `same_owner_local`, `same_device_foreign_owner`, or `external_partner`. It is an input to governance, not merely a label. |
@@ -42,6 +44,8 @@ This glossary is shared across the repository. Other documents should reuse thes
 | **tool plane** | The interoperability plane for tools. In Crawfish this is primarily MCP. |
 | **harness plane** | The interoperability plane for specialized agent harnesses. In Crawfish this includes OpenClaw Gateway and ACP-compatible harness integration. |
 | **agent plane** | The interoperability plane for remote or external agents. In Crawfish this is primarily A2A. |
+| **remote evidence status** | The runtime classification of whether required remote result evidence is complete, missing, invalid, or outside allowed scope. |
+| **remote outcome disposition** | The control-plane judgment applied to a remote result after treaty and federation checks, currently `accepted`, `review_required`, or `rejected`. |
 | **OpenClaw binding** | A first-class harness binding that lets Crawfish call OpenClaw through its Gateway protocol or be called by OpenClaw through plugins and RPC. |
 | **manifest** | The declarative specification of an agent, including capabilities, dependencies, runtime profile, lifecycle policy, and contract defaults. |
 | **checkpoint** | A durable recovery record written at safe execution boundaries such as model turns, mutating tool calls, or explicit yield points. |

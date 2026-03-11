@@ -213,6 +213,59 @@ pub struct TreatyViolation {
   pub summary: String,
 }
 
+pub struct FederationPack {
+  pub id: String,
+  pub treaty_pack_id: String,
+  pub review_defaults: FederationReviewDefaults,
+  pub alert_defaults: FederationAlertDefaults,
+  pub required_remote_evidence: Vec<TreatyEvidenceRequirement>,
+  pub result_acceptance_policy: RemoteResultAcceptance,
+  pub scope_violation_policy: RemoteResultAcceptance,
+  pub evidence_gap_policy: RemoteResultAcceptance,
+  pub blocked_remote_policy: RemoteStateDisposition,
+  pub auth_required_policy: RemoteStateDisposition,
+  pub remote_failure_policy: RemoteStateDisposition,
+  pub max_delegation_depth: u32,
+}
+
+pub struct FederationDecision {
+  pub federation_pack_id: String,
+  pub treaty_pack_id: String,
+  pub remote_principal: RemotePrincipalRef,
+  pub required_checkpoints: Vec<OversightCheckpoint>,
+  pub required_remote_evidence: Vec<TreatyEvidenceRequirement>,
+  pub escalation_policy: RemoteEscalationPolicy,
+}
+
+pub struct RemoteEscalationPolicy {
+  pub result_acceptance_policy: RemoteResultAcceptance,
+  pub scope_violation_policy: RemoteResultAcceptance,
+  pub evidence_gap_policy: RemoteResultAcceptance,
+  pub blocked_remote_policy: RemoteStateDisposition,
+  pub auth_required_policy: RemoteStateDisposition,
+  pub remote_failure_policy: RemoteStateDisposition,
+}
+
+pub enum RemoteStateDisposition {
+  Running,
+  Blocked,
+  AwaitingApproval,
+  Failed,
+}
+
+pub enum RemoteEvidenceStatus {
+  Complete,
+  MissingRequiredEvidence,
+  ScopeViolation,
+  Unknown,
+}
+
+pub enum RemoteResultAcceptance {
+  Accepted,
+  ReviewRequired,
+  Rejected,
+}
+
 pub enum RemoteOutcomeDisposition {
   Accepted,
   ReviewRequired,
@@ -396,6 +449,7 @@ type A2ARemoteAgentBinding = {
   agent_card_url: string;
   auth_ref?: string;
   treaty_pack: string;
+  federation_pack?: string;
   required_scopes: string[];
   streaming_mode: "prefer_streaming" | "poll_only";
   allow_in_task_auth: boolean;
@@ -424,6 +478,33 @@ type TreatyPack = {
   on_evidence_gap: "review_required" | "deny";
   review_queue: boolean;
   alert_rules: string[];
+};
+
+type FederationPack = {
+  id: string;
+  treaty_pack_id: string;
+  review_defaults: {
+    enabled: boolean;
+    priority: string;
+  };
+  alert_defaults: {
+    enabled: boolean;
+    rules: string[];
+  };
+  required_remote_evidence: (
+    | "delegation_receipt"
+    | "remote_task_ref"
+    | "terminal_state_verified"
+    | "allowed_artifact_classes"
+    | "allowed_data_scopes"
+  )[];
+  result_acceptance_policy: "accepted" | "review_required" | "rejected";
+  scope_violation_policy: "review_required" | "rejected";
+  evidence_gap_policy: "review_required" | "rejected";
+  blocked_remote_policy: "blocked" | "failed";
+  auth_required_policy: "awaiting_approval" | "failed";
+  remote_failure_policy: "failed" | "blocked";
+  max_delegation_depth: number;
 };
 
 type WorkspacePolicy = {
@@ -927,6 +1008,16 @@ Current `P1k` treaty-escalation rules:
 - returned artifact classes and data scopes are checked against the treaty before the result is accepted
 - missing required result evidence creates an explicit frontier incident instead of silently trusting the result
 
+Current `P1m` federation-pack rules:
+
+- remote delegation now compiles a `FederationDecision` in addition to a `TreatyDecision`
+- federation packs are static remote-governance bundles; they do not negotiate treaties, they interpret remote states and results
+- treaty decides whether delegation is lawful
+- federation pack decides how `input-required`, `auth-required`, evidence gaps, scope violations, and remote terminal results are escalated
+- a missing configured federation pack falls back only to the built-in `remote_task_plan_default` behavior when the binding allows the built-in path
+- remote result acceptance is now driven by `RemoteResultAcceptance` plus `RemoteEvidenceStatus`, not by a single implicit success branch
+- remote state handling is now driven by `RemoteStateDisposition`, so operators can see why the control plane blocked, awaited approval, or failed the action
+
 Treaty escalation semantics are intentionally narrow in alpha:
 
 - `on_scope_violation = deny | review_required`
@@ -948,6 +1039,7 @@ Remote lineage remains inspectable through:
 - remote principal
 - remote task id
 - treaty pack
+- federation pack
 - delegation receipt
 - doctrine checkpoint status
 - remote outcome disposition
@@ -970,6 +1062,13 @@ Result handling rules:
 - if evidence is complete and scope is valid, the remote outcome is `accepted`
 - if evidence is incomplete and the treaty escalation mode allows review, the remote outcome becomes `review_required` and the action is blocked for operator attention
 - if the result violates treaty scope, or the treaty escalation mode requires denial, the remote outcome is `rejected` and the action fails
+
+Federation packs make this reusable by fixing the remote escalation contract ahead of time:
+
+- which remote state transitions should become `blocked`, `awaiting_approval`, or `failed`
+- whether missing result evidence becomes `review_required` or `rejected`
+- whether scope violations are escalated for review or rejected outright
+- which review defaults and alert defaults apply when the frontier evidence chain is incomplete
 
 This is where the architecture treats remote agents as different from harnesses. A harness can be an execution surface. A remote agent is another authority boundary, which means the result itself must remain governable after the call returns.
 
@@ -1248,6 +1347,7 @@ The initial capability set remains:
 The remote-agent plane now has a distinct evaluator path as well. When `task.plan` crosses into the A2A plane, the runtime switches to `task_plan_remote_default`, which scores:
 
 - remote interaction model classification
+- federation pack and federation decision lineage
 - delegation receipt and remote task lineage
 - accepted vs escalated remote outcome disposition
 - treaty-violation absence
@@ -1298,7 +1398,7 @@ Current pairwise comparison is executor-first, not prompt-first and not strategy
 
 The winner selection order is fixed:
 
-1. fewer treaty-governance violations wins
+1. fewer treaty or federation-governance violations wins
 2. fewer doctrine or policy incidents wins
 3. successful terminal status beats failed status
 4. higher normalized evaluation score wins when the delta exceeds the configured margin
@@ -1357,6 +1457,10 @@ The P0 CLI surface is:
 - `crawfish action events`
 - `crawfish action trace`
 - `crawfish action evals`
+- `crawfish treaty list`
+- `crawfish treaty show`
+- `crawfish federation list`
+- `crawfish federation show`
 - `crawfish review list`
 - `crawfish review resolve`
 - `crawfish eval dataset list`
@@ -1372,9 +1476,11 @@ The P0 CLI surface is:
 ### Required CLI Behaviors
 
 - `status` shows lifecycle state, owner, trust domain, degradation profile, and continuity mode for each agent
-- `inspect` accepts agent id or action id and surfaces compiled contract, execution strategy, selected adapter or harness, external run ids such as OpenClaw `runId`, encounter state, grant refs, lease refs, dependency health, recent transitions, degradation profile, continuity mode, and failure reasons
-- `action trace` returns the trace bundle for one action, including event lineage, artifact refs, external refs, enforcement records, and policy incidents
+- `inspect` accepts agent id or action id and surfaces compiled contract, execution strategy, selected adapter or harness, external run ids such as OpenClaw `runId`, encounter state, grant refs, lease refs, treaty and federation summaries for remote-agent work, dependency health, recent transitions, degradation profile, continuity mode, remote evidence status, and failure reasons
+- `action trace` returns the trace bundle for one action, including event lineage, artifact refs, external refs, enforcement records, treaty and federation metadata, and policy incidents
 - `action evals` returns deterministic evaluations and verification-linked scorecards for one action
+- `treaty list` and `treaty show` expose recognized remote principals, allowed capabilities, scopes, artifact classes, and checkpoint requirements
+- `federation list` and `federation show` expose the remote escalation contract: treaty binding, required evidence, result acceptance rules, scope-violation policy, and blocked/auth-required behavior
 - `review list` returns operator review queue items opened by doctrine or evaluation
 - `review resolve` records operator resolution and feedback without rewriting the action history
 - `eval dataset list` and `eval dataset show` expose captured evaluation datasets and frozen cases

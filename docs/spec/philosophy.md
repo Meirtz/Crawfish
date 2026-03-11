@@ -186,11 +186,24 @@ This is why Crawfish treats remote delegation as treaty-governed rather than mer
 The correct order is:
 
 1. treaty
-2. evidence
-3. escalation
-4. only later, broader federation economics
+2. federation interpretation
+3. evidence
+4. escalation
+5. only later, broader federation economics
 
 If that order is reversed, the swarm scales contact before it scales law.
+
+## Principle 10.5: Treaties Are Necessary, But Not Sufficient
+
+A treaty decides whether remote delegation is lawful. It does not, by itself, decide how the local control plane should interpret every remote state and remote result that follows.
+
+That is why Crawfish now adds federation packs on top of treaties:
+
+- a treaty says whether delegation is allowed
+- a federation pack says how `input-required`, `auth-required`, evidence gaps, scope violations, and returned results should be interpreted
+- a control plane therefore stays consistent across remote attempts instead of scattering escalation logic across adapters
+
+This matters because frontier governance often fails after the remote side replies, not before it starts. A system that can say “yes, you may delegate” but cannot say “this remote result must be reviewed” is still under-governed.
 
 ## Principle 11: Remote Results Must Be Governed, Not Just Remote Calls
 
@@ -211,7 +224,7 @@ That is why post-result governance is part of the control plane rather than an a
 
 Without that distinction, remote delegation turns every successful HTTP response into an ambient trust event.
 
-The same lesson applies to evaluation. A remote result should not be judged only by whether it produced plausible content. It also needs to be judged by whether the frontier evidence chain held together. In practical terms, that means remote outcomes need scorecards that can inspect treaty violations, remote outcome disposition, delegation receipts, and checkpoint evidence rather than only the returned artifact text.
+The same lesson applies to evaluation. A remote result should not be judged only by whether it produced plausible content. It also needs to be judged by whether the frontier evidence chain held together. In practical terms, that means remote outcomes need scorecards that can inspect treaty violations, federation decisions, remote outcome disposition, delegation receipts, and checkpoint evidence rather than only the returned artifact text.
 
 ## Design Consequences
 
@@ -232,6 +245,9 @@ These principles imply concrete architectural choices:
 - treaties are runtime law, not partner metadata
   - remote delegation requires scope, evidence, and escalation
   - post-result governance is as important as dispatch-time governance
+- federation packs are runtime interpretation, not marketplace metadata
+  - they make remote escalation rules inspectable and reusable
+  - they keep remote-state and remote-result handling consistent across delegations
 - public terminology should stay future-correct
   - `swarm`, not `fleet`
   - `general-purpose harness`, not `coding-only harness`
