@@ -105,6 +105,25 @@ OpenClaw, A2A, treaties, federation packs, remote evidence, and remote follow-up
 
 The deeper remote-governance discussion is retained as an experimental appendix later in this document; it is not the mainline onboarding path.
 
+## Concept Discipline
+
+Crawfish keeps a broader architecture than it exposes on the public happy path.
+
+For the README, quickstart, and main benchmark story, keep the external model narrow:
+
+- local governed swarm runtime
+- lifecycle-managed actions
+- local-first `task.plan`
+- deterministic verification
+- approval-gated local mutation
+- inspectable traces, evaluations, reviews, and alerts
+
+The more advanced remote line remains implemented, but it should be read as retained experimental architecture rather than the default user journey. The compression rule is simple:
+
+- **treaty**: can remote delegation happen
+- **federation pack**: how remote states and results are interpreted
+- **evidence bundle**: what proof is required to admit the result
+- **follow-up**: how the same action continues when proof is incomplete
 
 ## What The Control Plane Enforces
 
@@ -249,6 +268,7 @@ The supporting spec set lives in:
 - [`docs/spec/v0.1-plan.md`](docs/spec/v0.1-plan.md)
 - [`docs/spec/glossary.md`](docs/spec/glossary.md)
 
+The mainline benchmark harness lives under [`scripts/benchmarks/mainline_local.py`](scripts/benchmarks/mainline_local.py). It defaults to a reproducible deterministic path; local harness replay and compare runs are opt-in so the benchmark path does not depend on local CLI installation state.
 ## Quickstart
 
 The reference example lives under [`examples/hero-swarm/`](examples/hero-swarm/).

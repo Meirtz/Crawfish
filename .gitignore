@@ -12,3 +12,4 @@ __pycache__/
 *.db-wal
 node_modules/
 dist/
+docs/paper/

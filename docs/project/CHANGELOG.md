@@ -6,6 +6,7 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 
 ### Added
 
+- reproducible benchmark harnesses under `scripts/benchmarks/` for the mainline local path and secondary remote admissibility path
 - Rust-first Hero P0 slice with deterministic `repo.index`, deterministic-first `repo.review`, and `ci.triage`
 - deterministic `incident.enrich` with typed enrichment and summary artifacts
 - SSE MCP client support for remote tool-backed inputs
@@ -62,6 +63,8 @@ This project follows a simple alpha changelog discipline: user-visible changes m
 
 ### Changed
 
+- paper-specific drafts, fixtures, and result bundles now live in a local-only `docs/paper/` workspace and are excluded from the public repository
+- public and paper-facing docs now compress remote governance into four external questions: delegation legality, result admissibility, evidence sufficiency, and follow-up continuation
 - `Cargo.lock` is now tracked because Crawfish publishes binaries
 - `crawfish-runtime` is now organized around runtime-spine modules such as `supervisor`, `api`, `execution`, `governance`, `evaluation`, `remote`, and `hero` instead of one giant orchestrator file
 - the runnable example under `examples/hero-swarm/` is now the reference public example, not a loose demo
